@@ -1,143 +1,278 @@
 # typemach
 
-> *If your agent doesn't compile, it can't crash at 3 AM.*
+> Typed machines for agents that have to survive real production runtime.
 
-A typed state machine runtime for LLM agents. One trait. Compile-time step validation. Checkpoint, interrupt, resume, cancel — all built in.
+LLM agents are not just prompt calls. The moment an agent can call tools, wait for a human, resume later, stream partial output, or be cancelled mid-flight, it is a state machine.
+
+Most agent frameworks let that machine live in runtime strings, dictionaries, callbacks, and replayed event logs. That is fast to prototype and painful to operate. A misspelled step name becomes a late crash. A malformed interrupt becomes a production incident. A "stream" often means "run everything, then replay what happened from memory."
+
+typemach exists for the opposite model:
+
+- Steps are Rust enum variants, not graph node strings.
+- State is a serializable Rust type, not an unowned dictionary.
+- Interrupts and resume input are typed application contracts.
+- Streaming is live runtime output, not result replay.
+- Cancellation can drop an in-flight transition future.
+- Checkpoints are explicit records owned by a small storage trait.
+
+typemach is deliberately not an LLM framework. It does not know about prompts, tools, vector databases, models, agents, or business protocols. It gives you the runtime boundary for a typed, checkpointed, cancellable state machine. Your code owns the intelligence.
+
+## What makes it different
+
+| Runtime concern | String/dict agent runtimes | typemach |
+|---|---|---|
+| Step routing | `add_node("answer", ...)` | `Transition::Next(Step::Answer)` |
+| Exhaustiveness | Runtime branch coverage | Rust `match` over your step enum |
+| Interrupts | JSON-shaped payloads | `Transition::Interrupt(MyInterrupt)` |
+| Resume | Opaque command payload | `apply_resume_input` plus `ResumeAction` |
+| Streaming | Often replay after completion | `Runner::stream` while the transition is running |
+| Agent events | Framework-owned event schema | Machine-owned typed `Signal` |
+| Backpressure | Usually hidden | Bounded channel capacity |
+| Cancellation | Best-effort flags | Cooperative cancel that can drop the transition future |
+| Persistence | Framework black box | `CheckpointSaver` trait |
+
+The special part is not that typemach can run a graph. The special part is that the runtime behavior you need in production is part of one typed contract: state, step, input, signal, output, interrupt.
+
+## Install
+
+typemach is currently consumed from Git:
+
+```toml
+[dependencies]
+typemach = { git = "https://github.com/sanlee42/typemach.git" }
+```
+
+For Postgres checkpoints:
+
+```toml
+[dependencies]
+typemach = { git = "https://github.com/sanlee42/typemach.git", features = ["checkpoint-postgres"] }
+```
+
+For applications, pin a commit or tag instead of floating on the default branch.
+
+## The machine contract
 
 ```rust
-#[async_trait]
-impl Machine for MyAgent {
-    type Step   = MyStep;     // enum — compiler checks every route
-    type State  = MyState;    // Serialize + DeserializeOwned → blanket impl
-    type Input  = MyInput;    // whatever your turn carries
-    type Signal = MySignal;   // typed streaming signals
-    type Output = MyOutput;   // whatever your caller consumes
-    type Interrupt = MyInterrupt; // typed, not a dict
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use typemach::{Machine, MachineError, RunContext, Transition};
 
-    fn start_step(&self) -> Self::Step { MyStep::Prepare }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Step {
+    Prepare,
+    Answer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State {
+    answer: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Input {
+    question: String,
+}
+
+#[derive(Debug)]
+enum Signal {
+    ToolStarted,
+    AnswerDelta(String),
+}
+
+#[derive(Debug)]
+struct Output {
+    answer: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Interrupt {
+    question: String,
+}
+
+struct Agent;
+
+#[async_trait]
+impl Machine for Agent {
+    type Step = Step;
+    type State = State;
+    type Input = Input;
+    type Signal = Signal;
+    type Output = Output;
+    type Interrupt = Interrupt;
+
+    fn start_step(&self) -> Self::Step {
+        Step::Prepare
+    }
+
+    fn new_state(
+        &self,
+        _input: &Self::Input,
+        _previous: Option<&Self::State>,
+        _snapshot: Option<&serde_json::Value>,
+    ) -> Result<Self::State, MachineError> {
+        Ok(State { answer: None })
+    }
+
+    fn apply_resume_input(
+        &self,
+        _state: &mut Self::State,
+        _input: &Self::Input,
+    ) -> Result<(), MachineError> {
+        Ok(())
+    }
 
     async fn transition(
         &self,
         step: Self::Step,
         state: &mut Self::State,
         ctx: &RunContext<Self::Input, Self::Step, Self::Signal, Self::Output, Self::Interrupt>,
-    )
-        -> Result<Transition<Self::Step, Self::Interrupt, Self::Output>, MachineError>
-    {
+    ) -> Result<Transition<Self::Step, Self::Interrupt, Self::Output>, MachineError> {
         match step {
-            MyStep::Prepare => {
-                ctx.emit(MySignal::ToolStarted).await?;
-                state.tools = fetch_tools(ctx).await?;
-                Ok(Transition::Next(MyStep::Plan))
+            Step::Prepare => {
+                ctx.emit(Signal::ToolStarted).await?;
+                Ok(Transition::Next(Step::Answer))
             }
-            MyStep::Plan => {
-                if state.need_clarification {
-                    Ok(Transition::Interrupt(MyInterrupt::Ask { question: "which metric?" }))
-                } else {
-                    Ok(Transition::Complete(MyOutput { answer: "done" }))
-                }
+            Step::Answer => {
+                let answer = format!("answering: {}", ctx.input.question);
+                ctx.emit(Signal::AnswerDelta(answer.clone())).await?;
+                state.answer = Some(answer.clone());
+                Ok(Transition::Complete(Output { answer }))
             }
         }
     }
 }
 ```
 
----
+The trait has six associated types:
 
-## The problem
+- `Step`: every runnable state in your machine.
+- `State`: durable machine state, serialized into checkpoints.
+- `Input`: one turn of caller input.
+- `Signal`: typed live events emitted by your transition code.
+- `Output`: successful terminal output.
+- `Interrupt`: typed pending work needed before resume.
 
-LangGraph, CrewAI, AutoGen — all Python. All runtime. A mistyped field in your `TypedDict`, a missing `isinstance` check, and your agent fails in production with a `KeyError` nobody saw coming. Python gives you flexibility. It does not give you the answer to "did I handle every state?"
+There is no graph builder, no magic command object, and no framework event schema to conform to.
 
-## What typemach does differently
+## Running a machine
 
-| | Everyone else | typemach |
-|---|---|---|
-| State machine | `add_node("think", ...)` — strings | `Transition::Next(MyStep::Think)` — enum |
-| Interrupt | `interrupt({"field": "date"})` — dict | `Transition::Interrupt(AskDate)` — type |
-| Resume | `Command(resume="tomorrow")` — opaque string | `apply_resume_input(state, input)` — typed method |
-| Checkpoint | framework black box | `CheckpointSaver` trait, bring your own DB |
-| API surface | `StateGraph`, `Command`, `Send`, `Pregel`, `Channel`, ... | `Machine` trait, 5 methods |
-| Code overhead | Large runtime package | Small typed runtime |
-
-## The contract
+Use `invoke` when the caller wants a single terminal result:
 
 ```rust
-pub trait Machine {
-    type Step:     Clone + Debug + Serialize + DeserializeOwned + Send + Sync;
-    type State:    MachineState;
-    type Input:    Clone + Send + Sync;
-    type Signal:   Send + Sync;
-    type Output:   Send + Sync;
-    type Interrupt: Clone + Serialize + DeserializeOwned + Send + Sync;
+let output = runner.invoke(request).await?;
+```
 
-    fn start_step(&self) -> Self::Step;
-    fn resume_action(&self, interrupt: &Self::Interrupt) -> ResumeAction<Self::Step>;
-    fn new_state(&self, input: &Self::Input, previous: Option<&Self::State>, snapshot: Option<&Value>) -> Result<Self::State, MachineError>;
-    fn apply_resume_input(&self, state: &mut Self::State, input: &Self::Input) -> Result<(), MachineError>;
+Use `stream` when the caller needs live runtime events:
 
-    async fn transition(
-        &self,
-        step: Self::Step,
-        state: &mut Self::State,
-        ctx: &RunContext<Self::Input, Self::Step, Self::Signal, Self::Output, Self::Interrupt>,
-    ) -> Result<Transition<Self::Step, Self::Interrupt, Self::Output>, MachineError>;
+```rust
+let mut events = runner.stream(
+    request,
+    StreamConfig {
+        heartbeat_interval: std::time::Duration::from_secs(2),
+        channel_capacity: 32,
+    },
+);
+
+while let Some(event) = events.next_event().await {
+    match event {
+        RunStreamEvent::Signal { signal } => {
+            // Your typed machine signal.
+        }
+        RunStreamEvent::Completed { output, .. } => {
+            break;
+        }
+        RunStreamEvent::Failed { error } => {
+            return Err(error);
+        }
+        _ => {}
+    }
 }
 ```
 
-6 associated types. 5 methods. That's the whole API.
+`RunStreamEvent` is the runtime event surface:
 
-## What you get for free
+- `Started`
+- `Heartbeat`
+- `StepStarted`
+- `StepFinished`
+- `Signal`
+- `Interrupted`
+- `Completed`
+- `Failed`
+- `Cancelled`
 
-Once you `impl Machine`, the `Runner<M, CK>` gives you:
+Signals emitted inside a transition are ordered before the terminal event for that transition. Heartbeats are emitted while a transition is still running and while a run is waiting for the thread lock. If the receiver is dropped, the stream driver stops and the active run is cleaned up.
 
-- **Checkpoint persistence** — every step transition saves state. On resume, `Runner` loads the last checkpoint and calls `apply_resume_input`.
-- **Session isolation** — per-session async lock, no concurrent turn execution on the same session.
-- **Step enforcement** — `max_steps` is checked every iteration. Exceeded → `MachineError::MaxStepsExceeded`.
-- **Streaming** — `runner.stream(request, config)` emits typed lifecycle events, heartbeats, and machine-owned signals through a bounded channel.
-- **Cancellation** — `runner.cancel_run(run_id)` notifies the active run and can drop an in-flight transition.
-- **Typed trace** — every step transition is recorded as `{"step": "Plan", "result": "next"}`.
-- **No allocation noise** — `MachineState` has a blanket impl for any `Serialize + DeserializeOwned` type. Your state doesn't need a custom `to_json`/`from_json` method.
+## Checkpoint, interrupt, resume
 
-## Checkpoint backends
+Every completed step stores a checkpoint through `CheckpointSaver`. On interrupt, typemach stores the durable state, interrupted step, typed interrupt payload, and run id. On resume, it loads the checkpoint, calls `apply_resume_input`, and resumes using `resume_action`.
 
 ```rust
-// In-memory (tests, dev)
+use std::sync::Arc;
+use typemach::{MemorySaver, Runner};
+
 let runner = Runner::new(agent, Arc::new(MemorySaver::new()));
-
-// Postgres (production)
-let pool = deadpool_postgres::Pool::new(/* ... */);
-let saver = PostgresSaver::new(pool);
-saver.ensure_schema().await?;
-let runner = Runner::new(agent, Arc::new(saver));
 ```
 
-`CheckpointRecord` is versioned (`version: 1`) — future format migrations are explicit, not silent.
-
-## Error handling
+The optional Postgres backend stores the same checkpoint record in `typemach_checkpoints`:
 
 ```rust
-pub enum MachineError {
-    CheckpointDb(Box<dyn Error>),     // transport — DB is down
-    CheckpointPool(String),           // transport — pool exhausted
-    Serialization(serde_json::Error), // domain — your state type changed
-    Deserialization(serde_json::Error),
-    MaxStepsExceeded { max: u32 },    // lifecycle — agent looped
-    Cancelled,                        // lifecycle — caller gave up
-    Transition(Box<dyn Error>),       // domain — your step logic failed
-    // ...
+#[cfg(feature = "checkpoint-postgres")]
+{
+    use typemach::checkpoint_pg::PostgresSaver;
+
+    let saver = PostgresSaver::new(pool);
+    saver.ensure_schema().await?;
+    let runner = Runner::new(agent, Arc::new(saver));
 }
 ```
 
-Transport errors carry source context. Domain errors are actionable. No `anyhow` in library code. No opaque strings.
+Checkpoint records are versioned. The state payload is transparent JSON, so operators can inspect what was persisted instead of reverse-engineering a framework database.
 
-## Philosophy
+## Cancellation and backpressure
 
-typemach is not a framework. It doesn't know about LLMs, tools, prompts, or agents. It knows about **typed state machines with checkpoint**. You bring the agent logic; it handles the runtime.
+`Runner::cancel_run(&run_id)` marks a run as cancelled and notifies the active cancel token. The runner selects transition execution against cancellation, so a slow model call or tool future can be dropped when the caller gives up.
 
-- **No builder pattern** — you write `match step { ... }`, not `add_node().add_edge().compile()`.
-- **No magic strings** — every step is a variant in your enum. Miss a branch → compiler error.
-- **No hidden state** — checkpoint records are transparent JSON. You can inspect them in `psql`.
-- **One trait** — if you can `impl Machine`, you're done.
+Streaming uses a bounded channel. That is intentional. If a downstream adapter stops reading, typemach does not keep buffering an unbounded event log in memory.
+
+## LLM integration
+
+LLM calls belong in your machine transitions. typemach does not wrap providers, invent tool schemas, or parse model-specific protocols for you.
+
+See [`examples/minimal_llm.rs`](examples/minimal_llm.rs) for a minimal OpenAI-compatible streaming example:
+
+```bash
+OPENAI_API_KEY=... \
+OPENAI_BASE_URL=https://api.openai.com/v1 \
+OPENAI_MODEL=... \
+cargo run --example minimal_llm -- "Explain typemach in one sentence"
+```
+
+The example:
+
+- Calls `OPENAI_BASE_URL/chat/completions` with `stream: true`.
+- Parses `data:` server-sent events.
+- Emits typed `AssistantDelta` signals from `RunContext::emit`.
+- Prints typemach runtime events as they arrive.
+- Fails explicitly on missing config, HTTP errors, malformed chunks, missing `[DONE]`, or an empty final answer.
+
+No fake model, no generated fallback answer, no hidden provider default.
+
+## Design boundary
+
+typemach is small because it only owns runtime mechanics:
+
+- machine execution
+- checkpoint persistence boundary
+- interrupt and resume lifecycle
+- live stream event ordering
+- heartbeat
+- cooperative cancellation
+- bounded backpressure
+- max step enforcement
+
+Everything else stays outside the crate. That boundary is the point. LLM agents need a runtime that is strict enough to operate and small enough to trust.
 
 ## License
 
