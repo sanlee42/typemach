@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 macro_rules! id_newtype {
     ($name:ident) => {
@@ -173,6 +173,16 @@ pub struct RunEventReceiver<Step, Signal, Output, Interrupt> {
 impl<Step, Signal, Output, Interrupt> RunEventReceiver<Step, Signal, Output, Interrupt> {
     pub async fn next_event(&mut self) -> Option<RunStreamEvent<Step, Signal, Output, Interrupt>> {
         self.receiver.recv().await
+    }
+
+    pub async fn next_event_timeout(
+        &mut self,
+        deadline: Instant,
+    ) -> Option<RunStreamEvent<Step, Signal, Output, Interrupt>> {
+        match async_rt::time::timeout_at(deadline.into(), self.receiver.recv()).await {
+            Ok(event) => event,
+            Err(_elapsed) => None,
+        }
     }
 }
 
