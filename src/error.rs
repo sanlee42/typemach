@@ -8,6 +8,9 @@ pub enum MachineError {
     #[error("checkpoint pool exhausted: {0}")]
     CheckpointPool(String),
 
+    #[error("store database error: {0}")]
+    StoreDb(#[source] Box<dyn std::error::Error + Send + Sync>),
+
     #[error("serialization failed: {0}")]
     Serialization(#[source] serde_json::Error),
 
@@ -16,6 +19,9 @@ pub enum MachineError {
 
     #[error("max steps exceeded ({max})")]
     MaxStepsExceeded { max: u32 },
+
+    #[error("too many in-flight runs")]
+    CapacityExceeded,
 
     #[error("run cancelled")]
     Cancelled,
