@@ -43,13 +43,13 @@ pub struct RunRegistry<E> {
     inner: Arc<Mutex<HashMap<RunId, ActiveRun<E>>>>,
 }
 
-impl<E: Clone> Default for RunRegistry<E> {
+impl<E> Default for RunRegistry<E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<E: Clone> RunRegistry<E> {
+impl<E> RunRegistry<E> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
@@ -64,6 +64,9 @@ impl<E: Clone> RunRegistry<E> {
         max_in_flight: usize,
     ) -> Result<(), MachineError> {
         let mut inner = self.inner.lock().expect("run registry lock poisoned");
+        if inner.contains_key(&run_id) {
+            return Err(MachineError::RunAlreadyActive);
+        }
         if inner.len() >= max_in_flight {
             return Err(MachineError::CapacityExceeded);
         }
@@ -109,31 +112,12 @@ impl<E: Clone> RunRegistry<E> {
         Some(run.current_seq)
     }
 
-    pub fn publish(&self, run_id: &RunId, event: E) {
-        let mut inner = self.inner.lock().expect("run registry lock poisoned");
-        if let Some(run) = inner.get_mut(run_id) {
-            run.stream_senders
-                .retain(|sender| sender.send(event.clone()).is_ok());
-        }
-    }
-
-    pub fn publish_terminal(&self, run_id: &RunId, event: E) -> bool {
-        let mut inner = self.inner.lock().expect("run registry lock poisoned");
-        let Some(run) = inner.get_mut(run_id) else {
-            return false;
-        };
-        if run.terminal_published {
-            return false;
-        }
-        run.terminal_published = true;
-        run.stream_senders
-            .retain(|sender| sender.send(event.clone()).is_ok());
-        true
-    }
-
     pub fn subscribe(&self, run_id: &RunId) -> Option<mpsc::UnboundedReceiver<E>> {
         let mut inner = self.inner.lock().expect("run registry lock poisoned");
         let run = inner.get_mut(run_id)?;
+        if run.terminal_published {
+            return None;
+        }
         let (sender, receiver) = mpsc::unbounded_channel();
         run.stream_senders.push(sender);
         Some(receiver)
@@ -154,6 +138,33 @@ impl<E: Clone> RunRegistry<E> {
             .lock()
             .expect("run registry lock poisoned")
             .is_empty()
+    }
+}
+
+impl<E: Clone> RunRegistry<E> {
+    pub fn publish(&self, run_id: &RunId, event: E) {
+        let mut inner = self.inner.lock().expect("run registry lock poisoned");
+        if let Some(run) = inner.get_mut(run_id) {
+            if run.terminal_published {
+                return;
+            }
+            run.stream_senders
+                .retain(|sender| sender.send(event.clone()).is_ok());
+        }
+    }
+
+    pub fn publish_terminal(&self, run_id: &RunId, event: E) -> bool {
+        let mut inner = self.inner.lock().expect("run registry lock poisoned");
+        let Some(run) = inner.get_mut(run_id) else {
+            return false;
+        };
+        if run.terminal_published {
+            return false;
+        }
+        run.terminal_published = true;
+        run.stream_senders
+            .retain(|sender| sender.send(event.clone()).is_ok());
+        true
     }
 }
 
@@ -181,6 +192,36 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_run_without_replacing_existing() {
+        let registry = RunRegistry::<i64>::new();
+        let (first_sender, mut first_receiver) = mpsc::unbounded_channel();
+        registry
+            .try_insert(test_run_id("run-a"), test_handle(), Some(first_sender), 1)
+            .expect("first run should fit");
+
+        let (second_sender, mut second_receiver) = mpsc::unbounded_channel();
+        let err = registry
+            .try_insert(
+                test_run_id("run-a"),
+                RunHandle::new("replacement".to_string()),
+                Some(second_sender),
+                1,
+            )
+            .expect_err("duplicate run should be rejected");
+
+        assert!(matches!(err, MachineError::RunAlreadyActive));
+        assert!(
+            registry
+                .resolve(&test_run_id("run-a"), "replacement")
+                .is_none()
+        );
+
+        registry.publish(&test_run_id("run-a"), 1);
+        assert_eq!(first_receiver.try_recv(), Ok(1));
+        assert!(second_receiver.try_recv().is_err());
     }
 
     #[test]
@@ -225,6 +266,36 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(1));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_run_rejects_late_subscribers_and_publish() {
+        let registry = RunRegistry::<i64>::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        registry
+            .try_insert(test_run_id("run-a"), test_handle(), Some(sender), 1)
+            .expect("run should fit");
+
+        assert!(registry.publish_terminal(&test_run_id("run-a"), 1));
+        assert!(registry.subscribe(&test_run_id("run-a")).is_none());
+        registry.publish(&test_run_id("run-a"), 2);
+
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn registry_accepts_non_clone_event_for_lifecycle_operations() {
+        #[derive(Debug)]
+        struct NonClone;
+
+        let registry = RunRegistry::<NonClone>::new();
+        registry
+            .try_insert(test_run_id("run-a"), test_handle(), None, 1)
+            .expect("run should fit");
+        assert_eq!(registry.next_seq(&test_run_id("run-a")), Some(1));
+        assert!(registry.subscribe(&test_run_id("run-a")).is_some());
+        assert!(registry.request_cancel(&test_run_id("run-a")).is_some());
     }
 
     #[test]

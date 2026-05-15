@@ -23,6 +23,9 @@ pub enum MachineError {
     #[error("too many in-flight runs")]
     CapacityExceeded,
 
+    #[error("run is already active")]
+    RunAlreadyActive,
+
     #[error("run cancelled")]
     Cancelled,
 

@@ -179,10 +179,9 @@ impl<Step, Signal, Output, Interrupt> RunEventReceiver<Step, Signal, Output, Int
         &mut self,
         deadline: Instant,
     ) -> Option<RunStreamEvent<Step, Signal, Output, Interrupt>> {
-        match async_rt::time::timeout_at(deadline.into(), self.receiver.recv()).await {
-            Ok(event) => event,
-            Err(_elapsed) => None,
-        }
+        async_rt::time::timeout_at(deadline.into(), self.receiver.recv())
+            .await
+            .unwrap_or_default()
     }
 }
 
