@@ -96,8 +96,8 @@ where
         let run_id = request.run_id.clone();
         let control = Arc::new(RunCancel::new());
         self.register_active(&run_id, Arc::clone(&control)).await;
-        let result = self.invoke_inner(request, control).await;
-        self.unregister_active(&run_id, None).await;
+        let result = self.invoke_inner(request, Arc::clone(&control)).await;
+        self.unregister_active(&run_id, &control).await;
         result
     }
 
@@ -112,8 +112,10 @@ where
             let run_id = request.run_id.clone();
             let control = Arc::new(RunCancel::new());
             runner.register_active(&run_id, Arc::clone(&control)).await;
-            runner.run_stream_driver(request, config, tx, control).await;
-            runner.unregister_active(&run_id, None).await;
+            runner
+                .run_stream_driver(request, config, tx, Arc::clone(&control))
+                .await;
+            runner.unregister_active(&run_id, &control).await;
         });
         RunEventReceiver { receiver }
     }
@@ -530,9 +532,20 @@ where
         }
     }
 
-    async fn unregister_active(&self, run_id: &RunId, _control: Option<&Arc<RunCancel>>) {
-        self.active_runs.lock().await.remove(run_id);
-        self.cancelled_runs.lock().await.remove(run_id);
+    async fn unregister_active(&self, run_id: &RunId, control: &Arc<RunCancel>) {
+        let removed = {
+            let mut active_runs = self.active_runs.lock().await;
+            let should_remove = active_runs
+                .get(run_id)
+                .is_some_and(|active| Arc::ptr_eq(active, control));
+            if should_remove {
+                active_runs.remove(run_id);
+            }
+            should_remove
+        };
+        if removed {
+            self.cancelled_runs.lock().await.remove(run_id);
+        }
     }
 
     #[cfg(test)]

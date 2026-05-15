@@ -508,6 +508,80 @@ fn stream_receiver_drop_stops_driver_and_cleans_active_run() {
 }
 
 #[test]
+fn stale_unregister_does_not_remove_new_active_run() {
+    block_on(async {
+        let runner = Runner::new(TestMachine, Arc::new(MemorySaver::new()));
+        let run_id = RunId::from("run-reused-id");
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let second_dropped = Arc::new(AtomicBool::new(false));
+
+        let mut first = request(TestMode::Slow);
+        first.run_id = run_id.clone();
+        first.thread_id = ThreadId::from("thread-a");
+        first.input.drop_flag = Some(Arc::clone(&first_dropped));
+        let mut first_stream = runner.stream(
+            first,
+            StreamConfig {
+                heartbeat_interval: std::time::Duration::from_secs(1),
+                channel_capacity: 8,
+            },
+        );
+        while let Some(event) = first_stream.next_event().await {
+            if matches!(event, RunStreamEvent::StepStarted { .. }) {
+                break;
+            }
+        }
+
+        let mut second = request(TestMode::Slow);
+        second.run_id = run_id.clone();
+        second.thread_id = ThreadId::from("thread-b");
+        second.input.drop_flag = Some(Arc::clone(&second_dropped));
+        let mut second_stream = runner.stream(
+            second,
+            StreamConfig {
+                heartbeat_interval: std::time::Duration::from_secs(1),
+                channel_capacity: 8,
+            },
+        );
+        while let Some(event) = second_stream.next_event().await {
+            if matches!(event, RunStreamEvent::StepStarted { .. }) {
+                break;
+            }
+        }
+
+        drop(first_stream);
+        for _ in 0..20 {
+            if first_dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            async_rt::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            first_dropped.load(Ordering::SeqCst),
+            "first stream did not stop"
+        );
+        assert_eq!(runner.active_run_count().await, 1);
+
+        runner.cancel_run(&run_id).await;
+        let cancelled = async_rt::time::timeout(std::time::Duration::from_millis(200), async {
+            while let Some(event) = second_stream.next_event().await {
+                if matches!(event, RunStreamEvent::Cancelled) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(cancelled, "new active run was not cancelled");
+        assert!(
+            second_dropped.load(Ordering::SeqCst),
+            "second transition future was not dropped"
+        );
+    });
+}
+
+#[test]
 fn stream_interrupt_can_resume_with_invoke_checkpoint() {
     block_on(async {
         let runner = Runner::new(TestMachine, Arc::new(MemorySaver::new()));
