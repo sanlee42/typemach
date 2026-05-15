@@ -20,6 +20,6 @@ pub use run::{
 };
 pub use runner::Runner;
 pub use store::{
-    FinishRunResult, MemoryRunStore, RunEvent, RunFinish, RunFinishRequest, RunLookup, RunStart,
-    RunStatus, RunStore, StartRunResult,
+    FinishRunResult, MemoryRunStore, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish,
+    RunFinishRecord, RunLookup, RunStart, RunStatus, RunStore, StartRunResult,
 };

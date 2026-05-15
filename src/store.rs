@@ -16,6 +16,54 @@ pub trait RunEvent: Clone + Send + Sync + 'static {
     fn is_terminal(&self) -> bool;
 }
 
+pub trait RunEventPayload: Clone + Send + Sync + 'static {
+    fn is_terminal(&self) -> bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunEventEnvelope<P> {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub seq: i64,
+    pub payload: P,
+}
+
+impl<P> RunEventEnvelope<P> {
+    pub fn new(run_id: RunId, session_id: SessionId, seq: i64, payload: P) -> Self {
+        Self {
+            run_id,
+            session_id,
+            seq,
+            payload,
+        }
+    }
+
+    pub fn into_payload(self) -> P {
+        self.payload
+    }
+}
+
+impl<P> RunEvent for RunEventEnvelope<P>
+where
+    P: RunEventPayload,
+{
+    fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    fn seq(&self) -> i64 {
+        self.seq
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.payload.is_terminal()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -54,7 +102,7 @@ pub struct RunStart {
 }
 
 #[derive(Debug, Clone)]
-pub struct RunFinish<E: RunEvent> {
+pub struct RunFinishRecord<E: RunEvent> {
     pub run_id: RunId,
     pub session_id: SessionId,
     pub status: RunStatus,
@@ -65,7 +113,7 @@ pub struct RunFinish<E: RunEvent> {
 }
 
 #[derive(Debug, Clone)]
-pub struct RunFinishRequest {
+pub struct RunFinish {
     pub run_id: RunId,
     pub session_id: SessionId,
     pub status: RunStatus,
@@ -84,9 +132,31 @@ pub struct RunLookup {
 }
 
 #[derive(Debug, Clone)]
-pub struct FinishRunResult<E: RunEvent> {
-    pub won: bool,
-    pub terminal_event: E,
+pub enum FinishRunResult<E: RunEvent> {
+    Finished(E),
+    AlreadyFinished(E),
+}
+
+impl<E: RunEvent> FinishRunResult<E> {
+    pub fn is_finished(&self) -> bool {
+        matches!(self, Self::Finished(_))
+    }
+
+    pub fn is_already_finished(&self) -> bool {
+        matches!(self, Self::AlreadyFinished(_))
+    }
+
+    pub fn terminal_event(&self) -> &E {
+        match self {
+            Self::Finished(event) | Self::AlreadyFinished(event) => event,
+        }
+    }
+
+    pub fn into_terminal_event(self) -> E {
+        match self {
+            Self::Finished(event) | Self::AlreadyFinished(event) => event,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +184,10 @@ where
         scope: &Value,
     ) -> Result<Option<RunLookup>, MachineError>;
 
-    async fn finish_run(&self, finish: &RunFinish<E>) -> Result<FinishRunResult<E>, MachineError>;
+    async fn finish_run(
+        &self,
+        finish: &RunFinishRecord<E>,
+    ) -> Result<FinishRunResult<E>, MachineError>;
 
     async fn terminal_event(&self, run_id: &RunId) -> Result<Option<E>, MachineError>;
 
@@ -272,7 +345,10 @@ where
             .map(run_lookup))
     }
 
-    async fn finish_run(&self, finish: &RunFinish<E>) -> Result<FinishRunResult<E>, MachineError> {
+    async fn finish_run(
+        &self,
+        finish: &RunFinishRecord<E>,
+    ) -> Result<FinishRunResult<E>, MachineError> {
         validate_event_run(&finish.run_id, &finish.session_id, &finish.terminal_event)?;
         if !finish.terminal_event.is_terminal() {
             return Err(MachineError::InvalidRunEvent {
@@ -299,20 +375,14 @@ where
                 .terminal_event
                 .clone()
                 .ok_or(MachineError::RunNotFound)?;
-            return Ok(FinishRunResult {
-                won: false,
-                terminal_event,
-            });
+            return Ok(FinishRunResult::AlreadyFinished(terminal_event));
         }
         validate_next_seq(run, &finish.terminal_event)?;
         run.status = finish.status;
         run.finish_reason = Some(finish.finish_reason.clone());
         run.terminal_event = Some(finish.terminal_event.clone());
         run.events.push(finish.terminal_event.clone());
-        Ok(FinishRunResult {
-            won: true,
-            terminal_event: finish.terminal_event.clone(),
-        })
+        Ok(FinishRunResult::Finished(finish.terminal_event.clone()))
     }
 
     async fn terminal_event(&self, run_id: &RunId) -> Result<Option<E>, MachineError> {
@@ -542,7 +612,7 @@ mod tests {
                     .expect("record")
             );
             let terminal = event("run-a", "session-a", 2, true);
-            let finish = RunFinish {
+            let finish = RunFinishRecord {
                 run_id: RunId::from("run-a"),
                 session_id: SessionId::from("session-a"),
                 status: RunStatus::Completed,
@@ -552,7 +622,7 @@ mod tests {
                 snapshot_json: None,
             };
             let result = store.finish_run(&finish).await.expect("finish");
-            assert!(result.won);
+            assert!(matches!(result, FinishRunResult::Finished(_)));
             assert_eq!(
                 store
                     .terminal_event(&RunId::from("run-a"))
@@ -588,7 +658,7 @@ mod tests {
             store.start_run(&start).await.expect("start");
             let first_terminal = event("run-a", "session-a", 1, true);
             let second_terminal = event("run-a", "session-a", 2, true);
-            let first = RunFinish {
+            let first = RunFinishRecord {
                 run_id: RunId::from("run-a"),
                 session_id: SessionId::from("session-a"),
                 status: RunStatus::Completed,
@@ -602,10 +672,13 @@ mod tests {
             second.status = RunStatus::Error;
             second.finish_reason = "runtime_failed".to_string();
 
-            assert!(store.finish_run(&first).await.expect("first").won);
+            assert!(matches!(
+                store.finish_run(&first).await.expect("first"),
+                FinishRunResult::Finished(_)
+            ));
             let result = store.finish_run(&second).await.expect("second");
-            assert!(!result.won);
-            assert_eq!(result.terminal_event, first_terminal);
+            assert!(matches!(result, FinishRunResult::AlreadyFinished(_)));
+            assert_eq!(result.into_terminal_event(), first_terminal);
         });
     }
 

@@ -6,16 +6,16 @@ use serde_json::Value;
 
 use crate::error::MachineError;
 use crate::registry::{RunHandle, RunRegistry};
-use crate::run::RunId;
+use crate::run::{RunId, SessionId};
 use crate::store::{
-    FinishRunResult, RunEvent, RunFinish, RunFinishRequest, RunLookup, RunStart, RunStatus,
-    RunStore, StartRunResult,
+    FinishRunResult, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish, RunFinishRecord,
+    RunLookup, RunStart, RunStatus, RunStore, StartRunResult,
 };
 
 #[derive(Debug)]
 pub enum AppendEventResult<E: RunEvent> {
     Recorded(E),
-    Skipped(E),
+    Skipped,
 }
 
 #[derive(Debug)]
@@ -91,9 +91,9 @@ where
 
     pub async fn ensure_session(
         &self,
-        session_id: Option<crate::run::SessionId>,
+        session_id: Option<SessionId>,
         scope: &Value,
-    ) -> Result<crate::run::SessionId, MachineError> {
+    ) -> Result<SessionId, MachineError> {
         self.store.ensure_session(session_id, scope).await
     }
 
@@ -144,7 +144,7 @@ where
         self.event_locks.lock().await.remove(run_id);
     }
 
-    pub async fn append_event<F>(
+    pub async fn append_with<F>(
         &self,
         run_id: &RunId,
         build_event: F,
@@ -183,13 +183,13 @@ where
             self.registry.remove(run_id);
             drop(guard);
             self.remove_event_lock(run_id).await;
-            Ok(AppendEventResult::Skipped(event))
+            Ok(AppendEventResult::Skipped)
         }
     }
 
-    pub async fn finish_run<F>(
+    pub async fn finish_with<F>(
         &self,
-        finish: RunFinishRequest,
+        finish: RunFinish,
         build_event: F,
     ) -> Result<FinishRunResult<E>, MachineError>
     where
@@ -207,10 +207,7 @@ where
             if let Some(terminal_event) = self.store.terminal_event(&finish.run_id).await? {
                 drop(guard);
                 self.remove_event_lock(&finish.run_id).await;
-                return Ok(FinishRunResult {
-                    won: false,
-                    terminal_event,
-                });
+                return Ok(FinishRunResult::AlreadyFinished(terminal_event));
             }
             drop(guard);
             self.remove_event_lock(&finish.run_id).await;
@@ -240,7 +237,7 @@ where
         }
 
         let run_id = finish.run_id.clone();
-        let finish = RunFinish {
+        let finish = RunFinishRecord {
             run_id: finish.run_id,
             session_id: finish.session_id,
             status: finish.status,
@@ -251,7 +248,7 @@ where
         };
         let result = self.store.finish_run(&finish).await?;
         self.registry
-            .publish_terminal(&finish.run_id, result.terminal_event.clone());
+            .publish_terminal(&finish.run_id, result.terminal_event().clone());
         self.registry.remove(&run_id);
         drop(guard);
         self.remove_event_lock(&run_id).await;
@@ -312,10 +309,42 @@ where
     }
 }
 
+impl<P, S> RunLifecycle<RunEventEnvelope<P>, S>
+where
+    P: RunEventPayload,
+    S: RunStore<RunEventEnvelope<P>>,
+{
+    pub async fn append_event(
+        &self,
+        run_id: &RunId,
+        session_id: &SessionId,
+        payload: P,
+    ) -> Result<AppendEventResult<RunEventEnvelope<P>>, MachineError> {
+        let event_run_id = run_id.clone();
+        let event_session_id = session_id.clone();
+        self.append_with(run_id, move |seq| {
+            RunEventEnvelope::new(event_run_id, event_session_id, seq, payload)
+        })
+        .await
+    }
+
+    pub async fn finish_run(
+        &self,
+        finish: RunFinish,
+        payload: P,
+    ) -> Result<FinishRunResult<RunEventEnvelope<P>>, MachineError> {
+        let event_run_id = finish.run_id.clone();
+        let event_session_id = finish.session_id.clone();
+        self.finish_with(finish, move |seq| {
+            RunEventEnvelope::new(event_run_id, event_session_id, seq, payload)
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::SessionId;
     use crate::store::{MemoryRunStore, RunStart, RunStore};
     use async_rt::sync::Notify;
     use async_trait::async_trait;
@@ -323,31 +352,18 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct TestEvent {
-        run_id: RunId,
-        session_id: SessionId,
-        seq: i64,
+    struct TestPayload {
         terminal: bool,
         name: &'static str,
     }
 
-    impl RunEvent for TestEvent {
-        fn run_id(&self) -> &RunId {
-            &self.run_id
-        }
-
-        fn session_id(&self) -> &SessionId {
-            &self.session_id
-        }
-
-        fn seq(&self) -> i64 {
-            self.seq
-        }
-
+    impl RunEventPayload for TestPayload {
         fn is_terminal(&self) -> bool {
             self.terminal
         }
     }
+
+    type TestEvent = RunEventEnvelope<TestPayload>;
 
     fn lifecycle() -> RunLifecycle<TestEvent, MemoryRunStore<TestEvent>> {
         RunLifecycle::new(
@@ -375,18 +391,24 @@ mod tests {
         serde_json::json!({"tenant": "demo"})
     }
 
-    fn event(run_id: &str, seq: i64, terminal: bool) -> TestEvent {
-        TestEvent {
-            run_id: RunId::from(run_id),
-            session_id: SessionId::from("session-a"),
-            seq,
+    fn payload(terminal: bool) -> TestPayload {
+        TestPayload {
             terminal,
             name: if terminal { "terminal" } else { "event" },
         }
     }
 
-    fn finish_request(run_id: &str, status: RunStatus) -> RunFinishRequest {
-        RunFinishRequest {
+    fn event(run_id: &str, seq: i64, terminal: bool) -> TestEvent {
+        RunEventEnvelope::new(
+            RunId::from(run_id),
+            SessionId::from("session-a"),
+            seq,
+            payload(terminal),
+        )
+    }
+
+    fn finish_request(run_id: &str, status: RunStatus) -> RunFinish {
+        RunFinish {
             run_id: RunId::from(run_id),
             session_id: SessionId::from("session-a"),
             status,
@@ -411,7 +433,11 @@ mod tests {
                 .expect("start");
 
             let result = lifecycle
-                .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                .append_event(
+                    &RunId::from("run-a"),
+                    &SessionId::from("session-a"),
+                    payload(false),
+                )
                 .await
                 .expect("append");
             assert!(matches!(result, AppendEventResult::Recorded(_)));
@@ -440,16 +466,18 @@ mod tests {
                 .await
                 .expect("start");
             let terminal = lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Completed), |seq| {
-                    event("run-a", seq, true)
-                })
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
                 .await
                 .expect("finish");
-            assert!(terminal.won);
-            assert_eq!(terminal.terminal_event.seq, 1);
+            assert!(terminal.is_finished());
+            assert_eq!(terminal.terminal_event().seq, 1);
             assert_eq!(lifecycle.registry().len(), 0);
             let append = lifecycle
-                .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                .append_event(
+                    &RunId::from("run-a"),
+                    &SessionId::from("session-a"),
+                    payload(false),
+                )
                 .await;
             assert!(matches!(append, Err(MachineError::RunNotFound)));
         });
@@ -468,17 +496,19 @@ mod tests {
                 .await
                 .expect("start");
             lifecycle
-                .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                .append_event(
+                    &RunId::from("run-a"),
+                    &SessionId::from("session-a"),
+                    payload(false),
+                )
                 .await
                 .expect("append");
 
             let terminal = lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Completed), |seq| {
-                    event("run-a", seq, true)
-                })
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
                 .await
                 .expect("finish");
-            assert_eq!(terminal.terminal_event.seq, 2);
+            assert_eq!(terminal.terminal_event().seq, 2);
         });
     }
 
@@ -499,9 +529,7 @@ mod tests {
                 .await
                 .expect("start first");
             lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Completed), |seq| {
-                    event("run-a", seq, true)
-                })
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
                 .await
                 .expect("finish");
 
@@ -532,24 +560,24 @@ mod tests {
                 .await
                 .expect("start");
             let first = lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Completed), |seq| {
-                    event("run-a", seq, true)
-                })
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
                 .await
                 .expect("first finish");
             let called = Arc::new(AtomicBool::new(false));
-            let called_by_closure = Arc::clone(&called);
 
             let second = lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Error), move |seq| {
-                    called_by_closure.store(true, Ordering::SeqCst);
-                    event("run-a", seq, true)
+                .finish_with(finish_request("run-a", RunStatus::Error), {
+                    let called = Arc::clone(&called);
+                    move |seq| {
+                        called.store(true, Ordering::SeqCst);
+                        event("run-a", seq, true)
+                    }
                 })
                 .await
                 .expect("second finish");
 
-            assert!(!second.won);
-            assert_eq!(second.terminal_event, first.terminal_event);
+            assert!(matches!(second, FinishRunResult::AlreadyFinished(_)));
+            assert_eq!(second.terminal_event(), first.terminal_event());
             assert!(!called.load(Ordering::SeqCst));
         });
     }
@@ -571,7 +599,11 @@ mod tests {
             let first_lifecycle = lifecycle.clone();
             let first = async_rt::spawn(async move {
                 first_lifecycle
-                    .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                    .append_event(
+                        &RunId::from("run-a"),
+                        &SessionId::from("session-a"),
+                        payload(false),
+                    )
                     .await
             });
             async_rt::time::timeout(Duration::from_secs(1), store.blocked.notified())
@@ -581,7 +613,11 @@ mod tests {
             let second_lifecycle = lifecycle.clone();
             let second = async_rt::spawn(async move {
                 second_lifecycle
-                    .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                    .append_event(
+                        &RunId::from("run-a"),
+                        &SessionId::from("session-a"),
+                        payload(false),
+                    )
                     .await
             });
             async_rt::time::sleep(Duration::from_millis(20)).await;
@@ -629,7 +665,11 @@ mod tests {
                 .await
                 .expect("start");
             lifecycle
-                .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                .append_event(
+                    &RunId::from("run-a"),
+                    &SessionId::from("session-a"),
+                    payload(false),
+                )
                 .await
                 .expect("append");
 
@@ -644,7 +684,11 @@ mod tests {
             assert_eq!(tail.cursor(), 1);
 
             lifecycle
-                .append_event(&RunId::from("run-a"), |seq| event("run-a", seq, false))
+                .append_event(
+                    &RunId::from("run-a"),
+                    &SessionId::from("session-a"),
+                    payload(false),
+                )
                 .await
                 .expect("append live");
             assert_eq!(tail.next_event().await.expect("live").seq, 2);
@@ -677,9 +721,7 @@ mod tests {
                 .await
                 .expect("start");
             lifecycle
-                .finish_run(finish_request("run-a", RunStatus::Completed), |seq| {
-                    event("run-a", seq, true)
-                })
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
                 .await
                 .expect("finish");
 
@@ -816,7 +858,7 @@ mod tests {
 
         async fn finish_run(
             &self,
-            finish: &RunFinish<TestEvent>,
+            finish: &RunFinishRecord<TestEvent>,
         ) -> Result<FinishRunResult<TestEvent>, MachineError> {
             self.inner.finish_run(finish).await
         }
