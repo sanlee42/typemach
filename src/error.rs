@@ -26,6 +26,12 @@ pub enum MachineError {
     #[error("run is already active")]
     RunAlreadyActive,
 
+    #[error("run not found")]
+    RunNotFound,
+
+    #[error("invalid run event: {reason}")]
+    InvalidRunEvent { reason: String },
+
     #[error("run cancelled")]
     Cancelled,
 
