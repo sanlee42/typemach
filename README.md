@@ -39,19 +39,19 @@ impl Machine for MyAgent {
 - Interrupt and resume are typed. No `Command(resume=...)` with an opaque payload.
 - `Runner::stream` emits events while the transition future runs. Not a replay.
 - Cooperative cancellation drops in-flight futures.
-- `CheckpointSaver` trait. In-memory and Postgres backends. Records are transparent JSON.
+- `CheckpointSaver` trait. In-memory, SQLite, and Postgres backends. Records are transparent JSON.
 - Bounded backpressure on stream channels.
 - Heartbeat during long steps and while waiting for the session lock.
 - `Runtime` wraps `Runner` + run lifecycle storage for persisted run events.
-- `TxRuntime` + `PgStore` commit checkpoint, stream events, and terminal run state together.
-- `TxRuntime` leases Pg runs, renews active ownership, and reaps stale `running` runs as errors.
+- `TxRuntime` + `PgStore`/`SqliteStore` commit checkpoint, stream events, and terminal run state together.
+- `TxRuntime` leases runs, renews active ownership, fences checkpoints by thread, and reaps stale `running` runs as errors.
 - `MachineState` has a blanket impl for any `Serialize + DeserializeOwned` type.
 
 ## Install
 
 ```toml
 [dependencies]
-typemach = { git = "https://github.com/sanlee42/typemach.git", features = ["postgres"] }
+typemach = { git = "https://github.com/sanlee42/typemach.git", features = ["sqlite"] }
 ```
 
 ## Example
@@ -89,9 +89,13 @@ runner.cancel_run(&run_id).await;
 
 Checkpoints are written after every step transition. Interrupts persist state + step + typed payload. Resume loads the record and calls `apply_resume_input`.
 
-For persisted runs, use `TxRuntime` with `PgStore`. `PgStore` owns generic `typemach_*` tables for sessions, runs, run events, and checkpoints. It stores typed event envelopes as JSON and keeps `scope`, metadata, idempotency keys, cancellation, terminal status, and checkpoint writes in one Postgres-backed path.
+For persisted runs, use `TxRuntime` with `PgStore` or `SqliteStore`. Both stores own generic `typemach_*` tables for sessions, runs, run events, thread leases, and checkpoints. They store typed event envelopes as JSON and keep `scope`, metadata, idempotency keys, cancellation, terminal status, and checkpoint writes in one transactional path.
 
-`TxRuntime` also owns run leases. Each active run carries a `LeaseId`; every Pg commit checks that token before writing checkpoint/events/terminal state. If a process dies, another instance can call `TxRuntime::reap(limit)` to finalize expired `running` runs as `error` with `lease_expired`.
+`TxRuntime` also owns run and thread leases. Each active run carries a `LeaseId`; every commit checks that token before writing checkpoint/events/terminal state. Stores enforce at most one `running` run per `thread_id`, and leased runs also claim the target thread lease, so two workers cannot advance different runs against the same checkpoint thread. If a process dies, another instance can call `TxRuntime::reap(limit)` to finalize expired `running` runs as `error` with `lease_expired`, releasing the thread for a later run.
+
+SQLite is available behind the `sqlite` feature and is the default local durable backend. Use `sqlite-bundled` if the target environment should build with bundled SQLite instead of a system library. Postgres remains the production network store behind the `postgres` feature.
+
+The optional `testkit` feature exposes reusable store conformance tests for backend authors. It covers idempotent start, scope isolation, event sequence checks, terminal-once behavior, running-thread exclusivity, rejected-commit rollback, lease fencing, checkpoint commits, and stale-run reaping.
 
 ## License
 

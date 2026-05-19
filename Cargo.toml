@@ -8,6 +8,9 @@ license = "MIT OR Apache-2.0"
 [features]
 default = []
 postgres = ["dep:deadpool-postgres"]
+sqlite = ["dep:tokio-rusqlite"]
+sqlite-bundled = ["sqlite", "tokio-rusqlite/bundled"]
+testkit = []
 
 [dependencies]
 async_rt = { package = "tokio", version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
@@ -17,7 +20,9 @@ async-trait = "0.1"
 tracing = "0.1"
 thiserror = "2"
 deadpool-postgres = { version = "0.14", optional = true }
+tokio-rusqlite = { version = "0.7", optional = true }
 
 [dev-dependencies]
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tempfile = "3"

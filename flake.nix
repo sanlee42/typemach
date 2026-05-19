@@ -18,6 +18,7 @@
             pkgs.mold
             pkgs.gcc.cc.lib
             pkgs.postgresql
+            pkgs.sqlite
           ];
 
           shellHook = ''

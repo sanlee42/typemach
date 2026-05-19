@@ -32,6 +32,12 @@ pub enum MachineError {
     #[error("run is owned by another worker")]
     NotOwner { owner: Option<crate::run::WorkerId> },
 
+    #[error("thread is busy")]
+    ThreadBusy {
+        owner: Option<crate::run::WorkerId>,
+        run: Option<crate::run::RunId>,
+    },
+
     #[error("run not found")]
     RunNotFound,
 
