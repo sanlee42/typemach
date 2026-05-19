@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::op::{EffectStatus, EffectUpdate, Item, ItemWrite};
+use crate::op::{EffectStatus, EffectUpdate, Entry, EntryWrite, Item, ItemWrite};
 
 use super::*;
 
@@ -64,6 +64,31 @@ where
     Ok(())
 }
 
+pub(super) fn validate_entries<E, Scope, FinishData>(
+    inner: &MemoryRunStoreInner<E, Scope, FinishData>,
+    scope_key: &str,
+    session_id: &SessionId,
+    entries: &[EntryWrite],
+) -> Result<(), MachineError>
+where
+    E: RunEvent,
+{
+    for (index, entry) in entries.iter().enumerate() {
+        if entries[..index].iter().any(|prev| prev.key == entry.key) {
+            return Err(MachineError::EntryConflict);
+        }
+        let key = (scope_key.to_string(), session_id.clone(), entry.key.clone());
+        if let Some(existing) = inner.entries.get(&key)
+            && (existing.kind != entry.kind
+                || existing.vis != entry.vis
+                || existing.body != entry.body)
+        {
+            return Err(MachineError::EntryConflict);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn apply_effect_updates<E, Scope, FinishData>(
     inner: &mut MemoryRunStoreInner<E, Scope, FinishData>,
     run_id: &RunId,
@@ -117,4 +142,41 @@ where
         );
     }
     Ok(())
+}
+
+pub(super) fn apply_entries<E, Scope, FinishData>(
+    inner: &mut MemoryRunStoreInner<E, Scope, FinishData>,
+    scope_key: &str,
+    run_id: &RunId,
+    session_id: &SessionId,
+    thread_id: &ThreadId,
+    entries: &[EntryWrite],
+) where
+    E: RunEvent,
+{
+    let now = now_ms();
+    for entry in entries {
+        let key = (scope_key.to_string(), session_id.clone(), entry.key.clone());
+        if inner.entries.contains_key(&key) {
+            continue;
+        }
+        let seq_key = (scope_key.to_string(), session_id.clone());
+        let seq = inner.entry_seq.entry(seq_key).or_default();
+        *seq += 1;
+        inner.entries.insert(
+            key,
+            Entry {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                thread_id: thread_id.clone(),
+                seq: *seq,
+                key: entry.key.clone(),
+                kind: entry.kind.clone(),
+                vis: entry.vis,
+                body: entry.body.clone(),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+    }
 }

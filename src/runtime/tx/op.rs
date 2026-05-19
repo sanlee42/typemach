@@ -4,12 +4,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::*;
-use crate::op::{Effect, EffectUpdate, ItemWrite, RunOps};
+use crate::op::{Effect, EffectUpdate, EntryWrite, ItemWrite, RunOps};
 
 #[derive(Debug, Default)]
 pub(super) struct PendingOps {
     pub(super) effects: Vec<EffectUpdate>,
     pub(super) items: Vec<ItemWrite>,
+    pub(super) entries: Vec<EntryWrite>,
 }
 
 pub(super) struct TxRunOps<S>
@@ -107,6 +108,23 @@ where
             return Err(MachineError::ItemConflict);
         }
         pending.items.push(item);
+        Ok(())
+    }
+
+    async fn push_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError> {
+        self.check_run(run_id)?;
+        let mut pending = self.pending.lock().await;
+        if let Some(existing) = pending
+            .entries
+            .iter()
+            .find(|existing| existing.key == entry.key)
+        {
+            if existing == &entry {
+                return Ok(());
+            }
+            return Err(MachineError::EntryConflict);
+        }
+        pending.entries.push(entry);
         Ok(())
     }
 }

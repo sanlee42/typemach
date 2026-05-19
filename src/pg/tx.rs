@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::*;
-use crate::op::{Effect, Item};
+use crate::op::{Effect, Entry, EntryQuery, Item, Vis};
 use crate::run::LeaseId;
 use crate::store::RunTx;
 
@@ -19,9 +19,13 @@ where
         &self,
         commit: &RunCommit<E, Data, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
+        if commit.events.is_empty()
+            && commit.effects.is_empty()
+            && commit.items.is_empty()
+            && commit.entries.is_empty()
+        {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires an event, effect, or item".to_string(),
+                reason: "commit requires an event, effect, item, or entry".to_string(),
             });
         }
         validate_commit(commit)?;
@@ -97,6 +101,15 @@ where
         }
         apply_effect_updates_tx(&tx, &commit.run_id, &commit.effects).await?;
         apply_items_tx(&tx, &commit.run_id, &commit.items).await?;
+        apply_entries_tx(
+            &tx,
+            &scope_key,
+            &commit.run_id,
+            &commit.session_id,
+            &ThreadId::from(row.get::<_, String>(4)),
+            &commit.entries,
+        )
+        .await?;
 
         if let Some(finish) = &commit.finish {
             let terminal_event =
@@ -238,5 +251,55 @@ where
             return Ok(Vec::new());
         }
         list_effects_tx(&client, run_id, limit).await
+    }
+
+    async fn list_entries(
+        &self,
+        query: EntryQuery<'_, Scope>,
+    ) -> Result<Page<Entry>, MachineError> {
+        if query.limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let scope_key = scope_key(query.scope)?;
+        let fetch = query.limit.saturating_add(1).min(i64::MAX as usize);
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let rows = EntryQuery {
+            scope: scope_key.as_str(),
+            session_id: query.session_id,
+            thread_id: query.thread_id,
+            kind: query.kind,
+            vis: query.vis,
+            after_seq: query.after_seq,
+            limit: fetch,
+        };
+        let mut entries = list_entries_tx(&client, rows).await?;
+        let next = if entries.len() > query.limit {
+            entries.truncate(query.limit);
+            entries.last().map(|entry| entry.seq)
+        } else {
+            None
+        };
+        Ok(Page::new(entries, next))
+    }
+
+    async fn latest_entry(
+        &self,
+        scope: &Scope,
+        session_id: &SessionId,
+        thread_id: Option<&ThreadId>,
+        kind: &str,
+        vis: Option<Vis>,
+    ) -> Result<Option<Entry>, MachineError> {
+        let scope_key = scope_key(scope)?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        latest_entry_tx(&client, &scope_key, session_id, thread_id, kind, vis).await
     }
 }

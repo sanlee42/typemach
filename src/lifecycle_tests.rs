@@ -1,5 +1,5 @@
 use super::*;
-use crate::op::Page;
+use crate::op::{EntryWrite, Page};
 use crate::run::{LeaseId, ThreadId, WorkerId};
 use crate::store::{
     LeaseClaim, MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult,
@@ -44,6 +44,8 @@ fn run_start(run_id: &str, key: Option<&str>) -> RunStart {
         retry_of_run_id: None,
         scope: scope(),
         metadata: serde_json::json!({}),
+        input: None,
+        entries: Vec::new(),
         lease: None,
     }
 }
@@ -86,6 +88,7 @@ fn finish_request(run_id: &str, status: RunStatus) -> RunFinish {
         status,
         finish_reason: "stop".to_string(),
         error_code: None,
+        entries: Vec::new(),
         data: (),
     }
 }
@@ -161,6 +164,18 @@ impl RunStore<TestEvent> for BlockingRecordStore {
         key: &str,
     ) -> Result<Option<RunLookup>, MachineError> {
         self.inner.find_idempotent_run(scope, session_id, key).await
+    }
+
+    async fn check_run_start(
+        &self,
+        run_id: &RunId,
+        scope: &Value,
+        input: Option<&Value>,
+        entries: &[EntryWrite],
+    ) -> Result<(), MachineError> {
+        self.inner
+            .check_run_start(run_id, scope, input, entries)
+            .await
     }
 
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Value) -> Result<(), MachineError> {

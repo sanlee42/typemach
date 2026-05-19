@@ -182,6 +182,8 @@ where
             retry_of_run_id: start.retry_of,
             scope: start.scope,
             metadata: start.meta,
+            input: start.input,
+            entries: start.entries,
             lease: Some(claim),
         };
         let token = start.token.unwrap_or_else(|| req.run_id.to_string());
@@ -463,6 +465,7 @@ where
                             event_count: 0,
                             effects: ops.effects,
                             items: ops.items,
+                            entries: ops.entries,
                             finish: None,
                         },
                         vec![payload],
@@ -496,6 +499,7 @@ where
                             event_count: 0,
                             effects: Vec::new(),
                             items: Vec::new(),
+                            entries: Vec::new(),
                             finish: None,
                         },
                         vec![payload],
@@ -533,6 +537,7 @@ where
                 status,
                 finish_reason: reason.to_string(),
                 error_code: code,
+                entries: Vec::new(),
                 data: S::FinishData::default(),
             };
             let ops = ctx.ops.take().await;
@@ -548,6 +553,7 @@ where
                         event_count: 0,
                         effects: ops.effects,
                         items: ops.items,
+                        entries: ops.entries,
                         finish: Some(finish),
                     },
                     payloads,
@@ -632,6 +638,7 @@ async fn tx_cancel_and_finish<M, S>(
         status: RunStatus::Cancelled,
         finish_reason: reason.to_string(),
         error_code: None,
+        entries: Vec::new(),
         data: S::FinishData::default(),
     };
     let ops = ctx.ops.take().await;
@@ -647,6 +654,7 @@ async fn tx_cancel_and_finish<M, S>(
                 event_count: 0,
                 effects: ops.effects,
                 items: ops.items,
+                entries: ops.entries,
                 finish: Some(finish),
             },
             payloads,
@@ -680,6 +688,7 @@ async fn tx_finish_error<M, S>(
         status: RunStatus::Error,
         finish_reason: "failed".to_string(),
         error_code: Some(error_code(error).to_string()),
+        entries: Vec::new(),
         data: S::FinishData::default(),
     };
     let ops = ctx.ops.take().await;
@@ -695,6 +704,7 @@ async fn tx_finish_error<M, S>(
                 event_count: 0,
                 effects: ops.effects,
                 items: ops.items,
+                entries: ops.entries,
                 finish: Some(finish),
             },
             payloads,

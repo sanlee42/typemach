@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::checkpoint::CheckpointRecord;
 use crate::error::MachineError;
-use crate::op::{Effect, EffectUpdate, Item, ItemWrite, Page};
+use crate::op::{Effect, EffectUpdate, Entry, EntryQuery, EntryWrite, Item, ItemWrite, Page, Vis};
 use crate::run::{LeaseId, RunId, SessionId, ThreadId, WorkerId};
 
 pub trait RunEvent: Clone + Send + Sync + 'static {
@@ -139,6 +139,8 @@ pub struct RunStart<Scope = Value> {
     pub retry_of_run_id: Option<RunId>,
     pub scope: Scope,
     pub metadata: Value,
+    pub input: Option<Value>,
+    pub entries: Vec<EntryWrite>,
     pub lease: Option<LeaseClaim>,
 }
 
@@ -151,6 +153,7 @@ pub struct RunFinishRecord<E: RunEvent, Data = (), Scope = Value> {
     pub finish_reason: String,
     pub error_code: Option<String>,
     pub terminal_event: E,
+    pub entries: Vec<EntryWrite>,
     pub data: Data,
 }
 
@@ -162,6 +165,7 @@ pub struct RunFinish<Data = (), Scope = Value> {
     pub status: RunStatus,
     pub finish_reason: String,
     pub error_code: Option<String>,
+    pub entries: Vec<EntryWrite>,
     pub data: Data,
 }
 
@@ -178,6 +182,7 @@ impl<Data, Scope> RunFinish<Data, Scope> {
             finish_reason: self.finish_reason,
             error_code: self.error_code,
             terminal_event,
+            entries: self.entries,
             data: self.data,
         }
     }
@@ -205,6 +210,7 @@ pub struct RunCommit<E: RunEvent, Data = (), Scope = Value> {
     pub events: Vec<E>,
     pub effects: Vec<EffectUpdate>,
     pub items: Vec<ItemWrite>,
+    pub entries: Vec<EntryWrite>,
     pub finish: Option<RunFinish<Data, Scope>>,
 }
 
@@ -215,6 +221,7 @@ pub struct CommitPlan<Data = (), Scope = Value> {
     pub event_count: usize,
     pub effects: Vec<EffectUpdate>,
     pub items: Vec<ItemWrite>,
+    pub entries: Vec<EntryWrite>,
     pub finish: Option<RunFinish<Data, Scope>>,
 }
 
@@ -336,6 +343,14 @@ where
         key: &str,
     ) -> Result<Option<RunLookup>, MachineError>;
 
+    async fn check_run_start(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        input: Option<&Value>,
+        entries: &[EntryWrite],
+    ) -> Result<(), MachineError>;
+
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Self::Scope)
     -> Result<(), MachineError>;
 
@@ -396,6 +411,20 @@ where
         scope: &Self::Scope,
         limit: usize,
     ) -> Result<Vec<Effect>, MachineError>;
+
+    async fn list_entries(
+        &self,
+        query: EntryQuery<'_, Self::Scope>,
+    ) -> Result<Page<Entry>, MachineError>;
+
+    async fn latest_entry(
+        &self,
+        scope: &Self::Scope,
+        session_id: &SessionId,
+        thread_id: Option<&ThreadId>,
+        kind: &str,
+        vis: Option<Vis>,
+    ) -> Result<Option<Entry>, MachineError>;
 }
 
 #[async_trait]

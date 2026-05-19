@@ -11,7 +11,7 @@ use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
-use crate::op::Page;
+use crate::op::{EntryWrite, Page};
 use crate::run::{RunId, SessionId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
@@ -95,6 +95,7 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                     parent_run_id TEXT NULL,
                     retry_of_run_id TEXT NULL,
                     metadata TEXT NOT NULL DEFAULT '{}',
+                    input TEXT NULL,
                     status TEXT NOT NULL,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     started_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
@@ -170,9 +171,28 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                     created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
                     updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
                     PRIMARY KEY (run_id, key)
+                );
+                CREATE TABLE IF NOT EXISTS typemach_entries (
+                    scope_key TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    run_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    vis TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    PRIMARY KEY (scope_key, session_id, key),
+                    UNIQUE (scope_key, session_id, seq),
+                    FOREIGN KEY (scope_key, session_id)
+                        REFERENCES typemach_sessions(scope_key, session_id)
+                        ON DELETE CASCADE
                 );",
             )
             .map_err(store_db)?;
+            ensure_run_input_column(conn)?;
             Ok(())
         })
         .await
@@ -282,6 +302,10 @@ where
                 .map_err(store_db)?;
             insert_session_tx(&tx, &run.session_id, &scope_key, &scope_json, now)?;
             if let Some(existing) = lookup_run_tx(&tx, &run.run_id, &scope_key)? {
+                if run_input_tx(&tx, &existing.run_id)? != run.input {
+                    return Err(MachineError::InputConflict);
+                }
+                check_entries_tx(&tx, &scope_key, &existing.session_id, &run.entries)?;
                 tx.commit().map_err(store_db)?;
                 return Ok(StoreStartResult::Existing(existing));
             }
@@ -289,6 +313,10 @@ where
                 && let Some(existing) =
                     find_idempotent_tx(&tx, &scope_key, &run.session_id, key)?
             {
+                if run_input_tx(&tx, &existing.run_id)? != run.input {
+                    return Err(MachineError::InputConflict);
+                }
+                check_entries_tx(&tx, &scope_key, &existing.session_id, &run.entries)?;
                 tx.commit().map_err(store_db)?;
                 return Ok(StoreStartResult::Existing(existing));
             }
@@ -301,6 +329,7 @@ where
 
             let parent = run.parent_run_id.as_ref().map(RunId::as_str);
             let retry = run.retry_of_run_id.as_ref().map(RunId::as_str);
+            let input = run.input.as_ref().map(json_text).transpose()?;
             let owner = run.lease.as_ref().map(|lease| lease.owner.as_str());
             let lease_id = run.lease.as_ref().map(|lease| lease.id.as_str());
             let until = run
@@ -311,12 +340,12 @@ where
             tx.execute(
                 "INSERT INTO typemach_runs (
                     run_id, session_id, thread_id, scope_key, scope, agent_kind, model,
-                    client_run_key, parent_run_id, retry_of_run_id, metadata, status,
+                    client_run_key, parent_run_id, retry_of_run_id, metadata, input, status,
                     owner_id, lease_id, lease_expires_at, attempt, started_at, created_at, updated_at
                  )
                  VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?17, ?17
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?18, ?18
                  )",
                 params![
                     run.run_id.as_str(),
@@ -330,6 +359,7 @@ where
                     parent,
                     retry,
                     metadata,
+                    input,
                     RunStatus::Running.as_str(),
                     owner,
                     lease_id,
@@ -345,6 +375,14 @@ where
                 tx.rollback().map_err(store_db)?;
                 return Err(err);
             }
+            apply_entries_tx(
+                &tx,
+                &scope_key,
+                &run.run_id,
+                &run.session_id,
+                &run.thread_id,
+                &run.entries,
+            )?;
             tx.commit().map_err(store_db)?;
             Ok(StoreStartResult::Created)
         })
@@ -375,6 +413,7 @@ where
             events: vec![finish.terminal_event.clone()],
             effects: Vec::new(),
             items: Vec::new(),
+            entries: finish.entries.clone(),
             finish: Some(RunFinish {
                 run_id: finish.run_id.clone(),
                 session_id: finish.session_id.clone(),
@@ -382,6 +421,7 @@ where
                 status: finish.status,
                 finish_reason: finish.finish_reason.clone(),
                 error_code: finish.error_code.clone(),
+                entries: Vec::new(),
                 data: finish.data.clone(),
             }),
         };
@@ -440,6 +480,37 @@ where
         .await
     }
 
+    async fn check_run_start(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        input: Option<&Value>,
+        entries: &[EntryWrite],
+    ) -> Result<(), MachineError> {
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        let input = input.cloned();
+        let entries = entries.to_vec();
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_db)?;
+            let lookup = lookup_run_tx(&tx, &run_id, &scope_key)?;
+            let Some(lookup) = lookup else {
+                tx.commit().map_err(store_db)?;
+                return Err(MachineError::RunNotFound);
+            };
+            let stored = run_input_tx(&tx, &run_id)?;
+            if stored != input {
+                return Err(MachineError::InputConflict);
+            }
+            check_entries_tx(&tx, &scope_key, &lookup.session_id, &entries)?;
+            tx.commit().map_err(store_db)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Scope) -> Result<(), MachineError> {
         let run_id = run_id.clone();
         let scope_key = scope_key(scope)?;
@@ -475,6 +546,7 @@ where
             events: vec![event.clone()],
             effects: Vec::new(),
             items: Vec::new(),
+            entries: Vec::new(),
             finish: None,
         };
         match self.commit_run(&commit).await? {

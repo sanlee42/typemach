@@ -43,6 +43,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                 retry_of_run_id: None,
                 scope: scope.clone(),
                 metadata: serde_json::json!({}),
+                input: None,
+                entries: Vec::new(),
                 lease: None,
             })
             .await
@@ -75,6 +77,7 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                 events: vec![event],
                 effects: Vec::new(),
                 items: Vec::new(),
+                entries: Vec::new(),
                 finish: None,
             })
             .await
@@ -106,6 +109,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                 retry_of_run_id: None,
                 scope: scope.clone(),
                 metadata: serde_json::json!({}),
+                input: None,
+                entries: Vec::new(),
                 lease: Some(LeaseClaim::new(
                     owner.clone(),
                     lease_id.clone(),
@@ -131,6 +136,7 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
             events: vec![leased_event.clone()],
             effects: Vec::new(),
             items: Vec::new(),
+            entries: Vec::new(),
             finish: None,
         };
         assert!(matches!(
@@ -181,6 +187,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                 retry_of_run_id: None,
                 scope: scope.clone(),
                 metadata: serde_json::json!({}),
+                input: None,
+                entries: Vec::new(),
                 lease: Some(LeaseClaim::new(
                     WorkerId::from("worker-stale"),
                     LeaseId::from("lease-stale"),
@@ -225,6 +233,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                     retry_of_run_id: None,
                     scope: scope_a.clone(),
                     metadata: serde_json::json!({}),
+                    input: None,
+                    entries: Vec::new(),
                     lease: None,
                 })
                 .await
@@ -244,6 +254,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                     retry_of_run_id: None,
                     scope: scope_b.clone(),
                     metadata: serde_json::json!({}),
+                    input: None,
+                    entries: Vec::new(),
                     lease: None,
                 })
                 .await

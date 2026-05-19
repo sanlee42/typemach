@@ -146,6 +146,42 @@ pub(super) fn find_idempotent_tx(
     row.map(LookupRow::into_lookup).transpose()
 }
 
+pub(super) fn ensure_run_input_column(
+    conn: &tokio_rusqlite::rusqlite::Connection,
+) -> Result<(), MachineError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(typemach_runs)")
+        .map_err(store_db)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(store_db)?;
+    for row in rows {
+        if row.map_err(store_db)? == "input" {
+            return Ok(());
+        }
+    }
+    conn.execute("ALTER TABLE typemach_runs ADD COLUMN input TEXT NULL", [])
+        .map_err(store_db)?;
+    Ok(())
+}
+
+pub(super) fn run_input_tx(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+) -> Result<Option<serde_json::Value>, MachineError> {
+    let raw = tx
+        .query_row(
+            "SELECT input FROM typemach_runs WHERE run_id = ?1",
+            params![run_id.as_str()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(store_db)?
+        .flatten();
+    raw.map(|raw| serde_json::from_str(raw.as_str()).map_err(MachineError::Deserialization))
+        .transpose()
+}
+
 pub(super) fn lookup_row(row: &Row<'_>) -> tokio_rusqlite::rusqlite::Result<LookupRow> {
     Ok(LookupRow {
         run_id: row.get(0)?,

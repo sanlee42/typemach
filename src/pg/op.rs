@@ -6,6 +6,9 @@ use super::*;
 use crate::op::{Effect, EffectStatus, EffectUpdate, Item, ItemWrite};
 use crate::run::LeaseId;
 
+mod entry;
+pub(super) use entry::*;
+
 pub(super) async fn check_op_run_tx<C>(
     tx: &C,
     run_id: &RunId,

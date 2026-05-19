@@ -239,6 +239,8 @@ fn tx_runtime_reaps_stale_leased_runs() {
                 retry_of_run_id: None,
                 scope: scope(),
                 metadata: json!({}),
+                input: None,
+                entries: Vec::new(),
                 lease: Some(LeaseClaim::new(
                     WorkerId::from("worker-stale"),
                     LeaseId::from("lease-stale"),

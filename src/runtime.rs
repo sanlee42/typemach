@@ -13,6 +13,7 @@ use crate::lifecycle::{
     AppendEventResult, RunLifecycle, RunSubscription, StartRunRejection, StartRunResult,
 };
 use crate::machine::Machine;
+use crate::op::EntryWrite;
 use crate::registry::{RunHandle, RunRegistry};
 use crate::run::{
     LeaseId, RunEventReceiver, RunId, RunOutput, RunRequest, RunStreamEvent, SessionId, StepResult,
@@ -81,6 +82,8 @@ pub struct Start<Scope = Value> {
     pub parent: Option<RunId>,
     pub retry_of: Option<RunId>,
     pub meta: Value,
+    pub input: Option<Value>,
+    pub entries: Vec<EntryWrite>,
     pub token: Option<String>,
 }
 
@@ -94,6 +97,8 @@ impl<Scope> Start<Scope> {
             parent: None,
             retry_of: None,
             meta: Value::Object(Default::default()),
+            input: None,
+            entries: Vec::new(),
             token: None,
         }
     }
@@ -222,6 +227,8 @@ where
             retry_of_run_id: start.retry_of,
             scope: start.scope,
             metadata: start.meta,
+            input: start.input,
+            entries: start.entries,
             lease: None,
         };
         let token = start.token.unwrap_or_else(|| req.run_id.to_string());
@@ -512,6 +519,7 @@ where
                 status,
                 finish_reason: reason.to_string(),
                 error_code: code,
+                entries: Vec::new(),
                 data: S::FinishData::default(),
             };
             let result = life.finish_run(finish, payload).await?;
@@ -618,6 +626,7 @@ async fn cancel_and_finish<M, C, S>(
         status: RunStatus::Cancelled,
         finish_reason: reason.to_string(),
         error_code: None,
+        entries: Vec::new(),
         data: S::FinishData::default(),
     };
     let _ = life.finish_run(finish, Payload::Cancel).await;
@@ -640,6 +649,7 @@ async fn finish_error<S>(
         status: RunStatus::Error,
         finish_reason: "failed".to_string(),
         error_code: Some(error_code(error).to_string()),
+        entries: Vec::new(),
         data: S::FinishData::default(),
     };
     let _ = life
@@ -670,6 +680,8 @@ fn error_code(error: &MachineError) -> &'static str {
         MachineError::EffectPending => "effect_pending",
         MachineError::EffectNotFound => "effect_not_found",
         MachineError::ItemConflict => "item_conflict",
+        MachineError::EntryConflict => "entry_conflict",
+        MachineError::InputConflict => "input_conflict",
         MachineError::InvalidPageLimit => "invalid_page_limit",
         MachineError::StepTimeout => "step_timeout",
         MachineError::RunTimeout => "run_timeout",

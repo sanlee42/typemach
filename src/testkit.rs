@@ -32,6 +32,8 @@ where
     S: CheckpointStore + RunLease<TestEvent> + RunTx<TestEvent, Scope = Value, FinishData = ()>,
 {
     idempotent_start_and_scope(store).await?;
+    entry::idempotent_start_checks_input(store).await?;
+    entry::entries_are_session_scoped_and_private(store).await?;
     event_checkpoint_and_terminal(store).await?;
     effects_items_and_paged_replay(store).await?;
     rejected_commits_do_not_advance(store).await?;
@@ -112,6 +114,7 @@ where
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
         effects: Vec::new(),
         items: Vec::new(),
+        entries: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -136,6 +139,7 @@ where
         status: RunStatus::Completed,
         finish_reason: "done".to_string(),
         error_code: None,
+        entries: Vec::new(),
         data: (),
     };
     let done = RunCommit {
@@ -147,6 +151,7 @@ where
         events: vec![event(run_id.as_str(), session_id.as_str(), 2, true)],
         effects: Vec::new(),
         items: Vec::new(),
+        entries: Vec::new(),
         finish: Some(finish),
     };
     assert!(matches!(
@@ -228,6 +233,7 @@ where
             kind: "artifact".to_string(),
             body: json!({"value": 7}),
         }],
+        entries: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -258,6 +264,7 @@ where
         events: Vec::new(),
         effects: vec![EffectUpdate::done("effect-a", json!({"ok": true}))],
         items: Vec::new(),
+        entries: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -339,6 +346,7 @@ where
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
         effects: Vec::new(),
         items: Vec::new(),
+        entries: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -464,6 +472,7 @@ where
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
         effects: Vec::new(),
         items: Vec::new(),
+        entries: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -569,6 +578,8 @@ fn run_start(run_id: &str, session_id: &str, thread_id: &str, scope: Value) -> R
         retry_of_run_id: None,
         scope,
         metadata: json!({}),
+        input: None,
+        entries: Vec::new(),
         lease: None,
     }
 }
@@ -593,3 +604,5 @@ fn event(run_id: &str, session_id: &str, seq: i64, terminal: bool) -> TestEvent 
         },
     )
 }
+
+mod entry;

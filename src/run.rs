@@ -9,7 +9,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::op::{Effect, EffectUpdate, ItemWrite, NoopRunOps, RunOps};
+use crate::op::{Effect, EffectUpdate, EntryWrite, ItemWrite, NoopRunOps, RunOps, Vis};
 
 macro_rules! id_newtype {
     ($name:ident) => {
@@ -340,6 +340,26 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
                 ItemWrite {
                     key: key.into(),
                     kind: kind.into(),
+                    body,
+                },
+            )
+            .await
+    }
+
+    pub async fn entry(
+        &self,
+        key: impl Into<String>,
+        kind: impl Into<String>,
+        vis: Vis,
+        body: Value,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_entry(
+                &self.run_id,
+                EntryWrite {
+                    key: key.into(),
+                    kind: kind.into(),
+                    vis,
                     body,
                 },
             )

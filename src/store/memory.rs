@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
-use crate::op::EffectStatus;
+use crate::op::{EffectStatus, EntryQuery};
 
 #[derive(Debug)]
 pub struct MemoryRunStore<E: RunEvent, Scope = Value, FinishData = ()> {
@@ -65,6 +65,8 @@ struct MemoryRunStoreInner<E: RunEvent, Scope, FinishData> {
     thread_leases: HashMap<ThreadId, MemoryThreadLease>,
     checkpoints: HashMap<ThreadId, CheckpointRecord>,
     idempotency: HashMap<(String, SessionId, String), RunId>,
+    entry_seq: HashMap<(String, SessionId), i64>,
+    entries: HashMap<(String, SessionId, String), Entry>,
     effects: HashMap<(RunId, String), Effect>,
     items: HashMap<(RunId, String), Item>,
 }
@@ -78,6 +80,8 @@ impl<E: RunEvent, Scope, FinishData> Default for MemoryRunStoreInner<E, Scope, F
             thread_leases: HashMap::new(),
             checkpoints: HashMap::new(),
             idempotency: HashMap::new(),
+            entry_seq: HashMap::new(),
+            entries: HashMap::new(),
             effects: HashMap::new(),
             items: HashMap::new(),
         }
@@ -150,24 +154,37 @@ where
             .sessions
             .entry(run.session_id.clone())
             .or_insert_with(|| run.scope.clone());
+        let scope_key = scope_key(&run.scope)?;
         if let Some(existing) = inner.runs.get(&run.run_id) {
+            if existing.start.scope != run.scope {
+                return Err(MachineError::RunNotFound);
+            }
+            if existing.start.input != run.input {
+                return Err(MachineError::InputConflict);
+            }
+            validate_entries(&inner, &scope_key, &existing.start.session_id, &run.entries)?;
             return Ok(StoreStartResult::Existing(run_lookup(existing)));
         }
         let idempotency_key = if let Some(client_key) = &run.client_run_key {
             let key = (
-                scope_key(&run.scope)?,
+                scope_key.clone(),
                 run.session_id.clone(),
                 client_key.clone(),
             );
             if let Some(existing_run_id) = inner.idempotency.get(&key)
                 && let Some(existing) = inner.runs.get(existing_run_id)
             {
+                if existing.start.input != run.input {
+                    return Err(MachineError::InputConflict);
+                }
+                validate_entries(&inner, &scope_key, &existing.start.session_id, &run.entries)?;
                 return Ok(StoreStartResult::Existing(run_lookup(existing)));
             }
             Some(key)
         } else {
             None
         };
+        validate_entries(&inner, &scope_key, &run.session_id, &run.entries)?;
         if let Some((owner, run_id)) = running_memory_thread(&inner, &run.thread_id, &run.run_id) {
             return Err(MachineError::ThreadBusy { owner, run: run_id });
         }
@@ -189,6 +206,14 @@ where
                 events: Vec::new(),
                 lease: run.lease.as_ref().map(memory_lease),
             },
+        );
+        apply_entries(
+            &mut inner,
+            &scope_key,
+            &run.run_id,
+            &run.session_id,
+            &run.thread_id,
+            &run.entries,
         );
         Ok(StoreStartResult::Created)
     }
@@ -224,7 +249,7 @@ where
         let mut inner = self.inner.lock().await;
         let run = inner
             .runs
-            .get_mut(&finish.run_id)
+            .get(&finish.run_id)
             .ok_or(MachineError::RunNotFound)?;
         if finish.session_id != run.start.session_id {
             return Err(MachineError::InvalidRunEvent {
@@ -244,7 +269,22 @@ where
         if run.lease.is_some() {
             return Err(MachineError::LeaseLost);
         }
+        let scope_key = scope_key(&finish.scope)?;
+        validate_entries(&inner, &scope_key, &finish.session_id, &finish.entries)?;
         validate_next_seq(run, &finish.terminal_event)?;
+        let thread_id = run.start.thread_id.clone();
+        apply_entries(
+            &mut inner,
+            &scope_key,
+            &finish.run_id,
+            &finish.session_id,
+            &thread_id,
+            &finish.entries,
+        );
+        let run = inner
+            .runs
+            .get_mut(&finish.run_id)
+            .ok_or(MachineError::RunNotFound)?;
         run.status = finish.status;
         run.finish_reason = Some(finish.finish_reason.clone());
         run.finish_data = Some(finish.data.clone());
@@ -280,6 +320,26 @@ where
             .get(&idempotency_key)
             .and_then(|run_id| inner.runs.get(run_id))
             .map(run_lookup))
+    }
+
+    async fn check_run_start(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        input: Option<&Value>,
+        entries: &[EntryWrite],
+    ) -> Result<(), MachineError> {
+        let inner = self.inner.lock().await;
+        let run = inner.runs.get(run_id).ok_or(MachineError::RunNotFound)?;
+        if run.start.scope != *scope {
+            return Err(MachineError::RunNotFound);
+        }
+        if run.start.input.as_ref() != input {
+            return Err(MachineError::InputConflict);
+        }
+        let scope_key = scope_key(scope)?;
+        validate_entries(&inner, &scope_key, &run.start.session_id, entries)?;
+        Ok(())
     }
 
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Scope) -> Result<(), MachineError> {
@@ -402,9 +462,13 @@ where
         &self,
         commit: &RunCommit<E, FinishData, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
+        if commit.events.is_empty()
+            && commit.effects.is_empty()
+            && commit.items.is_empty()
+            && commit.entries.is_empty()
+        {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires an event, effect, or item".to_string(),
+                reason: "commit requires an event, effect, item, or entry".to_string(),
             });
         }
         validate_commit_events(commit)?;
@@ -439,6 +503,9 @@ where
         validate_event_sequence(run, &commit.events)?;
         validate_effect_updates(&inner, &commit.run_id, &commit.effects)?;
         validate_items(&inner, &commit.run_id, &commit.items)?;
+        let scope_key = scope_key(&commit.scope)?;
+        validate_entries(&inner, &scope_key, &commit.session_id, &commit.entries)?;
+        let thread_id = run.start.thread_id.clone();
         if let Some(checkpoint) = &commit.checkpoint {
             inner
                 .checkpoints
@@ -446,6 +513,14 @@ where
         }
         apply_effect_updates(&mut inner, &commit.run_id, &commit.effects)?;
         apply_items(&mut inner, &commit.run_id, &commit.items)?;
+        apply_entries(
+            &mut inner,
+            &scope_key,
+            &commit.run_id,
+            &commit.session_id,
+            &thread_id,
+            &commit.entries,
+        );
         let run = inner
             .runs
             .get_mut(&commit.run_id)
@@ -608,6 +683,63 @@ where
         effects.sort_by(|left, right| left.key.cmp(&right.key));
         effects.truncate(limit);
         Ok(effects)
+    }
+
+    async fn list_entries(
+        &self,
+        query: EntryQuery<'_, Scope>,
+    ) -> Result<Page<Entry>, MachineError> {
+        if query.limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let scope_key = scope_key(query.scope)?;
+        let inner = self.inner.lock().await;
+        let mut entries = inner
+            .entries
+            .iter()
+            .filter(|((entry_scope, entry_session, _), entry)| {
+                entry_scope == &scope_key
+                    && entry_session == query.session_id
+                    && entry.seq > query.after_seq
+                    && query
+                        .thread_id
+                        .is_none_or(|thread_id| entry.thread_id == *thread_id)
+                    && query.kind.is_none_or(|kind| entry.kind == kind)
+                    && query.vis.is_none_or(|vis| entry.vis == vis)
+            })
+            .map(|(_, entry)| entry)
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.seq);
+        let next = if entries.len() > query.limit {
+            entries.truncate(query.limit);
+            entries.last().map(|entry| entry.seq)
+        } else {
+            None
+        };
+        Ok(Page::new(entries, next))
+    }
+
+    async fn latest_entry(
+        &self,
+        scope: &Scope,
+        session_id: &SessionId,
+        thread_id: Option<&ThreadId>,
+        kind: &str,
+        vis: Option<Vis>,
+    ) -> Result<Option<Entry>, MachineError> {
+        let page = self
+            .list_entries(EntryQuery {
+                scope,
+                session_id,
+                thread_id,
+                kind: Some(kind),
+                vis,
+                after_seq: 0,
+                limit: usize::MAX,
+            })
+            .await?;
+        Ok(page.items.into_iter().max_by_key(|entry| entry.seq))
     }
 }
 

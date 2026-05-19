@@ -4,6 +4,9 @@ use super::*;
 use crate::op::{Effect, EffectStatus, EffectUpdate, Item, ItemWrite};
 use crate::run::LeaseId;
 
+mod entry;
+pub(super) use entry::*;
+
 pub(super) fn check_op_run_tx(
     tx: &Transaction<'_>,
     run_id: &RunId,

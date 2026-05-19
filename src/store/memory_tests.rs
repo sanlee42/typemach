@@ -39,6 +39,8 @@ fn run_start(run_id: &str, session_id: &str, key: Option<&str>) -> RunStart {
         retry_of_run_id: None,
         scope: serde_json::json!({"tenant": "demo"}),
         metadata: serde_json::json!({}),
+        input: None,
+        entries: Vec::new(),
         lease: None,
     }
 }
@@ -100,6 +102,7 @@ fn memory_store_records_running_events_and_skips_after_terminal() {
             finish_reason: "stop".to_string(),
             error_code: None,
             terminal_event: terminal.clone(),
+            entries: Vec::new(),
             data: (),
         };
         let result = store.finish_run(&finish).await.expect("finish");
@@ -148,6 +151,7 @@ fn memory_store_terminal_competes_once() {
             finish_reason: "stop".to_string(),
             error_code: None,
             terminal_event: first_terminal.clone(),
+            entries: Vec::new(),
             data: (),
         };
         let mut second = first.clone();
@@ -221,6 +225,7 @@ fn memory_store_scopes_terminal_event_cancel_and_record_paths() {
             finish_reason: "stop".to_string(),
             error_code: None,
             terminal_event: terminal.clone(),
+            entries: Vec::new(),
             data: (),
         };
         store.finish_run(&finish).await.expect("finish");
@@ -262,6 +267,8 @@ fn memory_store_uses_typed_scope_for_lookup_and_idempotency() {
             retry_of_run_id: None,
             scope: TestScope { tenant: "alpha" },
             metadata: serde_json::json!({}),
+            input: None,
+            entries: Vec::new(),
             lease: None,
         };
 
@@ -295,6 +302,8 @@ fn memory_store_uses_typed_scope_for_lookup_and_idempotency() {
             retry_of_run_id: None,
             scope: TestScope { tenant: "beta" },
             metadata: serde_json::json!({}),
+            input: None,
+            entries: Vec::new(),
             lease: None,
         };
         assert!(matches!(
@@ -327,6 +336,7 @@ fn memory_store_persists_typed_finish_data() {
             finish_reason: "stop".to_string(),
             error_code: None,
             terminal_event: event("run-a", "session-a", 1, true),
+            entries: Vec::new(),
             data: data.clone(),
         };
 
@@ -410,6 +420,7 @@ fn memory_store_fences_leased_commits() {
             events: vec![event("run-a", "session-a", 1, false)],
             effects: Vec::new(),
             items: Vec::new(),
+            entries: Vec::new(),
             finish: None,
         };
         assert!(matches!(
@@ -442,6 +453,7 @@ fn memory_store_fences_leased_commits() {
             status: RunStatus::Completed,
             finish_reason: "done".to_string(),
             error_code: None,
+            entries: Vec::new(),
             data: (),
         };
         let done = RunCommit {
@@ -453,6 +465,7 @@ fn memory_store_fences_leased_commits() {
             events: vec![event("run-a", "session-a", 2, true)],
             effects: Vec::new(),
             items: Vec::new(),
+            entries: Vec::new(),
             finish: Some(finish),
         };
         assert!(matches!(

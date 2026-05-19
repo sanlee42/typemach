@@ -1,7 +1,7 @@
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 use crate::machine::{ResumeAction, Transition};
-use crate::op::{Effect, EffectStatus, Item, Page};
+use crate::op::{Effect, EffectStatus, Entry, EntryQuery, EntryWrite, Item, Page, Vis};
 use crate::run::{LeaseId, RunCommand, RuntimeLimits};
 use crate::store::{
     Lease, LeaseClaim, MemoryRunStore, RunCommit, RunCommitResult, RunFinishRecord, RunLease,
@@ -218,6 +218,18 @@ impl RunStore<Event> for TestTxStore {
         self.runs.find_idempotent_run(scope, session_id, key).await
     }
 
+    async fn check_run_start(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        input: Option<&Value>,
+        entries: &[EntryWrite],
+    ) -> Result<(), MachineError> {
+        self.runs
+            .check_run_start(run_id, scope, input, entries)
+            .await
+    }
+
     async fn mark_cancelled(
         &self,
         run_id: &RunId,
@@ -299,6 +311,26 @@ impl RunTx<Event> for TestTxStore {
         limit: usize,
     ) -> Result<Vec<Effect>, MachineError> {
         self.runs.list_effects(run_id, scope, limit).await
+    }
+
+    async fn list_entries(
+        &self,
+        query: EntryQuery<'_, Self::Scope>,
+    ) -> Result<Page<Entry>, MachineError> {
+        self.runs.list_entries(query).await
+    }
+
+    async fn latest_entry(
+        &self,
+        scope: &Self::Scope,
+        session_id: &SessionId,
+        thread_id: Option<&ThreadId>,
+        kind: &str,
+        vis: Option<Vis>,
+    ) -> Result<Option<Entry>, MachineError> {
+        self.runs
+            .latest_entry(scope, session_id, thread_id, kind, vis)
+            .await
     }
 }
 

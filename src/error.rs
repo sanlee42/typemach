@@ -53,6 +53,12 @@ pub enum MachineError {
     #[error("item already exists with different data")]
     ItemConflict,
 
+    #[error("entry already exists with different data")]
+    EntryConflict,
+
+    #[error("idempotent run input differs")]
+    InputConflict,
+
     #[error("invalid page limit")]
     InvalidPageLimit,
 

@@ -5,8 +5,8 @@ use serde_json::Value;
 use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::*;
-use crate::op::{Effect, Item};
-use crate::run::LeaseId;
+use crate::op::{Effect, Entry, EntryQuery, Item, Vis};
+use crate::run::{LeaseId, ThreadId};
 use crate::store::RunTx;
 
 #[async_trait]
@@ -20,9 +20,13 @@ where
         &self,
         commit: &RunCommit<E, Data, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
+        if commit.events.is_empty()
+            && commit.effects.is_empty()
+            && commit.items.is_empty()
+            && commit.entries.is_empty()
+        {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires an event, effect, or item".to_string(),
+                reason: "commit requires an event, effect, item, or entry".to_string(),
             });
         }
         validate_commit(commit)?;
@@ -73,6 +77,14 @@ where
             }
             apply_effect_updates_tx(&tx, &commit.run_id, &commit.effects)?;
             apply_items_tx(&tx, &commit.run_id, &commit.items)?;
+            apply_entries_tx(
+                &tx,
+                &scope_key,
+                &commit.run_id,
+                &commit.session_id,
+                &row.thread_id,
+                &commit.entries,
+            )?;
             if let Some(finish) = &commit.finish {
                 let terminal_event =
                     commit
@@ -232,6 +244,71 @@ where
             let effects = list_effects_tx(&tx, &run_id, limit)?;
             tx.commit().map_err(store_db)?;
             Ok(effects)
+        })
+        .await
+    }
+
+    async fn list_entries(
+        &self,
+        query: EntryQuery<'_, Scope>,
+    ) -> Result<Page<Entry>, MachineError> {
+        if query.limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let scope_key = scope_key(query.scope)?;
+        let session_id = query.session_id.clone();
+        let thread_id = query.thread_id.cloned();
+        let kind = query.kind.map(str::to_string);
+        let vis = query.vis;
+        let after_seq = query.after_seq;
+        let limit = query.limit;
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize);
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_db)?;
+            let rows = EntryQuery {
+                scope: scope_key.as_str(),
+                session_id: &session_id,
+                thread_id: thread_id.as_ref(),
+                kind: kind.as_deref(),
+                vis,
+                after_seq,
+                limit: fetch,
+            };
+            let mut entries = list_entries_tx(&tx, rows)?;
+            let next = if entries.len() > limit {
+                entries.truncate(limit);
+                entries.last().map(|entry| entry.seq)
+            } else {
+                None
+            };
+            tx.commit().map_err(store_db)?;
+            Ok(Page::new(entries, next))
+        })
+        .await
+    }
+
+    async fn latest_entry(
+        &self,
+        scope: &Scope,
+        session_id: &SessionId,
+        thread_id: Option<&ThreadId>,
+        kind: &str,
+        vis: Option<Vis>,
+    ) -> Result<Option<Entry>, MachineError> {
+        let scope_key = scope_key(scope)?;
+        let session_id = session_id.clone();
+        let thread_id = thread_id.cloned();
+        let kind = kind.to_string();
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_db)?;
+            let entry =
+                latest_entry_tx(&tx, &scope_key, &session_id, thread_id.as_ref(), &kind, vis)?;
+            tx.commit().map_err(store_db)?;
+            Ok(entry)
         })
         .await
     }

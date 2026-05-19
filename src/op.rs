@@ -4,7 +4,31 @@ use serde_json::Value;
 use std::ops::Deref;
 
 use crate::error::MachineError;
-use crate::run::RunId;
+use crate::run::{RunId, SessionId, ThreadId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Vis {
+    Public,
+    Internal,
+}
+
+impl Vis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "public" => Some(Self::Public),
+            "internal" => Some(Self::Internal),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +143,73 @@ pub struct ItemWrite {
     pub body: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Entry {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub thread_id: ThreadId,
+    pub seq: i64,
+    pub key: String,
+    pub kind: String,
+    pub vis: Vis,
+    pub body: Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntryWrite {
+    pub key: String,
+    pub kind: String,
+    pub vis: Vis,
+    pub body: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EntryQuery<'a, Scope: ?Sized = Value> {
+    pub scope: &'a Scope,
+    pub session_id: &'a SessionId,
+    pub thread_id: Option<&'a ThreadId>,
+    pub kind: Option<&'a str>,
+    pub vis: Option<Vis>,
+    pub after_seq: i64,
+    pub limit: usize,
+}
+
+impl<'a, Scope: ?Sized> EntryQuery<'a, Scope> {
+    pub fn new(scope: &'a Scope, session_id: &'a SessionId, limit: usize) -> Self {
+        Self {
+            scope,
+            session_id,
+            thread_id: None,
+            kind: None,
+            vis: None,
+            after_seq: 0,
+            limit,
+        }
+    }
+
+    pub fn thread(mut self, thread_id: &'a ThreadId) -> Self {
+        self.thread_id = Some(thread_id);
+        self
+    }
+
+    pub fn kind(mut self, kind: &'a str) -> Self {
+        self.kind = Some(kind);
+        self
+    }
+
+    pub fn vis(mut self, vis: Vis) -> Self {
+        self.vis = Some(vis);
+        self
+    }
+
+    pub fn after(mut self, seq: i64) -> Self {
+        self.after_seq = seq;
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -161,6 +252,8 @@ pub trait RunOps: Send + Sync {
     async fn push_effect(&self, run_id: &RunId, update: EffectUpdate) -> Result<(), MachineError>;
 
     async fn push_item(&self, run_id: &RunId, item: ItemWrite) -> Result<(), MachineError>;
+
+    async fn push_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError>;
 }
 
 #[derive(Debug)]
@@ -191,6 +284,10 @@ impl RunOps for NoopRunOps {
     }
 
     async fn push_item(&self, _run_id: &RunId, _item: ItemWrite) -> Result<(), MachineError> {
+        Err(MachineError::RuntimeOpUnavailable)
+    }
+
+    async fn push_entry(&self, _run_id: &RunId, _entry: EntryWrite) -> Result<(), MachineError> {
         Err(MachineError::RuntimeOpUnavailable)
     }
 }

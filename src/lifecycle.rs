@@ -132,6 +132,14 @@ where
     ) -> Result<StartRunResult, MachineError> {
         let run_id = run.run_id.clone();
         if let Some(existing) = self.store.lookup_run(&run_id, &run.scope).await? {
+            self.store
+                .check_run_start(
+                    &existing.run_id,
+                    &run.scope,
+                    run.input.as_ref(),
+                    &run.entries,
+                )
+                .await?;
             return Ok(StartRunResult::Existing(existing));
         }
         if let Some(client_run_key) = &run.client_run_key
@@ -140,6 +148,14 @@ where
                 .find_idempotent_run(&run.scope, &run.session_id, client_run_key)
                 .await?
         {
+            self.store
+                .check_run_start(
+                    &existing.run_id,
+                    &run.scope,
+                    run.input.as_ref(),
+                    &run.entries,
+                )
+                .await?;
             return Ok(StartRunResult::Existing(existing));
         }
 
@@ -388,9 +404,13 @@ where
         S: RunTx<E>,
         F: FnMut(i64) -> E,
     {
-        if plan.event_count == 0 && plan.effects.is_empty() && plan.items.is_empty() {
+        if plan.event_count == 0
+            && plan.effects.is_empty()
+            && plan.items.is_empty()
+            && plan.entries.is_empty()
+        {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires an event, effect, or item".to_string(),
+                reason: "commit requires an event, effect, item, or entry".to_string(),
             });
         }
         if let Some(finish) = &plan.finish {
@@ -455,6 +475,7 @@ where
             events,
             effects: plan.effects,
             items: plan.items,
+            entries: plan.entries,
             finish: plan.finish,
         };
         let result = match self.store.commit_run(&commit).await {

@@ -21,7 +21,10 @@ pub use lifecycle::{
     AppendEventResult, RunLifecycle, RunSubscription, RunTail, StartRunRejection, StartRunResult,
 };
 pub use machine::{Machine, MachineState, ResumeAction, Transition};
-pub use op::{Effect, EffectStatus, EffectUpdate, Item, ItemWrite, NoopRunOps, Page, RunOps};
+pub use op::{
+    Effect, EffectStatus, EffectUpdate, Entry, EntryQuery, EntryWrite, Item, ItemWrite, NoopRunOps,
+    Page, RunOps, Vis,
+};
 #[cfg(feature = "postgres")]
 pub use pg::PgStore;
 pub use registry::{RunHandle, RunRegistry};
