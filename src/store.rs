@@ -146,15 +146,32 @@ pub struct RunStart<Scope = Value> {
 
 #[derive(Serialize)]
 struct StartSig<'a> {
+    session_id: &'a SessionId,
+    thread_id: &'a ThreadId,
+    agent_kind: &'a str,
+    model: Option<&'a str>,
+    client_run_key: Option<&'a str>,
+    parent_run_id: Option<&'a RunId>,
+    retry_of_run_id: Option<&'a RunId>,
+    metadata: &'a Value,
     input: Option<&'a Value>,
     entries: &'a [EntryWrite],
 }
 
-pub(crate) fn start_sig(
-    input: Option<&Value>,
-    entries: &[EntryWrite],
-) -> Result<String, MachineError> {
-    serde_json::to_string(&StartSig { input, entries }).map_err(MachineError::Serialization)
+pub(crate) fn start_sig<Scope>(run: &RunStart<Scope>) -> Result<String, MachineError> {
+    serde_json::to_string(&StartSig {
+        session_id: &run.session_id,
+        thread_id: &run.thread_id,
+        agent_kind: &run.agent_kind,
+        model: run.model.as_deref(),
+        client_run_key: run.client_run_key.as_deref(),
+        parent_run_id: run.parent_run_id.as_ref(),
+        retry_of_run_id: run.retry_of_run_id.as_ref(),
+        metadata: &run.metadata,
+        input: run.input.as_ref(),
+        entries: &run.entries,
+    })
+    .map_err(MachineError::Serialization)
 }
 
 #[derive(Debug, Clone)]
@@ -359,9 +376,7 @@ where
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Self::Scope,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Self::Scope>,
     ) -> Result<(), MachineError>;
 
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Self::Scope)

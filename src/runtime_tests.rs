@@ -1,7 +1,7 @@
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 use crate::machine::{ResumeAction, Transition};
-use crate::op::{Effect, EffectStatus, Entry, EntryQuery, EntryWrite, Item, Page, Vis};
+use crate::op::{Effect, EffectStatus, Entry, EntryQuery, Item, Page, Vis};
 use crate::run::{LeaseId, RunCommand, RuntimeLimits};
 use crate::store::{
     Lease, LeaseClaim, MemoryRunStore, RunCommit, RunCommitResult, RunFinishRecord, RunLease,
@@ -221,13 +221,9 @@ impl RunStore<Event> for TestTxStore {
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Self::Scope,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Self::Scope>,
     ) -> Result<(), MachineError> {
-        self.runs
-            .check_run_start(run_id, scope, input, entries)
-            .await
+        self.runs.check_run_start(run_id, start).await
     }
 
     async fn mark_cancelled(

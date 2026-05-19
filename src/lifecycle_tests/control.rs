@@ -184,12 +184,10 @@ fn lifecycle_start_run_returns_idempotent_existing_without_registry_insert() {
                 .expect("first"),
             StartRunResult::Started
         ));
+        let mut retry = run_start("run-b", Some("client-key"));
+        retry.thread_id = ThreadId::from("thread-run-a");
         match lifecycle
-            .start_run(
-                run_start("run-b", Some("client-key")),
-                RunHandle::new("token-b".to_string()),
-                None,
-            )
+            .start_run(retry, RunHandle::new("token-b".to_string()), None)
             .await
             .expect("second")
         {

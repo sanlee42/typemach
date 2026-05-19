@@ -62,7 +62,7 @@ where
     let second = run_start(
         "contract-idem-b",
         "contract-session-idem",
-        "contract-thread-idem-b",
+        "contract-thread-idem",
         alpha,
     );
     let existing = store.start_run(&with_key(second, "idem-key")).await?;

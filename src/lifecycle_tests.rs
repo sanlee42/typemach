@@ -1,5 +1,5 @@
 use super::*;
-use crate::op::{EntryWrite, Page};
+use crate::op::Page;
 use crate::run::{LeaseId, ThreadId, WorkerId};
 use crate::store::{
     LeaseClaim, MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult,
@@ -169,13 +169,9 @@ impl RunStore<TestEvent> for BlockingRecordStore {
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Value,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Value>,
     ) -> Result<(), MachineError> {
-        self.inner
-            .check_run_start(run_id, scope, input, entries)
-            .await
+        self.inner.check_run_start(run_id, start).await
     }
 
     async fn mark_cancelled(&self, run_id: &RunId, scope: &Value) -> Result<(), MachineError> {

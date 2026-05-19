@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
-use crate::op::{EntryWrite, Page};
+use crate::op::Page;
 use crate::run::{RunId, SessionId, ThreadId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
@@ -292,7 +292,7 @@ where
         self.ensure_session(Some(run.session_id.clone()), &run.scope)
             .await?;
         let scope_key = scope_key(&run.scope)?;
-        let sig = start_sig(run.input.as_ref(), &run.entries)?;
+        let sig = start_sig(run)?;
         if let Some(existing) = self.lookup_run(&run.run_id, &run.scope).await? {
             let client = self
                 .pool
@@ -548,12 +548,10 @@ where
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Scope,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Scope>,
     ) -> Result<(), MachineError> {
-        let scope_key = scope_key(scope)?;
-        let sig = start_sig(input, entries)?;
+        let scope_key = scope_key(&start.scope)?;
+        let sig = start_sig(start)?;
         let client = self
             .pool
             .get()

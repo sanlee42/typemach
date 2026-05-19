@@ -141,8 +141,10 @@ fn idempotent_key_returns_existing_run() {
             .expect("first invoke");
         assert!(matches!(result, StartResult::Started(_)));
 
+        let mut req = request("run-idem-2", Mode::Complete);
+        req.thread_id = crate::run::ThreadId::from("thread-run-idem-1");
         let result = rt
-            .invoke(request("run-idem-2", Mode::Complete), start(Some("key-1")))
+            .invoke(req, start(Some("key-1")))
             .await
             .expect("second invoke");
         let StartResult::Existing(existing) = result else {
@@ -165,12 +167,9 @@ fn idempotent_key_rejects_different_request_input() {
             .expect("first invoke");
         assert!(matches!(result, StartResult::Started(_)));
 
-        let result = rt
-            .invoke(
-                request("run-idem-input-2", Mode::Slow),
-                start(Some("key-input")),
-            )
-            .await;
+        let mut req = request("run-idem-input-2", Mode::Slow);
+        req.thread_id = crate::run::ThreadId::from("thread-run-idem-input-1");
+        let result = rt.invoke(req, start(Some("key-input"))).await;
         assert!(matches!(result, Err(MachineError::StartConflict)));
     });
 }
@@ -188,12 +187,9 @@ fn tx_runtime_idempotent_key_rejects_different_request_input() {
             .expect("first invoke");
         assert!(matches!(result, StartResult::Started(_)));
 
-        let result = rt
-            .invoke(
-                request("run-tx-idem-input-2", Mode::Slow),
-                start(Some("tx-key-input")),
-            )
-            .await;
+        let mut req = request("run-tx-idem-input-2", Mode::Slow);
+        req.thread_id = crate::run::ThreadId::from("thread-run-tx-idem-input-1");
+        let result = rt.invoke(req, start(Some("tx-key-input"))).await;
         assert!(matches!(result, Err(MachineError::StartConflict)));
     });
 }

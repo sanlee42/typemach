@@ -155,12 +155,12 @@ where
             .entry(run.session_id.clone())
             .or_insert_with(|| run.scope.clone());
         let scope_key = scope_key(&run.scope)?;
-        let sig = start_sig(run.input.as_ref(), &run.entries)?;
+        let sig = start_sig(run)?;
         if let Some(existing) = inner.runs.get(&run.run_id) {
             if existing.start.scope != run.scope {
                 return Err(MachineError::RunNotFound);
             }
-            if start_sig(existing.start.input.as_ref(), &existing.start.entries)? != sig {
+            if start_sig(&existing.start)? != sig {
                 return Err(MachineError::StartConflict);
             }
             return Ok(StoreStartResult::Existing(run_lookup(existing)));
@@ -174,7 +174,7 @@ where
             if let Some(existing_run_id) = inner.idempotency.get(&key)
                 && let Some(existing) = inner.runs.get(existing_run_id)
             {
-                if start_sig(existing.start.input.as_ref(), &existing.start.entries)? != sig {
+                if start_sig(&existing.start)? != sig {
                     return Err(MachineError::StartConflict);
                 }
                 return Ok(StoreStartResult::Existing(run_lookup(existing)));
@@ -324,16 +324,14 @@ where
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Scope,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Scope>,
     ) -> Result<(), MachineError> {
         let inner = self.inner.lock().await;
         let run = inner.runs.get(run_id).ok_or(MachineError::RunNotFound)?;
-        if run.start.scope != *scope {
+        if run.start.scope != start.scope {
             return Err(MachineError::RunNotFound);
         }
-        if start_sig(run.start.input.as_ref(), &run.start.entries)? != start_sig(input, entries)? {
+        if start_sig(&run.start)? != start_sig(start)? {
             return Err(MachineError::StartConflict);
         }
         Ok(())

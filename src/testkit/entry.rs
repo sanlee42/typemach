@@ -28,7 +28,7 @@ where
     let mut same = run_start(
         "contract-input-b",
         "contract-input-session",
-        "contract-input-thread-b",
+        "contract-input-thread-a",
         scope.clone(),
     );
     same.client_run_key = Some("input-key".to_string());
@@ -45,6 +45,54 @@ where
         panic!("same run_id and start envelope must return existing run");
     };
     assert_eq!(existing.run_id, first.run_id);
+
+    let mut different_thread = same.clone();
+    different_thread.run_id = RunId::from("contract-input-thread-conflict");
+    different_thread.thread_id = ThreadId::from("contract-input-thread-b");
+    assert!(matches!(
+        store.start_run(&different_thread).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut different_kind = same.clone();
+    different_kind.run_id = RunId::from("contract-input-kind-conflict");
+    different_kind.agent_kind = "other".to_string();
+    assert!(matches!(
+        store.start_run(&different_kind).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut different_model = same.clone();
+    different_model.run_id = RunId::from("contract-input-model-conflict");
+    different_model.model = Some("other-model".to_string());
+    assert!(matches!(
+        store.start_run(&different_model).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut different_meta = same.clone();
+    different_meta.run_id = RunId::from("contract-input-meta-conflict");
+    different_meta.metadata = json!({"trace": "other"});
+    assert!(matches!(
+        store.start_run(&different_meta).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut different_parent = same.clone();
+    different_parent.run_id = RunId::from("contract-input-parent-conflict");
+    different_parent.parent_run_id = Some(RunId::from("contract-parent"));
+    assert!(matches!(
+        store.start_run(&different_parent).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut different_retry = same.clone();
+    different_retry.run_id = RunId::from("contract-input-retry-conflict");
+    different_retry.retry_of_run_id = Some(RunId::from("contract-retry"));
+    assert!(matches!(
+        store.start_run(&different_retry).await,
+        Err(MachineError::StartConflict)
+    ));
 
     let mut same_run_changed = first.clone();
     same_run_changed.entries = Vec::new();

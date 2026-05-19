@@ -11,7 +11,7 @@ use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
-use crate::op::{EntryWrite, Page};
+use crate::op::Page;
 use crate::run::{RunId, SessionId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
@@ -298,7 +298,7 @@ where
             let scope_key = scope_key(&run.scope)?;
             let scope_json = json_text(&run.scope)?;
             let metadata = json_text(&run.metadata)?;
-            let sig = start_sig(run.input.as_ref(), &run.entries)?;
+            let sig = start_sig(&run)?;
             let now = now_ms();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -485,13 +485,11 @@ where
     async fn check_run_start(
         &self,
         run_id: &RunId,
-        scope: &Scope,
-        input: Option<&Value>,
-        entries: &[EntryWrite],
+        start: &RunStart<Scope>,
     ) -> Result<(), MachineError> {
         let run_id = run_id.clone();
-        let scope_key = scope_key(scope)?;
-        let sig = start_sig(input, entries)?;
+        let scope_key = scope_key(&start.scope)?;
+        let sig = start_sig(start)?;
         self.call(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Deferred)

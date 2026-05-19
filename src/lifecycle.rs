@@ -132,14 +132,7 @@ where
     ) -> Result<StartRunResult, MachineError> {
         let run_id = run.run_id.clone();
         if let Some(existing) = self.store.lookup_run(&run_id, &run.scope).await? {
-            self.store
-                .check_run_start(
-                    &existing.run_id,
-                    &run.scope,
-                    run.input.as_ref(),
-                    &run.entries,
-                )
-                .await?;
+            self.store.check_run_start(&existing.run_id, &run).await?;
             return Ok(StartRunResult::Existing(existing));
         }
         if let Some(client_run_key) = &run.client_run_key
@@ -148,14 +141,7 @@ where
                 .find_idempotent_run(&run.scope, &run.session_id, client_run_key)
                 .await?
         {
-            self.store
-                .check_run_start(
-                    &existing.run_id,
-                    &run.scope,
-                    run.input.as_ref(),
-                    &run.entries,
-                )
-                .await?;
+            self.store.check_run_start(&existing.run_id, &run).await?;
             return Ok(StartRunResult::Existing(existing));
         }
 

@@ -60,7 +60,8 @@ fn memory_store_idempotent_start_returns_existing_run() {
     block_on(async {
         let store = MemoryRunStore::<TestEvent>::new();
         let first = run_start("run-a", "session-a", Some("client-key"));
-        let second = run_start("run-b", "session-a", Some("client-key"));
+        let mut second = run_start("run-b", "session-a", Some("client-key"));
+        second.thread_id = first.thread_id.clone();
         assert!(matches!(
             store.start_run(&first).await.expect("start"),
             StoreStartResult::Created
