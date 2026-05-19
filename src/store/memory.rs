@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use async_rt::sync::Mutex;
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
+use crate::op::EffectStatus;
 
 #[derive(Debug)]
 pub struct MemoryRunStore<E: RunEvent, Scope = Value, FinishData = ()> {
@@ -64,6 +65,8 @@ struct MemoryRunStoreInner<E: RunEvent, Scope, FinishData> {
     thread_leases: HashMap<ThreadId, MemoryThreadLease>,
     checkpoints: HashMap<ThreadId, CheckpointRecord>,
     idempotency: HashMap<(String, SessionId, String), RunId>,
+    effects: HashMap<(RunId, String), Effect>,
+    items: HashMap<(RunId, String), Item>,
 }
 
 impl<E: RunEvent, Scope, FinishData> Default for MemoryRunStoreInner<E, Scope, FinishData> {
@@ -75,6 +78,8 @@ impl<E: RunEvent, Scope, FinishData> Default for MemoryRunStoreInner<E, Scope, F
             thread_leases: HashMap::new(),
             checkpoints: HashMap::new(),
             idempotency: HashMap::new(),
+            effects: HashMap::new(),
+            items: HashMap::new(),
         }
     }
 }
@@ -334,9 +339,13 @@ where
         run_id: &RunId,
         scope: &Scope,
         after_seq: i64,
-    ) -> Result<Vec<E>, MachineError> {
+        limit: usize,
+    ) -> Result<Page<E>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
         let inner = self.inner.lock().await;
-        Ok(inner
+        let mut events = inner
             .runs
             .get(run_id)
             .filter(|run| run.start.scope == *scope)
@@ -350,7 +359,14 @@ where
                 events.sort_by_key(|event| event.seq());
                 events
             })
-            .unwrap_or_default())
+            .unwrap_or_default();
+        let next = if events.len() > limit {
+            events.truncate(limit);
+            events.last().map(RunEvent::seq)
+        } else {
+            None
+        };
+        Ok(Page::new(events, next))
     }
 }
 
@@ -386,9 +402,9 @@ where
         &self,
         commit: &RunCommit<E, FinishData, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires at least one event".to_string(),
+                reason: "commit requires an event, effect, or item".to_string(),
             });
         }
         validate_commit_events(commit)?;
@@ -421,11 +437,15 @@ where
             check_memory_thread(&inner, run, checkpoint, commit.lease.as_ref())?;
         }
         validate_event_sequence(run, &commit.events)?;
+        validate_effect_updates(&inner, &commit.run_id, &commit.effects)?;
+        validate_items(&inner, &commit.run_id, &commit.items)?;
         if let Some(checkpoint) = &commit.checkpoint {
             inner
                 .checkpoints
                 .insert(checkpoint.thread_id.clone(), checkpoint.record.clone());
         }
+        apply_effect_updates(&mut inner, &commit.run_id, &commit.effects)?;
+        apply_items(&mut inner, &commit.run_id, &commit.items)?;
         let run = inner
             .runs
             .get_mut(&commit.run_id)
@@ -459,123 +479,135 @@ where
 
         Ok(RunCommitResult::Recorded(commit.events.clone()))
     }
-}
 
-#[async_trait]
-impl<E, Scope, FinishData> RunLease<E> for MemoryRunStore<E, Scope, FinishData>
-where
-    E: RunEvent,
-    Scope: Clone + PartialEq + Serialize + Send + Sync + 'static,
-    FinishData: Clone + Default + Send + Sync + 'static,
-{
-    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool, MachineError> {
-        let mut inner = self.inner.lock().await;
-        let Some(run) = inner.runs.get(&lease.run) else {
-            return Ok(false);
-        };
-        let Some(active) = &run.lease else {
-            return Ok(false);
-        };
-        if run.status != RunStatus::Running
-            || active.owner != lease.owner
-            || active.id != lease.id
-            || active.until <= Instant::now()
-        {
-            return Ok(false);
-        }
-        let thread_id = run.start.thread_id.clone();
-        let Some(thread) = inner.thread_leases.get_mut(&thread_id) else {
-            return Ok(false);
-        };
-        if thread.run != lease.run
-            || thread.owner != lease.owner
-            || thread.id != lease.id
-            || thread.until <= Instant::now()
-        {
-            return Ok(false);
-        }
-        let until = Instant::now() + ttl;
-        thread.until = until;
-        let run = inner
-            .runs
-            .get_mut(&lease.run)
-            .ok_or(MachineError::RunNotFound)?;
-        if let Some(active) = &mut run.lease {
-            active.until = until;
-        }
-        Ok(true)
-    }
-
-    async fn release(&self, lease: &Lease) -> Result<(), MachineError> {
-        let mut inner = self.inner.lock().await;
-        let mut thread = None;
-        if let Some(run) = inner.runs.get_mut(&lease.run)
-            && run
-                .lease
-                .as_ref()
-                .is_some_and(|active| active.owner == lease.owner && active.id == lease.id)
-        {
-            thread = Some(run.start.thread_id.clone());
-            run.lease = None;
-        }
-        if let Some(thread) = thread {
-            inner.thread_leases.remove(&thread);
-        }
-        Ok(())
-    }
-
-    async fn reap_stale<F>(
+    async fn reserve_effect(
         &self,
-        _owner: &WorkerId,
-        limit: usize,
-        mut build_event: F,
-    ) -> Result<Vec<RunLookup>, MachineError>
-    where
-        F: FnMut(&RunLookup, i64) -> E + Send,
-    {
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+        kind: &str,
+        request: Value,
+    ) -> Result<Effect, MachineError> {
         let mut inner = self.inner.lock().await;
-        let now = Instant::now();
-        let mut reaped = Vec::new();
-        let run_ids = inner.runs.keys().cloned().collect::<Vec<_>>();
-        for run_id in run_ids {
-            if reaped.len() >= limit {
-                break;
-            }
-            let Some(run) = inner.runs.get_mut(&run_id) else {
-                continue;
-            };
-            if run.status != RunStatus::Running
-                || run.lease.as_ref().is_none_or(|lease| lease.until > now)
-            {
-                continue;
-            }
-            let mut lookup = run_lookup(run);
-            let seq = run.events.last().map(RunEvent::seq).unwrap_or(0) + 1;
-            let event = build_event(&lookup, seq);
-            if event.run_id() != &run.start.run_id || event.session_id() != &run.start.session_id {
-                return Err(MachineError::InvalidRunEvent {
-                    reason: "reap event target does not match run".to_string(),
-                });
-            }
-            if event.seq() != seq || !event.is_terminal() {
-                return Err(MachineError::InvalidRunEvent {
-                    reason: "reap requires the next terminal event".to_string(),
-                });
-            }
-            run.status = RunStatus::Error;
-            run.finish_reason = Some("lease_expired".to_string());
-            run.finish_data = Some(FinishData::default());
-            run.terminal_event = Some(event.clone());
-            run.events.push(event);
-            let thread_id = run.start.thread_id.clone();
-            run.lease = None;
-            inner.thread_leases.remove(&thread_id);
-            lookup.status = RunStatus::Error;
-            lookup.finish_reason = Some("lease_expired".to_string());
-            lookup.owner = None;
-            reaped.push(lookup);
+        let run = inner.runs.get(run_id).ok_or(MachineError::RunNotFound)?;
+        if run.start.scope != *scope {
+            return Err(MachineError::RunNotFound);
         }
-        Ok(reaped)
+        if run.status.is_terminal() {
+            return Err(MachineError::RunNotFound);
+        }
+        check_memory_lease(run, lease)?;
+        let effect_key = (run_id.clone(), key.to_string());
+        if let Some(existing) = inner.effects.get(&effect_key) {
+            if existing.kind != kind || existing.request != request {
+                return Err(MachineError::EffectConflict);
+            }
+            return Ok(existing.clone());
+        }
+        let now = now_ms();
+        let effect = Effect {
+            run_id: run_id.clone(),
+            key: key.to_string(),
+            kind: kind.to_string(),
+            status: EffectStatus::Reserved,
+            request,
+            result: None,
+            error_code: None,
+            error_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        inner.effects.insert(effect_key, effect.clone());
+        Ok(effect)
+    }
+
+    async fn start_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+    ) -> Result<Effect, MachineError> {
+        let mut inner = self.inner.lock().await;
+        let run = inner.runs.get(run_id).ok_or(MachineError::RunNotFound)?;
+        if run.start.scope != *scope {
+            return Err(MachineError::RunNotFound);
+        }
+        if run.status.is_terminal() {
+            return Err(MachineError::RunNotFound);
+        }
+        check_memory_lease(run, lease)?;
+        let effect = inner
+            .effects
+            .get_mut(&(run_id.clone(), key.to_string()))
+            .ok_or(MachineError::EffectNotFound)?;
+        if effect.status.is_blocking() {
+            return Err(MachineError::EffectPending);
+        }
+        if effect.status == EffectStatus::Done {
+            return Ok(effect.clone());
+        }
+        effect.status = EffectStatus::Started;
+        effect.result = None;
+        effect.error_code = None;
+        effect.error_message = None;
+        effect.updated_at = now_ms();
+        Ok(effect.clone())
+    }
+
+    async fn list_items(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Item>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let inner = self.inner.lock().await;
+        let Some(run) = inner.runs.get(run_id) else {
+            return Ok(Vec::new());
+        };
+        if run.start.scope != *scope {
+            return Ok(Vec::new());
+        }
+        let mut items = inner
+            .items
+            .values()
+            .filter(|item| item.run_id == *run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| left.key.cmp(&right.key));
+        items.truncate(limit);
+        Ok(items)
+    }
+
+    async fn list_effects(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Effect>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let inner = self.inner.lock().await;
+        let Some(run) = inner.runs.get(run_id) else {
+            return Ok(Vec::new());
+        };
+        if run.start.scope != *scope {
+            return Ok(Vec::new());
+        }
+        let mut effects = inner
+            .effects
+            .values()
+            .filter(|effect| effect.run_id == *run_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        effects.sort_by(|left, right| left.key.cmp(&right.key));
+        effects.truncate(limit);
+        Ok(effects)
     }
 }
 
@@ -616,59 +648,6 @@ where
                 Some(run.start.run_id.clone()),
             )
         })
-}
-
-fn memory_lease(claim: &LeaseClaim) -> MemoryLease {
-    MemoryLease {
-        owner: claim.owner.clone(),
-        id: claim.id.clone(),
-        until: Instant::now() + claim.ttl,
-    }
-}
-
-fn claim_memory_thread<E, Scope, FinishData>(
-    inner: &mut MemoryRunStoreInner<E, Scope, FinishData>,
-    run: &RunStart<Scope>,
-    claim: &LeaseClaim,
-) -> Result<(), MachineError>
-where
-    E: RunEvent,
-{
-    let now = Instant::now();
-    if let Some(active) = inner.thread_leases.get(&run.thread_id)
-        && active.until > now
-    {
-        return Err(MachineError::ThreadBusy {
-            owner: Some(active.owner.clone()),
-            run: Some(active.run.clone()),
-        });
-    }
-    inner.thread_leases.insert(
-        run.thread_id.clone(),
-        MemoryThreadLease {
-            run: run.run_id.clone(),
-            owner: claim.owner.clone(),
-            id: claim.id.clone(),
-            until: now + claim.ttl,
-        },
-    );
-    Ok(())
-}
-
-fn check_memory_lease<E, Scope, FinishData>(
-    run: &MemoryRun<E, Scope, FinishData>,
-    lease: Option<&LeaseId>,
-) -> Result<(), MachineError>
-where
-    E: RunEvent,
-{
-    let Some(active) = &run.lease else {
-        return Ok(());
-    };
-    if lease != Some(&active.id) || active.until <= Instant::now() {
-        return Err(MachineError::LeaseLost);
-    }
-    Ok(())
 }
 
 fn check_memory_thread<E, Scope, FinishData>(
@@ -715,5 +694,9 @@ where
     Ok(())
 }
 
+mod lease;
+mod op;
 mod validate;
+use lease::*;
+use op::*;
 use validate::*;

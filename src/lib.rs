@@ -2,6 +2,7 @@ pub mod checkpoint;
 pub mod error;
 pub mod lifecycle;
 pub mod machine;
+pub mod op;
 #[cfg(feature = "postgres")]
 pub mod pg;
 pub mod registry;
@@ -20,6 +21,7 @@ pub use lifecycle::{
     AppendEventResult, RunLifecycle, RunSubscription, RunTail, StartRunRejection, StartRunResult,
 };
 pub use machine::{Machine, MachineState, ResumeAction, Transition};
+pub use op::{Effect, EffectStatus, EffectUpdate, Item, ItemWrite, NoopRunOps, Page, RunOps};
 #[cfg(feature = "postgres")]
 pub use pg::PgStore;
 pub use registry::{RunHandle, RunRegistry};

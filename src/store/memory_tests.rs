@@ -123,7 +123,7 @@ fn memory_store_records_running_events_and_skips_after_terminal() {
         );
 
         let events = store
-            .list_events(&RunId::from("run-a"), &start.scope, 0)
+            .list_events(&RunId::from("run-a"), &start.scope, 0, usize::MAX)
             .await
             .expect("events");
         assert_eq!(events.len(), 2);
@@ -379,7 +379,7 @@ fn memory_store_lists_events_after_cursor() {
                 .expect("record");
         }
         let events = store
-            .list_events(&RunId::from("run-a"), &start.scope, 1)
+            .list_events(&RunId::from("run-a"), &start.scope, 1, usize::MAX)
             .await
             .expect("events");
         assert_eq!(
@@ -408,6 +408,8 @@ fn memory_store_fences_leased_commits() {
             lease: None,
             checkpoint: None,
             events: vec![event("run-a", "session-a", 1, false)],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: None,
         };
         assert!(matches!(
@@ -449,6 +451,8 @@ fn memory_store_fences_leased_commits() {
             lease: Some(LeaseId::from("lease-a")),
             checkpoint: None,
             events: vec![event("run-a", "session-a", 2, true)],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: Some(finish),
         };
         assert!(matches!(

@@ -349,6 +349,8 @@ fn build_request(prompt: String) -> Result<RunRequest<PromptInput>, ExampleError
         runtime_limits: RuntimeLimits {
             max_steps: MAX_STEPS,
             allow_clarification: false,
+            step_timeout: None,
+            run_timeout: None,
         },
     })
 }

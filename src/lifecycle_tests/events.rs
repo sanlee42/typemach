@@ -28,7 +28,7 @@ fn lifecycle_appends_persists_and_publishes_event() {
 
         let events = lifecycle
             .store()
-            .list_events(&RunId::from("run-a"), &scope(), 0)
+            .list_events(&RunId::from("run-a"), &scope(), 0, usize::MAX)
             .await
             .expect("events");
         assert_eq!(events.len(), 1);
@@ -253,7 +253,7 @@ fn lifecycle_serializes_appends_for_one_run() {
         assert!(
             store
                 .inner
-                .list_events(&RunId::from("run-a"), &scope(), 0)
+                .list_events(&RunId::from("run-a"), &scope(), 0, usize::MAX)
                 .await
                 .expect("events")
                 .is_empty()
@@ -271,7 +271,7 @@ fn lifecycle_serializes_appends_for_one_run() {
 
         let events = store
             .inner
-            .list_events(&RunId::from("run-a"), &scope(), 0)
+            .list_events(&RunId::from("run-a"), &scope(), 0, usize::MAX)
             .await
             .expect("events");
         assert_eq!(

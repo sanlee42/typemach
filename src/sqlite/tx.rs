@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio_rusqlite::rusqlite::{TransactionBehavior, params};
+use serde_json::Value;
+use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::*;
+use crate::op::{Effect, Item};
+use crate::run::LeaseId;
 use crate::store::RunTx;
 
 #[async_trait]
@@ -17,9 +20,9 @@ where
         &self,
         commit: &RunCommit<E, Data, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires at least one event".to_string(),
+                reason: "commit requires an event, effect, or item".to_string(),
             });
         }
         validate_commit(commit)?;
@@ -56,6 +59,8 @@ where
                 check_thread_tx(&tx, &row, &commit, checkpoint)?;
                 save_checkpoint_tx(&tx, checkpoint.thread_id.as_str(), &checkpoint.record)?;
             }
+            validate_effect_updates_tx(&tx, &commit.run_id, &commit.effects)?;
+            validate_items_tx(&tx, &commit.run_id, &commit.items)?;
             let mut last_seq = last_seq_tx(&tx, &commit.run_id)?;
             for event in &commit.events {
                 if event.seq() <= last_seq {
@@ -66,6 +71,8 @@ where
                 insert_event_tx(&tx, event)?;
                 last_seq = event.seq();
             }
+            apply_effect_updates_tx(&tx, &commit.run_id, &commit.effects)?;
+            apply_items_tx(&tx, &commit.run_id, &commit.items)?;
             if let Some(finish) = &commit.finish {
                 let terminal_event =
                     commit
@@ -108,6 +115,123 @@ where
             }
             tx.commit().map_err(store_db)?;
             Ok(RunCommitResult::Recorded(commit.events.clone()))
+        })
+        .await
+    }
+
+    async fn reserve_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+        kind: &str,
+        request: Value,
+    ) -> Result<Effect, MachineError> {
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        let lease = lease.cloned();
+        let key = key.to_string();
+        let kind = kind.to_string();
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(store_db)?;
+            check_op_run_tx(&tx, &run_id, &scope_key, lease.as_ref())?;
+            let effect = reserve_effect_tx(&tx, &run_id, &key, &kind, request)?;
+            tx.commit().map_err(store_db)?;
+            Ok(effect)
+        })
+        .await
+    }
+
+    async fn start_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+    ) -> Result<Effect, MachineError> {
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        let lease = lease.cloned();
+        let key = key.to_string();
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(store_db)?;
+            check_op_run_tx(&tx, &run_id, &scope_key, lease.as_ref())?;
+            let effect = start_effect_tx(&tx, &run_id, &key)?;
+            tx.commit().map_err(store_db)?;
+            Ok(effect)
+        })
+        .await
+    }
+
+    async fn list_items(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Item>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_db)?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM typemach_runs WHERE run_id = ?1 AND scope_key = ?2",
+                    params![run_id.as_str(), scope_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(store_db)?;
+            if exists.is_none() {
+                tx.commit().map_err(store_db)?;
+                return Ok(Vec::new());
+            }
+            let items = list_items_tx(&tx, &run_id, limit)?;
+            tx.commit().map_err(store_db)?;
+            Ok(items)
+        })
+        .await
+    }
+
+    async fn list_effects(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Effect>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Deferred)
+                .map_err(store_db)?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM typemach_runs WHERE run_id = ?1 AND scope_key = ?2",
+                    params![run_id.as_str(), scope_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(store_db)?;
+            if exists.is_none() {
+                tx.commit().map_err(store_db)?;
+                return Ok(Vec::new());
+            }
+            let effects = list_effects_tx(&tx, &run_id, limit)?;
+            tx.commit().map_err(store_db)?;
+            Ok(effects)
         })
         .await
     }

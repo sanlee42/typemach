@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
+use crate::op::Page;
 use crate::run::{RunId, SessionId, ThreadId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
@@ -155,7 +156,31 @@ impl<E, Scope, Data> PgStore<E, Scope, Data> {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS typemach_run_events_terminal_idx
                     ON typemach_run_events (run_id)
-                    WHERE terminal;",
+                    WHERE terminal;
+                CREATE TABLE IF NOT EXISTS typemach_effects (
+                    run_id TEXT NOT NULL REFERENCES typemach_runs(run_id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request JSONB NOT NULL,
+                    result JSONB NULL,
+                    error_code TEXT NULL,
+                    error_message TEXT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (run_id, key)
+                );
+                CREATE INDEX IF NOT EXISTS typemach_effects_status_idx
+                    ON typemach_effects (run_id, status);
+                CREATE TABLE IF NOT EXISTS typemach_items (
+                    run_id TEXT NOT NULL REFERENCES typemach_runs(run_id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (run_id, key)
+                );",
             )
             .await
             .map_err(store_db)?;
@@ -379,6 +404,8 @@ where
             lease: None,
             checkpoint: None,
             events: vec![finish.terminal_event.clone()],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: Some(RunFinish {
                 run_id: finish.run_id.clone(),
                 session_id: finish.session_id.clone(),
@@ -486,6 +513,8 @@ where
             lease: None,
             checkpoint: None,
             events: vec![event.clone()],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: None,
         };
         match self.commit_run(&commit).await? {
@@ -502,8 +531,13 @@ where
         run_id: &RunId,
         scope: &Scope,
         after_seq: i64,
-    ) -> Result<Vec<E>, MachineError> {
+        limit: usize,
+    ) -> Result<Page<E>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
         let scope_key = scope_key(scope)?;
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let client = self
             .pool
             .get()
@@ -515,21 +549,32 @@ where
                  FROM typemach_run_events event
                  JOIN typemach_runs run ON run.run_id = event.run_id
                  WHERE event.run_id = $1 AND run.scope_key = $2 AND event.seq > $3
-                 ORDER BY event.seq ASC",
-                &[&run_id.as_str(), &scope_key, &after_seq],
+                 ORDER BY event.seq ASC
+                 LIMIT $4",
+                &[&run_id.as_str(), &scope_key, &after_seq, &fetch],
             )
             .await
             .map_err(store_db)?;
-        rows.into_iter()
+        let mut events = rows
+            .into_iter()
             .map(|row| decode_event(row.get::<_, String>(0).as_str()))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let next = if events.len() > limit {
+            events.truncate(limit);
+            events.last().map(RunEvent::seq)
+        } else {
+            None
+        };
+        Ok(Page::new(events, next))
     }
 }
 
 mod io;
 mod lease;
+mod op;
 #[cfg(test)]
 mod tests;
 mod tx;
 
 use io::*;
+use op::*;

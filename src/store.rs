@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::checkpoint::CheckpointRecord;
 use crate::error::MachineError;
+use crate::op::{Effect, EffectUpdate, Item, ItemWrite, Page};
 use crate::run::{LeaseId, RunId, SessionId, ThreadId, WorkerId};
 
 pub trait RunEvent: Clone + Send + Sync + 'static {
@@ -202,6 +203,8 @@ pub struct RunCommit<E: RunEvent, Data = (), Scope = Value> {
     pub lease: Option<LeaseId>,
     pub checkpoint: Option<CheckpointWrite>,
     pub events: Vec<E>,
+    pub effects: Vec<EffectUpdate>,
+    pub items: Vec<ItemWrite>,
     pub finish: Option<RunFinish<Data, Scope>>,
 }
 
@@ -210,6 +213,8 @@ pub struct CommitPlan<Data = (), Scope = Value> {
     pub lease: Option<LeaseId>,
     pub checkpoint: Option<CheckpointWrite>,
     pub event_count: usize,
+    pub effects: Vec<EffectUpdate>,
+    pub items: Vec<ItemWrite>,
     pub finish: Option<RunFinish<Data, Scope>>,
 }
 
@@ -346,7 +351,8 @@ where
         run_id: &RunId,
         scope: &Self::Scope,
         after_seq: i64,
-    ) -> Result<Vec<E>, MachineError>;
+        limit: usize,
+    ) -> Result<Page<E>, MachineError>;
 }
 
 #[async_trait]
@@ -358,6 +364,38 @@ where
         &self,
         commit: &RunCommit<E, Self::FinishData, Self::Scope>,
     ) -> Result<RunCommitResult<E>, MachineError>;
+
+    async fn reserve_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+        kind: &str,
+        request: serde_json::Value,
+    ) -> Result<Effect, MachineError>;
+
+    async fn start_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+    ) -> Result<Effect, MachineError>;
+
+    async fn list_items(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        limit: usize,
+    ) -> Result<Vec<Item>, MachineError>;
+
+    async fn list_effects(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        limit: usize,
+    ) -> Result<Vec<Effect>, MachineError>;
 }
 
 #[async_trait]

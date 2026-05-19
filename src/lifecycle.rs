@@ -355,8 +355,9 @@ where
 
         let next_seq = self
             .store
-            .list_events(&finish.run_id, &finish.scope, 0)
+            .list_events(&finish.run_id, &finish.scope, 0, usize::MAX)
             .await?
+            .items
             .last()
             .map(RunEvent::seq)
             .unwrap_or(0)
@@ -387,9 +388,9 @@ where
         S: RunTx<E>,
         F: FnMut(i64) -> E,
     {
-        if plan.event_count == 0 {
+        if plan.event_count == 0 && plan.effects.is_empty() && plan.items.is_empty() {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires at least one event".to_string(),
+                reason: "commit requires an event, effect, or item".to_string(),
             });
         }
         if let Some(finish) = &plan.finish {
@@ -452,6 +453,8 @@ where
             lease: plan.lease,
             checkpoint: plan.checkpoint,
             events,
+            effects: plan.effects,
+            items: plan.items,
             finish: plan.finish,
         };
         let result = match self.store.commit_run(&commit).await {
@@ -522,7 +525,11 @@ where
         if lookup.status == RunStatus::Running
             && let Some(receiver) = self.registry.subscribe(run_id)
         {
-            let replay = self.store.list_events(run_id, scope, after_seq).await?;
+            let page = self
+                .store
+                .list_events(run_id, scope, after_seq, usize::MAX)
+                .await?;
+            let replay = page.items;
             let last_replay_seq = replay
                 .last()
                 .map(RunEvent::seq)
@@ -538,7 +545,11 @@ where
                 owner: lookup.owner,
             });
         }
-        let replay = self.store.list_events(run_id, scope, after_seq).await?;
+        let replay = self
+            .store
+            .list_events(run_id, scope, after_seq, usize::MAX)
+            .await?
+            .items;
         Ok(RunSubscription::Inactive {
             status: lookup.status,
             replay,

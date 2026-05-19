@@ -38,6 +38,30 @@ pub enum MachineError {
         run: Option<crate::run::RunId>,
     },
 
+    #[error("runtime operation is unavailable")]
+    RuntimeOpUnavailable,
+
+    #[error("effect already exists with different data")]
+    EffectConflict,
+
+    #[error("effect is pending")]
+    EffectPending,
+
+    #[error("effect is not reserved")]
+    EffectNotFound,
+
+    #[error("item already exists with different data")]
+    ItemConflict,
+
+    #[error("invalid page limit")]
+    InvalidPageLimit,
+
+    #[error("step timed out")]
+    StepTimeout,
+
+    #[error("run timed out")]
+    RunTimeout,
+
     #[error("run not found")]
     RunNotFound,
 

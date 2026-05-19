@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use super::*;
+use crate::op::{Effect, Item};
+use crate::run::LeaseId;
 use crate::store::RunTx;
 
 #[async_trait]
@@ -16,9 +19,9 @@ where
         &self,
         commit: &RunCommit<E, Data, Scope>,
     ) -> Result<RunCommitResult<E>, MachineError> {
-        if commit.events.is_empty() {
+        if commit.events.is_empty() && commit.effects.is_empty() && commit.items.is_empty() {
             return Err(MachineError::InvalidRunEvent {
-                reason: "commit requires at least one event".to_string(),
+                reason: "commit requires an event, effect, or item".to_string(),
             });
         }
         validate_commit(commit)?;
@@ -80,6 +83,8 @@ where
             .await?;
         }
 
+        validate_effect_updates_tx(&tx, &commit.run_id, &commit.effects).await?;
+        validate_items_tx(&tx, &commit.run_id, &commit.items).await?;
         let mut last_seq = last_seq_tx(&tx, &commit.run_id).await?;
         for event in &commit.events {
             if event.seq() <= last_seq {
@@ -90,6 +95,8 @@ where
             insert_event_tx(&tx, event).await?;
             last_seq = event.seq();
         }
+        apply_effect_updates_tx(&tx, &commit.run_id, &commit.effects).await?;
+        apply_items_tx(&tx, &commit.run_id, &commit.items).await?;
 
         if let Some(finish) = &commit.finish {
             let terminal_event =
@@ -133,5 +140,103 @@ where
 
         tx.commit().await.map_err(store_db)?;
         Ok(RunCommitResult::Recorded(commit.events.clone()))
+    }
+
+    async fn reserve_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+        kind: &str,
+        request: Value,
+    ) -> Result<Effect, MachineError> {
+        let scope_key = scope_key(scope)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let tx = client.transaction().await.map_err(store_db)?;
+        check_op_run_tx(&tx, run_id, &scope_key, lease).await?;
+        let effect = reserve_effect_tx(&tx, run_id, key, kind, request).await?;
+        tx.commit().await.map_err(store_db)?;
+        Ok(effect)
+    }
+
+    async fn start_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+    ) -> Result<Effect, MachineError> {
+        let scope_key = scope_key(scope)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let tx = client.transaction().await.map_err(store_db)?;
+        check_op_run_tx(&tx, run_id, &scope_key, lease).await?;
+        let effect = start_effect_tx(&tx, run_id, key).await?;
+        tx.commit().await.map_err(store_db)?;
+        Ok(effect)
+    }
+
+    async fn list_items(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Item>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let scope_key = scope_key(scope)?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM typemach_runs WHERE run_id = $1 AND scope_key = $2",
+                &[&run_id.as_str(), &scope_key],
+            )
+            .await
+            .map_err(store_db)?;
+        if exists.is_none() {
+            return Ok(Vec::new());
+        }
+        list_items_tx(&client, run_id, limit).await
+    }
+
+    async fn list_effects(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        limit: usize,
+    ) -> Result<Vec<Effect>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
+        let scope_key = scope_key(scope)?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM typemach_runs WHERE run_id = $1 AND scope_key = $2",
+                &[&run_id.as_str(), &scope_key],
+            )
+            .await
+            .map_err(store_db)?;
+        if exists.is_none() {
+            return Ok(Vec::new());
+        }
+        list_effects_tx(&client, run_id, limit).await
     }
 }

@@ -11,6 +11,7 @@ use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
+use crate::op::Page;
 use crate::run::{RunId, SessionId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
@@ -145,7 +146,31 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS typemach_run_events_terminal_idx
                     ON typemach_run_events (run_id)
-                    WHERE terminal = 1;",
+                    WHERE terminal = 1;
+                CREATE TABLE IF NOT EXISTS typemach_effects (
+                    run_id TEXT NOT NULL REFERENCES typemach_runs(run_id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request TEXT NOT NULL,
+                    result TEXT NULL,
+                    error_code TEXT NULL,
+                    error_message TEXT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    PRIMARY KEY (run_id, key)
+                );
+                CREATE INDEX IF NOT EXISTS typemach_effects_status_idx
+                    ON typemach_effects (run_id, status);
+                CREATE TABLE IF NOT EXISTS typemach_items (
+                    run_id TEXT NOT NULL REFERENCES typemach_runs(run_id) ON DELETE CASCADE,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
+                    PRIMARY KEY (run_id, key)
+                );",
             )
             .map_err(store_db)?;
             Ok(())
@@ -348,6 +373,8 @@ where
             lease: None,
             checkpoint: None,
             events: vec![finish.terminal_event.clone()],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: Some(RunFinish {
                 run_id: finish.run_id.clone(),
                 session_id: finish.session_id.clone(),
@@ -446,6 +473,8 @@ where
             lease: None,
             checkpoint: None,
             events: vec![event.clone()],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: None,
         };
         match self.commit_run(&commit).await? {
@@ -462,9 +491,14 @@ where
         run_id: &RunId,
         scope: &Scope,
         after_seq: i64,
-    ) -> Result<Vec<E>, MachineError> {
+        limit: usize,
+    ) -> Result<Page<E>, MachineError> {
+        if limit == 0 {
+            return Err(MachineError::InvalidPageLimit);
+        }
         let run_id = run_id.clone();
         let scope_key = scope_key(scope)?;
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         self.call(move |conn| {
             let mut stmt = conn
                 .prepare(
@@ -472,20 +506,28 @@ where
                      FROM typemach_run_events event
                      JOIN typemach_runs run ON run.run_id = event.run_id
                      WHERE event.run_id = ?1 AND run.scope_key = ?2 AND event.seq > ?3
-                     ORDER BY event.seq ASC",
+                     ORDER BY event.seq ASC
+                     LIMIT ?4",
                 )
                 .map_err(store_db)?;
             let rows = stmt
-                .query_map(params![run_id.as_str(), scope_key, after_seq], |row| {
-                    row.get::<_, String>(0)
-                })
+                .query_map(
+                    params![run_id.as_str(), scope_key, after_seq, fetch],
+                    |row| row.get::<_, String>(0),
+                )
                 .map_err(store_db)?;
             let mut events = Vec::new();
             for row in rows {
                 let raw = row.map_err(store_db)?;
                 events.push(decode_event(raw.as_str())?);
             }
-            Ok(events)
+            let next = if events.len() > limit {
+                events.truncate(limit);
+                events.last().map(RunEvent::seq)
+            } else {
+                None
+            };
+            Ok(Page::new(events, next))
         })
         .await
     }
@@ -493,8 +535,10 @@ where
 
 mod io;
 mod lease;
+mod op;
 #[cfg(test)]
 mod tests;
 mod tx;
 
 use io::*;
+use op::*;

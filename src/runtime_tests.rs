@@ -1,7 +1,8 @@
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 use crate::machine::{ResumeAction, Transition};
-use crate::run::{RunCommand, RuntimeLimits};
+use crate::op::{Effect, EffectStatus, Item, Page};
+use crate::run::{LeaseId, RunCommand, RuntimeLimits};
 use crate::store::{
     Lease, LeaseClaim, MemoryRunStore, RunCommit, RunCommitResult, RunFinishRecord, RunLease,
     RunStore, RunTx, StoreStartResult,
@@ -36,6 +37,7 @@ enum Mode {
     Interrupt,
     Loop,
     Slow,
+    Ops,
 }
 
 struct TestMachine;
@@ -104,6 +106,14 @@ impl Machine for TestMachine {
                 async_rt::time::sleep(Duration::from_secs(5)).await;
                 Ok(Transition::Complete("slow".to_string()))
             }
+            (Mode::Ops, Step::Start) => {
+                ctx.reserve("effect-a", "tool", json!({"arg": 1})).await?;
+                ctx.start("effect-a").await?;
+                ctx.done("effect-a", json!({"ok": true})).await?;
+                ctx.item("item-a", "artifact", json!({"value": 7})).await?;
+                Ok(Transition::Next(Step::Done))
+            }
+            (Mode::Ops, Step::Done) => Ok(Transition::Complete("ops".to_string())),
             _ => Ok(Transition::Complete("done".to_string())),
         }
     }
@@ -230,8 +240,9 @@ impl RunStore<Event> for TestTxStore {
         run_id: &RunId,
         scope: &Self::Scope,
         after_seq: i64,
-    ) -> Result<Vec<Event>, MachineError> {
-        self.runs.list_events(run_id, scope, after_seq).await
+        limit: usize,
+    ) -> Result<Page<Event>, MachineError> {
+        self.runs.list_events(run_id, scope, after_seq, limit).await
     }
 }
 
@@ -246,6 +257,48 @@ impl RunTx<Event> for TestTxStore {
                 .await?;
         }
         self.runs.commit_run(commit).await
+    }
+
+    async fn reserve_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+        kind: &str,
+        request: serde_json::Value,
+    ) -> Result<Effect, MachineError> {
+        self.runs
+            .reserve_effect(run_id, scope, lease, key, kind, request)
+            .await
+    }
+
+    async fn start_effect(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        key: &str,
+    ) -> Result<Effect, MachineError> {
+        self.runs.start_effect(run_id, scope, lease, key).await
+    }
+
+    async fn list_items(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        limit: usize,
+    ) -> Result<Vec<Item>, MachineError> {
+        self.runs.list_items(run_id, scope, limit).await
+    }
+
+    async fn list_effects(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        limit: usize,
+    ) -> Result<Vec<Effect>, MachineError> {
+        self.runs.list_effects(run_id, scope, limit).await
     }
 }
 
@@ -283,6 +336,8 @@ fn request(run_id: &str, mode: Mode) -> RunRequest<Input> {
         runtime_limits: RuntimeLimits {
             max_steps: 5,
             allow_clarification: true,
+            step_timeout: None,
+            run_timeout: None,
         },
     }
 }

@@ -73,6 +73,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
                     checkpoint.clone(),
                 )),
                 events: vec![event],
+                effects: Vec::new(),
+                items: Vec::new(),
                 finish: None,
             })
             .await
@@ -80,7 +82,7 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
         assert!(matches!(result, RunCommitResult::Recorded(_)));
         assert_eq!(
             store
-                .list_events(&run_id, &scope, 0)
+                .list_events(&run_id, &scope, 0, usize::MAX)
                 .await
                 .expect("events")
                 .len(),
@@ -127,6 +129,8 @@ fn pg_store_roundtrip_skips_without_test_database_url() {
             lease: None,
             checkpoint: None,
             events: vec![leased_event.clone()],
+            effects: Vec::new(),
+            items: Vec::new(),
             finish: None,
         };
         assert!(matches!(

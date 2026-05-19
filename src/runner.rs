@@ -1,13 +1,16 @@
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver};
 use crate::error::MachineError;
 use crate::machine::{Machine, MachineState, ResumeAction, Transition};
+use crate::op::{NoopRunOps, RunOps};
 use crate::run::{
     RunCancel, RunCommand, RunContext, RunEventReceiver, RunId, RunOutput, RunRequest,
     RunStreamEvent, StepResult, StreamConfig, ThreadId,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::future;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 type StreamSender<M> = async_rt::sync::mpsc::Sender<
@@ -106,6 +109,15 @@ where
         request: RunRequest<M::Input>,
         config: StreamConfig,
     ) -> RunEventReceiver<M::Step, M::Signal, M::Output, M::Interrupt> {
+        self.stream_with_ops(request, config, Arc::new(NoopRunOps))
+    }
+
+    pub(crate) fn stream_with_ops(
+        &self,
+        request: RunRequest<M::Input>,
+        config: StreamConfig,
+        ops: Arc<dyn RunOps>,
+    ) -> RunEventReceiver<M::Step, M::Signal, M::Output, M::Interrupt> {
         let (tx, receiver) = async_rt::sync::mpsc::channel(config.channel_capacity());
         let runner = self.clone();
         async_rt::spawn(async move {
@@ -113,7 +125,7 @@ where
             let control = Arc::new(RunCancel::new());
             runner.register_active(&run_id, Arc::clone(&control)).await;
             runner
-                .run_stream_driver(request, config, tx, Arc::clone(&control))
+                .run_stream_driver(request, config, tx, Arc::clone(&control), ops)
                 .await;
             runner.unregister_active(&run_id, &control).await;
         });
@@ -146,6 +158,10 @@ where
         );
         let mut trace = Vec::new();
         let mut step_count = 0u32;
+        let run_deadline = request
+            .runtime_limits
+            .run_timeout
+            .map(|timeout| async_rt::time::Instant::now() + timeout);
 
         loop {
             step_count += 1;
@@ -163,7 +179,7 @@ where
             );
 
             match self
-                .transition_or_cancel(current_step.clone(), &mut state, &ctx)
+                .transition_or_cancel(current_step.clone(), &mut state, &ctx, run_deadline)
                 .await?
             {
                 Transition::Next(next) => {
@@ -207,6 +223,7 @@ where
         config: StreamConfig,
         tx: StreamSender<M>,
         control: Arc<RunCancel>,
+        ops: Arc<dyn RunOps>,
     ) {
         if send_event(
             &tx,
@@ -223,7 +240,7 @@ where
         }
 
         let result = self
-            .run_stream_inner(&request, config, &tx, Arc::clone(&control))
+            .run_stream_inner(&request, config, &tx, Arc::clone(&control), ops)
             .await;
         match result {
             Ok(StreamTerminal::Completed {
@@ -273,6 +290,7 @@ where
         config: StreamConfig,
         tx: &StreamSender<M>,
         control: Arc<RunCancel>,
+        ops: Arc<dyn RunOps>,
     ) -> Result<StreamTerminal<M::Output, M::Interrupt>, MachineError> {
         let thread_id = request.thread_id.clone();
         let _lock = match self
@@ -299,9 +317,14 @@ where
             request.input.clone(),
             Some(tx.clone()),
             control,
-        );
+        )
+        .with_ops(ops);
         let mut trace = Vec::new();
         let mut step_count = 0u32;
+        let run_deadline = request
+            .runtime_limits
+            .run_timeout
+            .map(|timeout| async_rt::time::Instant::now() + timeout);
 
         loop {
             step_count += 1;
@@ -338,6 +361,7 @@ where
                     &ctx,
                     tx,
                     config.heartbeat_interval(),
+                    run_deadline,
                 )
                 .await?;
 
@@ -419,7 +443,7 @@ where
         &self,
         request: &RunRequest<M::Input>,
         tx: &StreamSender<M>,
-        heartbeat_interval: std::time::Duration,
+        heartbeat_interval: Duration,
         control: &RunCancel,
     ) -> StreamLock {
         let lock = self.thread_lock_arc(&request.thread_id).await.lock_owned();
@@ -463,10 +487,17 @@ where
         step: M::Step,
         state: &mut M::State,
         ctx: &MachineRunContext<M>,
+        run_deadline: Option<async_rt::time::Instant>,
     ) -> Result<Transition<M::Step, M::Interrupt, M::Output>, MachineError> {
+        let step_timer = step_timer(ctx.runtime_limits.step_timeout);
+        async_rt::pin!(step_timer);
+        let run_timer = run_timer(run_deadline);
+        async_rt::pin!(run_timer);
         async_rt::select! {
             result = self.machine.transition(step, state, ctx) => result,
             _ = ctx.cancelled() => Err(MachineError::Cancelled),
+            _ = &mut step_timer => Err(MachineError::StepTimeout),
+            _ = &mut run_timer => Err(MachineError::RunTimeout),
         }
     }
 
@@ -476,12 +507,17 @@ where
         state: &mut M::State,
         ctx: &MachineRunContext<M>,
         tx: &StreamSender<M>,
-        heartbeat_interval: std::time::Duration,
+        heartbeat_interval: Duration,
+        run_deadline: Option<async_rt::time::Instant>,
     ) -> Result<StreamTransition<M::Step, M::Output, M::Interrupt>, MachineError> {
         let transition = self.machine.transition(step, state, ctx);
         async_rt::pin!(transition);
         let heartbeat = async_rt::time::sleep(heartbeat_interval);
         async_rt::pin!(heartbeat);
+        let step_timer = step_timer(ctx.runtime_limits.step_timeout);
+        async_rt::pin!(step_timer);
+        let run_timer = run_timer(run_deadline);
+        async_rt::pin!(run_timer);
 
         loop {
             async_rt::select! {
@@ -513,6 +549,12 @@ where
                 }
                 _ = tx.closed() => {
                     return Ok(StreamTransition::ReceiverClosed);
+                }
+                _ = &mut step_timer => {
+                    return Err(MachineError::StepTimeout);
+                }
+                _ = &mut run_timer => {
+                    return Err(MachineError::RunTimeout);
                 }
             }
         }
@@ -686,6 +728,22 @@ where
         let arc = Arc::clone(entry);
         drop(locks);
         arc
+    }
+}
+
+async fn step_timer(timeout: Option<Duration>) {
+    if let Some(timeout) = timeout {
+        async_rt::time::sleep(timeout).await;
+    } else {
+        future::pending::<()>().await;
+    }
+}
+
+async fn run_timer(deadline: Option<async_rt::time::Instant>) {
+    if let Some(deadline) = deadline {
+        async_rt::time::sleep_until(deadline).await;
+    } else {
+        future::pending::<()>().await;
     }
 }
 

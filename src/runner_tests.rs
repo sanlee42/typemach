@@ -7,6 +7,7 @@ use crate::run::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Step {
@@ -143,6 +144,8 @@ fn request(mode: TestMode) -> RunRequest<TestInput> {
         runtime_limits: RuntimeLimits {
             max_steps: 5,
             allow_clarification: true,
+            step_timeout: None,
+            run_timeout: None,
         },
     }
 }
@@ -187,6 +190,28 @@ fn max_steps_are_enforced() {
         req.runtime_limits.max_steps = 2;
         let err = runner.invoke(req).await.expect_err("run should fail");
         assert!(matches!(err, MachineError::MaxStepsExceeded { max: 2 }));
+    });
+}
+
+#[test]
+fn step_timeout_is_enforced() {
+    block_on(async {
+        let runner = Runner::new(TestMachine, Arc::new(MemorySaver::new()));
+        let mut req = request(TestMode::Slow);
+        req.runtime_limits.step_timeout = Some(Duration::from_millis(10));
+        let err = runner.invoke(req).await.expect_err("run should time out");
+        assert!(matches!(err, MachineError::StepTimeout));
+    });
+}
+
+#[test]
+fn run_timeout_is_enforced() {
+    block_on(async {
+        let runner = Runner::new(TestMachine, Arc::new(MemorySaver::new()));
+        let mut req = request(TestMode::Slow);
+        req.runtime_limits.run_timeout = Some(Duration::from_millis(10));
+        let err = runner.invoke(req).await.expect_err("run should time out");
+        assert!(matches!(err, MachineError::RunTimeout));
     });
 }
 

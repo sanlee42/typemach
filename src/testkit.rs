@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStore};
 use crate::error::MachineError;
+use crate::op::{EffectStatus, EffectUpdate, ItemWrite};
 use crate::run::{LeaseId, RunId, SessionId, ThreadId, WorkerId};
 use crate::store::{
     CheckpointWrite, FinishRunResult, Lease, LeaseClaim, RunCommit, RunCommitResult,
@@ -32,6 +33,7 @@ where
 {
     idempotent_start_and_scope(store).await?;
     event_checkpoint_and_terminal(store).await?;
+    effects_items_and_paged_replay(store).await?;
     rejected_commits_do_not_advance(store).await?;
     running_thread_is_exclusive(store).await?;
     lease_and_thread_fencing(store).await?;
@@ -108,6 +110,8 @@ where
         lease: None,
         checkpoint: Some(CheckpointWrite::new(thread_id.clone(), checkpoint.clone())),
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
+        effects: Vec::new(),
+        items: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -141,6 +145,8 @@ where
         lease: None,
         checkpoint: None,
         events: vec![event(run_id.as_str(), session_id.as_str(), 2, true)],
+        effects: Vec::new(),
+        items: Vec::new(),
         finish: Some(finish),
     };
     assert!(matches!(
@@ -157,6 +163,134 @@ where
             ..
         }
     ));
+    Ok(())
+}
+
+async fn effects_items_and_paged_replay<S>(store: &S) -> Result<(), MachineError>
+where
+    S: RunTx<TestEvent, Scope = Value, FinishData = ()>,
+{
+    let scope = scope("ops");
+    let run_id = RunId::from("contract-ops-run");
+    let session_id = SessionId::from("contract-ops-session");
+    let start = run_start(
+        run_id.as_str(),
+        session_id.as_str(),
+        "contract-ops-thread",
+        scope.clone(),
+    );
+    assert!(matches!(
+        store.start_run(&start).await?,
+        StoreStartResult::Created
+    ));
+
+    let reserved = store
+        .reserve_effect(&run_id, &scope, None, "effect-a", "tool", json!({"arg": 1}))
+        .await?;
+    assert_eq!(reserved.status, EffectStatus::Reserved);
+    let same = store
+        .reserve_effect(&run_id, &scope, None, "effect-a", "tool", json!({"arg": 1}))
+        .await?;
+    assert_eq!(same.key, reserved.key);
+    assert!(matches!(
+        store
+            .reserve_effect(
+                &run_id,
+                &scope,
+                None,
+                "effect-a",
+                "order",
+                json!({"arg": 1})
+            )
+            .await,
+        Err(MachineError::EffectConflict)
+    ));
+
+    let started = store
+        .start_effect(&run_id, &scope, None, "effect-a")
+        .await?;
+    assert_eq!(started.status, EffectStatus::Started);
+    assert!(matches!(
+        store.start_effect(&run_id, &scope, None, "effect-a").await,
+        Err(MachineError::EffectPending)
+    ));
+
+    let first = RunCommit {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        scope: scope.clone(),
+        lease: None,
+        checkpoint: None,
+        events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
+        effects: vec![EffectUpdate::done("effect-a", json!({"ok": true}))],
+        items: vec![ItemWrite {
+            key: "item-a".to_string(),
+            kind: "artifact".to_string(),
+            body: json!({"value": 7}),
+        }],
+        finish: None,
+    };
+    assert!(matches!(
+        store.commit_run(&first).await?,
+        RunCommitResult::Recorded(_)
+    ));
+    let effects = store.list_effects(&run_id, &scope, 8).await?;
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].status, EffectStatus::Done);
+    assert_eq!(effects[0].result, Some(json!({"ok": true})));
+    assert_eq!(
+        store
+            .start_effect(&run_id, &scope, None, "effect-a")
+            .await?
+            .status,
+        EffectStatus::Done
+    );
+    let items = store.list_items(&run_id, &scope, 8).await?;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].key, "item-a");
+
+    let idempotent_done = RunCommit {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        scope: scope.clone(),
+        lease: None,
+        checkpoint: None,
+        events: Vec::new(),
+        effects: vec![EffectUpdate::done("effect-a", json!({"ok": true}))],
+        items: Vec::new(),
+        finish: None,
+    };
+    assert!(matches!(
+        store.commit_run(&idempotent_done).await?,
+        RunCommitResult::Recorded(events) if events.is_empty()
+    ));
+    let conflicting_done = RunCommit {
+        effects: vec![EffectUpdate::done("effect-a", json!({"ok": false}))],
+        ..idempotent_done
+    };
+    assert!(matches!(
+        store.commit_run(&conflicting_done).await,
+        Err(MachineError::EffectConflict)
+    ));
+
+    assert!(
+        store
+            .record_event(
+                &run_id,
+                &scope,
+                &event(run_id.as_str(), session_id.as_str(), 2, false)
+            )
+            .await?
+    );
+    let first_page = store.list_events(&run_id, &scope, 0, 1).await?;
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page.next, Some(1));
+    let second_page = store
+        .list_events(&run_id, &scope, first_page.next.unwrap(), 1)
+        .await?;
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].seq, 2);
+    assert_eq!(second_page.next, None);
     Ok(())
 }
 
@@ -203,6 +337,8 @@ where
             first_checkpoint.clone(),
         )),
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
+        effects: Vec::new(),
+        items: Vec::new(),
         finish: None,
     };
     assert!(matches!(
@@ -326,6 +462,8 @@ where
         lease: None,
         checkpoint: None,
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],
+        effects: Vec::new(),
+        items: Vec::new(),
         finish: None,
     };
     assert!(matches!(

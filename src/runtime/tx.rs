@@ -15,9 +15,10 @@ use crate::checkpoint::{CheckpointRecord, CheckpointSaver, CheckpointStore};
 use crate::error::MachineError;
 use crate::lifecycle::{RunLifecycle, RunSubscription, StartRunResult};
 use crate::machine::Machine;
+use crate::op::RunOps;
 use crate::registry::{RunHandle, RunRegistry};
 use crate::run::{
-    RunEventReceiver, RunId, RunOutput, RunRequest, RunStreamEvent, SessionId, StepResult,
+    LeaseId, RunEventReceiver, RunId, RunOutput, RunRequest, RunStreamEvent, SessionId, StepResult,
     StreamConfig, ThreadId,
 };
 use crate::runner::Runner;
@@ -25,6 +26,9 @@ use crate::store::{
     CheckpointWrite, CommitPlan, Lease, LeaseClaim, RunCommitResult, RunEventEnvelope, RunFinish,
     RunLease, RunLookup, RunStart, RunStatus, RunTx,
 };
+
+mod op;
+use op::*;
 
 struct TxSaver<S> {
     inner: Arc<S>,
@@ -196,7 +200,14 @@ where
         let run_id = req.run_id.clone();
         let session_id = req.session_id.clone();
         let thread_id = req.thread_id.clone();
-        let raw = self.runner.stream(req, cfg);
+        let ops = Arc::new(TxRunOps::new(
+            Arc::clone(&self.store),
+            req.run_id.clone(),
+            scope.clone(),
+            lease.id.clone(),
+        ));
+        let run_ops: Arc<dyn RunOps> = ops.clone();
+        let raw = self.runner.stream_with_ops(req, cfg, run_ops);
         let (tx, receiver) = async_rt::sync::mpsc::channel(cfg.channel_capacity());
         let runner = self.runner.clone();
         let life = self.life.clone();
@@ -220,6 +231,7 @@ where
                 thread_id,
                 scope,
                 lease,
+                ops,
                 lease_stop,
             };
             tx_bridge::<M, S>(ctx, raw).await;
@@ -338,6 +350,7 @@ where
     thread_id: ThreadId,
     scope: S::Scope,
     lease: Lease,
+    ops: Arc<TxRunOps<S>>,
     lease_stop: Arc<AtomicBool>,
 }
 
@@ -437,6 +450,7 @@ where
                     return false;
                 }
 
+                let ops = ctx.ops.take().await;
                 let record = ctx
                     .life
                     .commit_events(
@@ -447,6 +461,8 @@ where
                             lease: Some(ctx.lease.id.clone()),
                             checkpoint: Some(checkpoint),
                             event_count: 0,
+                            effects: ops.effects,
+                            items: ops.items,
                             finish: None,
                         },
                         vec![payload],
@@ -478,6 +494,8 @@ where
                             lease: Some(ctx.lease.id.clone()),
                             checkpoint: None,
                             event_count: 0,
+                            effects: Vec::new(),
+                            items: Vec::new(),
                             finish: None,
                         },
                         vec![payload],
@@ -517,6 +535,7 @@ where
                 error_code: code,
                 data: S::FinishData::default(),
             };
+            let ops = ctx.ops.take().await;
             let record = ctx
                 .life
                 .commit_events(
@@ -527,6 +546,8 @@ where
                         lease: Some(ctx.lease.id.clone()),
                         checkpoint,
                         event_count: 0,
+                        effects: ops.effects,
+                        items: ops.items,
                         finish: Some(finish),
                     },
                     payloads,
@@ -613,6 +634,7 @@ async fn tx_cancel_and_finish<M, S>(
         error_code: None,
         data: S::FinishData::default(),
     };
+    let ops = ctx.ops.take().await;
     let _ = ctx
         .life
         .commit_events(
@@ -623,6 +645,8 @@ async fn tx_cancel_and_finish<M, S>(
                 lease: Some(ctx.lease.id.clone()),
                 checkpoint,
                 event_count: 0,
+                effects: ops.effects,
+                items: ops.items,
                 finish: Some(finish),
             },
             payloads,
@@ -658,6 +682,7 @@ async fn tx_finish_error<M, S>(
         error_code: Some(error_code(error).to_string()),
         data: S::FinishData::default(),
     };
+    let ops = ctx.ops.take().await;
     let _ = ctx
         .life
         .commit_events(
@@ -668,6 +693,8 @@ async fn tx_finish_error<M, S>(
                 lease: Some(ctx.lease.id.clone()),
                 checkpoint,
                 event_count: 0,
+                effects: ops.effects,
+                items: ops.items,
                 finish: Some(finish),
             },
             payloads,

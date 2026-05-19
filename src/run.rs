@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use crate::op::{Effect, EffectUpdate, ItemWrite, NoopRunOps, RunOps};
+
 macro_rules! id_newtype {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +81,21 @@ pub enum RunCommand {
 pub struct RuntimeLimits {
     pub max_steps: u32,
     pub allow_clarification: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_timeout: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_timeout: Option<Duration>,
+}
+
+impl RuntimeLimits {
+    pub fn new(max_steps: u32) -> Self {
+        Self {
+            max_steps,
+            allow_clarification: true,
+            step_timeout: None,
+            run_timeout: None,
+        }
+    }
 }
 
 /// Output from a completed or interrupted turn.
@@ -223,7 +240,7 @@ impl RunCancel {
 }
 
 /// Context passed to every node during graph execution.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunContext<I, Step, Signal, Output, Interrupt> {
     pub run_id: RunId,
     pub session_id: SessionId,
@@ -233,6 +250,7 @@ pub struct RunContext<I, Step, Signal, Output, Interrupt> {
     pub(crate) event_tx:
         Option<async_rt::sync::mpsc::Sender<RunStreamEvent<Step, Signal, Output, Interrupt>>>,
     pub(crate) cancel: Arc<RunCancel>,
+    pub(crate) ops: Arc<dyn RunOps>,
     _stream_types: PhantomData<(Step, Output, Interrupt)>,
 }
 
@@ -256,8 +274,76 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
             input,
             event_tx,
             cancel,
+            ops: Arc::new(NoopRunOps),
             _stream_types: PhantomData,
         }
+    }
+
+    pub(crate) fn with_ops(mut self, ops: Arc<dyn RunOps>) -> Self {
+        self.ops = ops;
+        self
+    }
+
+    pub async fn reserve(
+        &self,
+        key: &str,
+        kind: &str,
+        request: Value,
+    ) -> Result<Effect, crate::error::MachineError> {
+        self.ops.reserve(&self.run_id, key, kind, request).await
+    }
+
+    pub async fn start(&self, key: &str) -> Result<Effect, crate::error::MachineError> {
+        self.ops.start(&self.run_id, key).await
+    }
+
+    pub async fn done(
+        &self,
+        key: impl Into<String>,
+        result: Value,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_effect(&self.run_id, EffectUpdate::done(key, result))
+            .await
+    }
+
+    pub async fn fail(
+        &self,
+        key: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_effect(&self.run_id, EffectUpdate::failed(key, code, message))
+            .await
+    }
+
+    pub async fn unknown(
+        &self,
+        key: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_effect(&self.run_id, EffectUpdate::unknown(key, message))
+            .await
+    }
+
+    pub async fn item(
+        &self,
+        key: impl Into<String>,
+        kind: impl Into<String>,
+        body: Value,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_item(
+                &self.run_id,
+                ItemWrite {
+                    key: key.into(),
+                    kind: kind.into(),
+                    body,
+                },
+            )
+            .await
     }
 
     pub fn is_streaming(&self) -> bool {

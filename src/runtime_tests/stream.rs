@@ -28,7 +28,7 @@ fn stream_persists_and_forwards_completed_events() {
         assert_eq!(completed.as_deref(), Some("value=1"));
         let events = rt
             .store()
-            .list_events(&run_id, &scope(), 0)
+            .list_events(&run_id, &scope(), 0, usize::MAX)
             .await
             .expect("events");
         assert!(matches!(
@@ -67,7 +67,7 @@ fn invoke_returns_output_and_records_events() {
         }
         let events = rt
             .store()
-            .list_events(&run_id, &scope(), 0)
+            .list_events(&run_id, &scope(), 0, usize::MAX)
             .await
             .expect("events");
         assert!(
@@ -94,7 +94,7 @@ fn tx_runtime_commits_final_checkpoint_with_terminal_events() {
 
         let events = rt
             .store()
-            .list_events(&run_id, &scope(), 0)
+            .list_events(&run_id, &scope(), 0, usize::MAX)
             .await
             .expect("events");
         let step_done = events
@@ -134,6 +134,38 @@ fn tx_runtime_commits_final_checkpoint_with_terminal_events() {
 }
 
 #[test]
+fn tx_runtime_commits_context_ops_with_step_event() {
+    block_on(async {
+        let rt = tx_runtime(8);
+        let run_id = RunId::from("run-tx-ops");
+        let result = rt
+            .invoke(request(run_id.as_str(), Mode::Ops), start(None))
+            .await
+            .expect("invoke");
+        assert!(matches!(
+            result,
+            StartResult::Started(RunOutput::Completed { .. })
+        ));
+
+        let effects = rt
+            .store()
+            .list_effects(&run_id, &scope(), 8)
+            .await
+            .expect("effects");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].status, EffectStatus::Done);
+        assert_eq!(effects[0].result, Some(json!({"ok": true})));
+        let items = rt
+            .store()
+            .list_items(&run_id, &scope(), 8)
+            .await
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "artifact");
+    });
+}
+
+#[test]
 fn tx_runtime_commits_interrupt_checkpoint_with_terminal_events() {
     block_on(async {
         let rt = tx_runtime(8);
@@ -149,7 +181,7 @@ fn tx_runtime_commits_interrupt_checkpoint_with_terminal_events() {
 
         let events = rt
             .store()
-            .list_events(&run_id, &scope(), 0)
+            .list_events(&run_id, &scope(), 0, usize::MAX)
             .await
             .expect("events");
         let step_done = events
@@ -224,7 +256,7 @@ fn tx_runtime_reaps_stale_leased_runs() {
 
         let events = rt
             .store()
-            .list_events(&RunId::from("run-stale"), &scope(), 0)
+            .list_events(&RunId::from("run-stale"), &scope(), 0, usize::MAX)
             .await
             .expect("events");
         assert!(matches!(

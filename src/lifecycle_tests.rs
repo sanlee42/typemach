@@ -1,4 +1,5 @@
 use super::*;
+use crate::op::Page;
 use crate::run::{LeaseId, ThreadId, WorkerId};
 use crate::store::{
     LeaseClaim, MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult,
@@ -184,8 +185,11 @@ impl RunStore<TestEvent> for BlockingRecordStore {
         run_id: &RunId,
         scope: &Value,
         after_seq: i64,
-    ) -> Result<Vec<TestEvent>, MachineError> {
-        self.inner.list_events(run_id, scope, after_seq).await
+        limit: usize,
+    ) -> Result<Page<TestEvent>, MachineError> {
+        self.inner
+            .list_events(run_id, scope, after_seq, limit)
+            .await
     }
 }
 
