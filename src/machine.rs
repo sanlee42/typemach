@@ -42,8 +42,8 @@ pub trait Machine: Send + Sync + 'static {
     type Step: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
     type State: MachineState;
     type Input: Clone + Send + Sync + 'static;
-    type Signal: Send + Sync + 'static;
-    type Output: Send + Sync + 'static;
+    type Signal: Serialize + Send + Sync + 'static;
+    type Output: Serialize + Send + Sync + 'static;
     type Interrupt: Clone + Serialize + DeserializeOwned + Send + Sync + 'static;
 
     fn start_step(&self) -> Self::Step;

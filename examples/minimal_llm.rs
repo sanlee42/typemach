@@ -31,13 +31,13 @@ struct PromptInput {
     prompt: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 enum Signal {
     ModelStarted { model: String },
     AssistantDelta { text: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct Answer {
     text: String,
 }

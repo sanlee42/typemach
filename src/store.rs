@@ -69,6 +69,7 @@ where
 pub enum RunStatus {
     Running,
     Completed,
+    Interrupted,
     Cancelled,
     Error,
 }
@@ -82,6 +83,7 @@ impl RunStatus {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
             Self::Cancelled => "cancelled",
             Self::Error => "error",
         }

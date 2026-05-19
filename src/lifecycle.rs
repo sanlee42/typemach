@@ -67,7 +67,7 @@ impl<E: RunEvent> RunTail<E> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RunLifecycle<E, S>
 where
     E: RunEvent,
@@ -77,6 +77,21 @@ where
     store: Arc<S>,
     event_locks: Arc<Mutex<HashMap<RunId, Arc<Mutex<()>>>>>,
     max_in_flight: usize,
+}
+
+impl<E, S> Clone for RunLifecycle<E, S>
+where
+    E: RunEvent,
+    S: RunStore<E>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            store: Arc::clone(&self.store),
+            event_locks: Arc::clone(&self.event_locks),
+            max_in_flight: self.max_in_flight,
+        }
+    }
 }
 
 impl<E, S> RunLifecycle<E, S>
@@ -116,22 +131,45 @@ where
         stream_sender: Option<mpsc::UnboundedSender<E>>,
     ) -> Result<StartRunResult, MachineError> {
         let run_id = run.run_id.clone();
-        match self.store.start_run(&run).await? {
-            StoreStartResult::Existing(existing) => Ok(StartRunResult::Existing(existing)),
-            StoreStartResult::Created => {
-                match self
-                    .registry
-                    .try_insert(run_id, handle, stream_sender, self.max_in_flight)
-                {
-                    Ok(()) => Ok(StartRunResult::Started),
-                    Err(MachineError::CapacityExceeded) => Ok(StartRunResult::NotRegistered(
-                        StartRunRejection::CapacityExceeded,
-                    )),
-                    Err(MachineError::RunAlreadyActive) => Ok(StartRunResult::NotRegistered(
-                        StartRunRejection::RunAlreadyActive,
-                    )),
-                    Err(err) => Err(err),
-                }
+        if let Some(existing) = self.store.lookup_run(&run_id, &run.scope).await? {
+            return Ok(StartRunResult::Existing(existing));
+        }
+        if let Some(client_run_key) = &run.client_run_key
+            && let Some(existing) = self
+                .store
+                .find_idempotent_run(&run.scope, &run.session_id, client_run_key)
+                .await?
+        {
+            return Ok(StartRunResult::Existing(existing));
+        }
+
+        match self
+            .registry
+            .try_insert(run_id.clone(), handle, stream_sender, self.max_in_flight)
+        {
+            Ok(()) => {}
+            Err(MachineError::CapacityExceeded) => {
+                return Ok(StartRunResult::NotRegistered(
+                    StartRunRejection::CapacityExceeded,
+                ));
+            }
+            Err(MachineError::RunAlreadyActive) => {
+                return Ok(StartRunResult::NotRegistered(
+                    StartRunRejection::RunAlreadyActive,
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+
+        match self.store.start_run(&run).await {
+            Ok(StoreStartResult::Created) => Ok(StartRunResult::Started),
+            Ok(StoreStartResult::Existing(existing)) => {
+                self.registry.remove(&run_id);
+                Ok(StartRunResult::Existing(existing))
+            }
+            Err(err) => {
+                self.registry.remove(&run_id);
+                Err(err)
             }
         }
     }
@@ -999,7 +1037,11 @@ mod tests {
     #[test]
     fn lifecycle_start_run_returns_idempotent_existing_without_registry_insert() {
         block_on(async {
-            let lifecycle = lifecycle();
+            let lifecycle = RunLifecycle::new(
+                RunRegistry::new(),
+                Arc::new(MemoryRunStore::<TestEvent>::new()),
+                1,
+            );
             assert!(matches!(
                 lifecycle
                     .start_run(
@@ -1032,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_start_run_persists_when_registry_is_full() {
+    fn lifecycle_start_run_does_not_persist_when_registry_is_full() {
         block_on(async {
             let lifecycle = RunLifecycle::new(
                 RunRegistry::new(),
@@ -1056,9 +1098,8 @@ mod tests {
                 .store()
                 .lookup_run(&RunId::from("run-a"), &scope())
                 .await
-                .expect("lookup")
-                .expect("stored run");
-            assert_eq!(lookup.status, RunStatus::Running);
+                .expect("lookup");
+            assert!(lookup.is_none());
             assert_eq!(lifecycle.registry().len(), 0);
         });
     }
@@ -1072,11 +1113,8 @@ mod tests {
                 0,
             );
             lifecycle
-                .start_run(
-                    run_start("run-a", None),
-                    RunHandle::new("token".to_string()),
-                    None,
-                )
+                .store()
+                .start_run(&run_start("run-a", None))
                 .await
                 .expect("start");
 
@@ -1106,11 +1144,8 @@ mod tests {
                 0,
             );
             lifecycle
-                .start_run(
-                    run_start("run-a", None),
-                    RunHandle::new("token".to_string()),
-                    None,
-                )
+                .store()
+                .start_run(&run_start("run-a", None))
                 .await
                 .expect("start");
             lifecycle

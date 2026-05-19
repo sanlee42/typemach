@@ -42,6 +42,7 @@ impl Machine for MyAgent {
 - `CheckpointSaver` trait. In-memory and Postgres backends. Records are transparent JSON.
 - Bounded backpressure on stream channels.
 - Heartbeat during long steps and while waiting for the session lock.
+- `Runtime` wraps `Runner` + run lifecycle storage for persisted run events.
 - `MachineState` has a blanket impl for any `Serialize + DeserializeOwned` type.
 
 ## Install
