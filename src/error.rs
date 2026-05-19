@@ -26,6 +26,12 @@ pub enum MachineError {
     #[error("run is already active")]
     RunAlreadyActive,
 
+    #[error("run lease lost")]
+    LeaseLost,
+
+    #[error("run is owned by another worker")]
+    NotOwner { owner: Option<crate::run::WorkerId> },
+
     #[error("run not found")]
     RunNotFound,
 

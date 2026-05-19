@@ -43,13 +43,15 @@ impl Machine for MyAgent {
 - Bounded backpressure on stream channels.
 - Heartbeat during long steps and while waiting for the session lock.
 - `Runtime` wraps `Runner` + run lifecycle storage for persisted run events.
+- `TxRuntime` + `PgStore` commit checkpoint, stream events, and terminal run state together.
+- `TxRuntime` leases Pg runs, renews active ownership, and reaps stale `running` runs as errors.
 - `MachineState` has a blanket impl for any `Serialize + DeserializeOwned` type.
 
 ## Install
 
 ```toml
 [dependencies]
-typemach = { git = "https://github.com/sanlee42/typemach.git", features = ["checkpoint-postgres"] }
+typemach = { git = "https://github.com/sanlee42/typemach.git", features = ["postgres"] }
 ```
 
 ## Example
@@ -86,6 +88,10 @@ runner.cancel_run(&run_id).await;
 ```
 
 Checkpoints are written after every step transition. Interrupts persist state + step + typed payload. Resume loads the record and calls `apply_resume_input`.
+
+For persisted runs, use `TxRuntime` with `PgStore`. `PgStore` owns generic `typemach_*` tables for sessions, runs, run events, and checkpoints. It stores typed event envelopes as JSON and keeps `scope`, metadata, idempotency keys, cancellation, terminal status, and checkpoint writes in one Postgres-backed path.
+
+`TxRuntime` also owns run leases. Each active run carries a `LeaseId`; every Pg commit checks that token before writing checkpoint/events/terminal state. If a process dies, another instance can call `TxRuntime::reap(limit)` to finalize expired `running` runs as `error` with `lease_expired`.
 
 ## License
 

@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
-checkpoint-postgres = ["dep:deadpool-postgres"]
+postgres = ["dep:deadpool-postgres"]
 
 [dependencies]
 async_rt = { package = "tokio", version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

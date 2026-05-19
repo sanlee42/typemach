@@ -64,6 +64,27 @@ pub trait CheckpointSaver: Send + Sync {
     async fn load(&self, thread_id: &str) -> Result<Option<CheckpointRecord>, MachineError>;
 }
 
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    async fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<CheckpointRecord>, MachineError>;
+}
+
+#[async_trait]
+impl<T> CheckpointStore for T
+where
+    T: CheckpointSaver + ?Sized,
+{
+    async fn load_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<CheckpointRecord>, MachineError> {
+        self.load(thread_id).await
+    }
+}
+
 pub struct MemorySaver {
     checkpoints: Mutex<HashMap<String, CheckpointRecord>>,
 }

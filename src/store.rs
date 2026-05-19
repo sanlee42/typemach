@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_rt::sync::Mutex;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::checkpoint::CheckpointRecord;
 use crate::error::MachineError;
-use crate::run::{RunId, SessionId};
+use crate::run::{LeaseId, RunId, SessionId, ThreadId, WorkerId};
 
 pub trait RunEvent: Clone + Send + Sync + 'static {
     fn run_id(&self) -> &RunId;
@@ -88,6 +90,43 @@ impl RunStatus {
             Self::Error => "error",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "interrupted" => Some(Self::Interrupted),
+            "cancelled" => Some(Self::Cancelled),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub run: RunId,
+    pub owner: WorkerId,
+    pub id: LeaseId,
+}
+
+impl Lease {
+    pub fn new(run: RunId, owner: WorkerId, id: LeaseId) -> Self {
+        Self { run, owner, id }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaseClaim {
+    pub owner: WorkerId,
+    pub id: LeaseId,
+    pub ttl: Duration,
+}
+
+impl LeaseClaim {
+    pub fn new(owner: WorkerId, id: LeaseId, ttl: Duration) -> Self {
+        Self { owner, id, ttl }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +140,7 @@ pub struct RunStart<Scope = Value> {
     pub retry_of_run_id: Option<RunId>,
     pub scope: Scope,
     pub metadata: Value,
+    pub lease: Option<LeaseClaim>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,12 +185,74 @@ impl<Data, Scope> RunFinish<Data, Scope> {
 }
 
 #[derive(Debug, Clone)]
+pub struct CheckpointWrite {
+    pub thread_id: ThreadId,
+    pub record: CheckpointRecord,
+}
+
+impl CheckpointWrite {
+    pub fn new(thread_id: ThreadId, record: CheckpointRecord) -> Self {
+        Self { thread_id, record }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunCommit<E: RunEvent, Data = (), Scope = Value> {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub scope: Scope,
+    pub lease: Option<LeaseId>,
+    pub checkpoint: Option<CheckpointWrite>,
+    pub events: Vec<E>,
+    pub finish: Option<RunFinish<Data, Scope>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitPlan<Data = (), Scope = Value> {
+    pub lease: Option<LeaseId>,
+    pub checkpoint: Option<CheckpointWrite>,
+    pub event_count: usize,
+    pub finish: Option<RunFinish<Data, Scope>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RunCommitResult<E: RunEvent> {
+    Recorded(Vec<E>),
+    Finished {
+        events: Vec<E>,
+        result: FinishRunResult<E>,
+    },
+    Skipped,
+}
+
+impl<E: RunEvent> RunCommitResult<E> {
+    pub fn is_skipped(&self) -> bool {
+        matches!(self, Self::Skipped)
+    }
+
+    pub fn events(&self) -> &[E] {
+        match self {
+            Self::Recorded(events) | Self::Finished { events, .. } => events,
+            Self::Skipped => &[],
+        }
+    }
+
+    pub fn finish_result(&self) -> Option<&FinishRunResult<E>> {
+        match self {
+            Self::Finished { result, .. } => Some(result),
+            Self::Recorded(_) | Self::Skipped => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RunLookup {
     pub run_id: RunId,
     pub session_id: SessionId,
     pub status: RunStatus,
     pub finish_reason: Option<String>,
     pub cancel_requested: bool,
+    pub owner: Option<WorkerId>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +350,36 @@ where
     ) -> Result<Vec<E>, MachineError>;
 }
 
+#[async_trait]
+pub trait RunTx<E>: RunStore<E>
+where
+    E: RunEvent,
+{
+    async fn commit_run(
+        &self,
+        commit: &RunCommit<E, Self::FinishData, Self::Scope>,
+    ) -> Result<RunCommitResult<E>, MachineError>;
+}
+
+#[async_trait]
+pub trait RunLease<E>: Send + Sync
+where
+    E: RunEvent,
+{
+    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool, MachineError>;
+
+    async fn release(&self, lease: &Lease) -> Result<(), MachineError>;
+
+    async fn reap_stale<F>(
+        &self,
+        owner: &WorkerId,
+        limit: usize,
+        build_event: F,
+    ) -> Result<Vec<RunLookup>, MachineError>
+    where
+        F: FnMut(&RunLookup, i64) -> E + Send;
+}
+
 #[derive(Debug)]
 pub struct MemoryRunStore<E: RunEvent, Scope = Value, FinishData = ()> {
     inner: Arc<Mutex<MemoryRunStoreInner<E, Scope, FinishData>>>,
@@ -322,6 +454,14 @@ struct MemoryRun<E: RunEvent, Scope, FinishData> {
     finish_data: Option<FinishData>,
     terminal_event: Option<E>,
     events: Vec<E>,
+    lease: Option<MemoryLease>,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryLease {
+    owner: WorkerId,
+    id: LeaseId,
+    until: Instant,
 }
 
 #[async_trait]
@@ -391,6 +531,7 @@ where
                 finish_data: None,
                 terminal_event: None,
                 events: Vec::new(),
+                lease: run.lease.as_ref().map(memory_lease),
             },
         );
         Ok(StoreStartResult::Created)
@@ -444,12 +585,16 @@ where
                 .ok_or(MachineError::RunNotFound)?;
             return Ok(FinishRunResult::AlreadyFinished(terminal_event));
         }
+        if run.lease.is_some() {
+            return Err(MachineError::LeaseLost);
+        }
         validate_next_seq(run, &finish.terminal_event)?;
         run.status = finish.status;
         run.finish_reason = Some(finish.finish_reason.clone());
         run.finish_data = Some(finish.data.clone());
         run.terminal_event = Some(finish.terminal_event.clone());
         run.events.push(finish.terminal_event.clone());
+        run.lease = None;
         Ok(FinishRunResult::Finished(finish.terminal_event.clone()))
     }
 
@@ -520,6 +665,9 @@ where
         if run.status.is_terminal() {
             return Ok(false);
         }
+        if run.lease.is_some() {
+            return Err(MachineError::LeaseLost);
+        }
         if event.session_id() != &run.start.session_id {
             return Err(MachineError::InvalidRunEvent {
                 reason: "event session_id does not match target run".to_string(),
@@ -555,6 +703,166 @@ where
     }
 }
 
+#[async_trait]
+impl<E, Scope, FinishData> RunTx<E> for MemoryRunStore<E, Scope, FinishData>
+where
+    E: RunEvent,
+    Scope: Clone + PartialEq + Serialize + Send + Sync + 'static,
+    FinishData: Clone + Send + Sync + 'static,
+{
+    async fn commit_run(
+        &self,
+        commit: &RunCommit<E, FinishData, Scope>,
+    ) -> Result<RunCommitResult<E>, MachineError> {
+        if commit.events.is_empty() {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "commit requires at least one event".to_string(),
+            });
+        }
+        validate_commit_events(commit)?;
+
+        let mut inner = self.inner.lock().await;
+        let Some(run) = inner.runs.get_mut(&commit.run_id) else {
+            return Ok(RunCommitResult::Skipped);
+        };
+        if run.start.scope != commit.scope {
+            return Err(MachineError::RunNotFound);
+        }
+        if run.start.session_id != commit.session_id {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "event session_id does not match target run".to_string(),
+            });
+        }
+        if run.status.is_terminal() {
+            if commit.finish.is_some()
+                && let Some(event) = run.terminal_event.clone()
+            {
+                return Ok(RunCommitResult::Finished {
+                    events: vec![event.clone()],
+                    result: FinishRunResult::AlreadyFinished(event),
+                });
+            }
+            return Ok(RunCommitResult::Skipped);
+        }
+        check_memory_lease(run, commit.lease.as_ref())?;
+
+        for event in &commit.events {
+            validate_next_seq(run, event)?;
+            run.events.push(event.clone());
+        }
+
+        if let Some(finish) = &commit.finish {
+            let terminal_event =
+                commit
+                    .events
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| MachineError::InvalidRunEvent {
+                        reason: "finish commit requires a terminal event".to_string(),
+                    })?;
+            run.status = finish.status;
+            run.finish_reason = Some(finish.finish_reason.clone());
+            run.finish_data = Some(finish.data.clone());
+            run.terminal_event = Some(terminal_event.clone());
+            run.lease = None;
+            return Ok(RunCommitResult::Finished {
+                events: commit.events.clone(),
+                result: FinishRunResult::Finished(terminal_event),
+            });
+        }
+
+        Ok(RunCommitResult::Recorded(commit.events.clone()))
+    }
+}
+
+#[async_trait]
+impl<E, Scope, FinishData> RunLease<E> for MemoryRunStore<E, Scope, FinishData>
+where
+    E: RunEvent,
+    Scope: Clone + PartialEq + Serialize + Send + Sync + 'static,
+    FinishData: Clone + Default + Send + Sync + 'static,
+{
+    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool, MachineError> {
+        let mut inner = self.inner.lock().await;
+        let Some(run) = inner.runs.get_mut(&lease.run) else {
+            return Ok(false);
+        };
+        let Some(active) = &mut run.lease else {
+            return Ok(false);
+        };
+        if run.status != RunStatus::Running
+            || active.owner != lease.owner
+            || active.id != lease.id
+            || active.until <= Instant::now()
+        {
+            return Ok(false);
+        }
+        active.until = Instant::now() + ttl;
+        Ok(true)
+    }
+
+    async fn release(&self, lease: &Lease) -> Result<(), MachineError> {
+        let mut inner = self.inner.lock().await;
+        if let Some(run) = inner.runs.get_mut(&lease.run)
+            && run
+                .lease
+                .as_ref()
+                .is_some_and(|active| active.owner == lease.owner && active.id == lease.id)
+        {
+            run.lease = None;
+        }
+        Ok(())
+    }
+
+    async fn reap_stale<F>(
+        &self,
+        _owner: &WorkerId,
+        limit: usize,
+        mut build_event: F,
+    ) -> Result<Vec<RunLookup>, MachineError>
+    where
+        F: FnMut(&RunLookup, i64) -> E + Send,
+    {
+        let mut inner = self.inner.lock().await;
+        let now = Instant::now();
+        let mut reaped = Vec::new();
+        for run in inner.runs.values_mut() {
+            if reaped.len() >= limit {
+                break;
+            }
+            if run.status != RunStatus::Running
+                || run.lease.as_ref().is_none_or(|lease| lease.until > now)
+            {
+                continue;
+            }
+            let mut lookup = run_lookup(run);
+            let seq = run.events.last().map(RunEvent::seq).unwrap_or(0) + 1;
+            let event = build_event(&lookup, seq);
+            if event.run_id() != &run.start.run_id || event.session_id() != &run.start.session_id {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "reap event target does not match run".to_string(),
+                });
+            }
+            if event.seq() != seq || !event.is_terminal() {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "reap requires the next terminal event".to_string(),
+                });
+            }
+            run.status = RunStatus::Error;
+            run.finish_reason = Some("lease_expired".to_string());
+            run.finish_data = Some(FinishData::default());
+            run.terminal_event = Some(event.clone());
+            run.events.push(event);
+            run.lease = None;
+            lookup.status = RunStatus::Error;
+            lookup.finish_reason = Some("lease_expired".to_string());
+            lookup.owner = None;
+            reaped.push(lookup);
+        }
+        Ok(reaped)
+    }
+}
+
 fn run_lookup<E, Scope, FinishData>(run: &MemoryRun<E, Scope, FinishData>) -> RunLookup
 where
     E: RunEvent,
@@ -565,14 +873,40 @@ where
         status: run.status,
         finish_reason: run.finish_reason.clone(),
         cancel_requested: run.cancel_requested,
+        owner: run.lease.as_ref().map(|lease| lease.owner.clone()),
     }
+}
+
+fn memory_lease(claim: &LeaseClaim) -> MemoryLease {
+    MemoryLease {
+        owner: claim.owner.clone(),
+        id: claim.id.clone(),
+        until: Instant::now() + claim.ttl,
+    }
+}
+
+fn check_memory_lease<E, Scope, FinishData>(
+    run: &MemoryRun<E, Scope, FinishData>,
+    lease: Option<&LeaseId>,
+) -> Result<(), MachineError>
+where
+    E: RunEvent,
+{
+    let Some(active) = &run.lease else {
+        return Ok(());
+    };
+    if lease != Some(&active.id) || active.until <= Instant::now() {
+        return Err(MachineError::LeaseLost);
+    }
+    Ok(())
 }
 
 fn scope_key<Scope>(scope: &Scope) -> Result<String, MachineError>
 where
     Scope: Serialize,
 {
-    serde_json::to_string(scope).map_err(MachineError::Serialization)
+    let value = serde_json::to_value(scope).map_err(MachineError::Serialization)?;
+    serde_json::to_string(&value).map_err(MachineError::Serialization)
 }
 
 fn validate_event_run<E: RunEvent>(
@@ -589,6 +923,62 @@ fn validate_event_run<E: RunEvent>(
         return Err(MachineError::InvalidRunEvent {
             reason: "event session_id does not match target run".to_string(),
         });
+    }
+    Ok(())
+}
+
+fn validate_commit_events<E, Data, Scope>(
+    commit: &RunCommit<E, Data, Scope>,
+) -> Result<(), MachineError>
+where
+    E: RunEvent,
+{
+    for event in &commit.events {
+        validate_event_run(&commit.run_id, &commit.session_id, event)?;
+        if event.seq() <= 0 {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "event seq must be positive".to_string(),
+            });
+        }
+    }
+    match &commit.finish {
+        Some(finish) => {
+            if finish.run_id != commit.run_id || finish.session_id != commit.session_id {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish target does not match committed run".to_string(),
+                });
+            }
+            if !finish.status.is_terminal() {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish_run requires a terminal status".to_string(),
+                });
+            }
+            let Some(last) = commit.events.last() else {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish commit requires a terminal event".to_string(),
+                });
+            };
+            if !last.is_terminal() {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish_run requires a terminal event".to_string(),
+                });
+            }
+            if commit.events[..commit.events.len() - 1]
+                .iter()
+                .any(RunEvent::is_terminal)
+            {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "only the last commit event may be terminal".to_string(),
+                });
+            }
+        }
+        None => {
+            if commit.events.iter().any(RunEvent::is_terminal) {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "record_event does not accept terminal events".to_string(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -657,6 +1047,7 @@ mod tests {
             retry_of_run_id: None,
             scope: serde_json::json!({"tenant": "demo"}),
             metadata: serde_json::json!({}),
+            lease: None,
         }
     }
 
@@ -878,6 +1269,7 @@ mod tests {
                 retry_of_run_id: None,
                 scope: TestScope { tenant: "alpha" },
                 metadata: serde_json::json!({}),
+                lease: None,
             };
 
             assert!(matches!(
@@ -909,6 +1301,7 @@ mod tests {
                 retry_of_run_id: None,
                 scope: TestScope { tenant: "beta" },
                 metadata: serde_json::json!({}),
+                lease: None,
             };
             assert!(matches!(
                 store.start_run(&retry).await.expect("cross-scope start"),
@@ -998,6 +1391,117 @@ mod tests {
             assert_eq!(
                 events.iter().map(|event| event.seq).collect::<Vec<_>>(),
                 vec![2, 3]
+            );
+        });
+    }
+
+    #[test]
+    fn memory_store_fences_leased_commits() {
+        block_on(async {
+            let store = MemoryRunStore::<TestEvent>::new();
+            let mut start = run_start("run-a", "session-a", None);
+            start.lease = Some(LeaseClaim::new(
+                WorkerId::from("worker-a"),
+                LeaseId::from("lease-a"),
+                std::time::Duration::from_secs(30),
+            ));
+            store.start_run(&start).await.expect("start");
+
+            let missing = RunCommit {
+                run_id: RunId::from("run-a"),
+                session_id: SessionId::from("session-a"),
+                scope: start.scope.clone(),
+                lease: None,
+                checkpoint: None,
+                events: vec![event("run-a", "session-a", 1, false)],
+                finish: None,
+            };
+            assert!(matches!(
+                store.commit_run(&missing).await,
+                Err(MachineError::LeaseLost)
+            ));
+
+            let wrong = RunCommit {
+                lease: Some(LeaseId::from("lease-b")),
+                ..missing.clone()
+            };
+            assert!(matches!(
+                store.commit_run(&wrong).await,
+                Err(MachineError::LeaseLost)
+            ));
+
+            let ok = RunCommit {
+                lease: Some(LeaseId::from("lease-a")),
+                ..missing
+            };
+            assert!(matches!(
+                store.commit_run(&ok).await.expect("commit"),
+                RunCommitResult::Recorded(_)
+            ));
+
+            let finish = RunFinish {
+                run_id: RunId::from("run-a"),
+                session_id: SessionId::from("session-a"),
+                scope: start.scope.clone(),
+                status: RunStatus::Completed,
+                finish_reason: "done".to_string(),
+                error_code: None,
+                data: (),
+            };
+            let done = RunCommit {
+                run_id: RunId::from("run-a"),
+                session_id: SessionId::from("session-a"),
+                scope: start.scope.clone(),
+                lease: Some(LeaseId::from("lease-a")),
+                checkpoint: None,
+                events: vec![event("run-a", "session-a", 2, true)],
+                finish: Some(finish),
+            };
+            assert!(matches!(
+                store.commit_run(&done).await.expect("finish"),
+                RunCommitResult::Finished { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn memory_store_reaps_stale_leases_once() {
+        block_on(async {
+            let store = MemoryRunStore::<TestEvent>::new();
+            let mut start = run_start("run-a", "session-a", None);
+            start.lease = Some(LeaseClaim::new(
+                WorkerId::from("worker-a"),
+                LeaseId::from("lease-a"),
+                std::time::Duration::from_millis(1),
+            ));
+            store.start_run(&start).await.expect("start");
+            async_rt::time::sleep(std::time::Duration::from_millis(5)).await;
+
+            let reaped = store
+                .reap_stale(&WorkerId::from("reaper"), 8, |run, seq| {
+                    event(run.run_id.as_str(), run.session_id.as_str(), seq, true)
+                })
+                .await
+                .expect("reap");
+            assert_eq!(reaped.len(), 1);
+            assert_eq!(reaped[0].status, RunStatus::Error);
+            assert_eq!(reaped[0].finish_reason.as_deref(), Some("lease_expired"));
+
+            let lookup = store
+                .lookup_run(&RunId::from("run-a"), &start.scope)
+                .await
+                .expect("lookup")
+                .expect("run");
+            assert_eq!(lookup.status, RunStatus::Error);
+            assert_eq!(
+                store
+                    .reap_stale(&WorkerId::from("reaper"), 8, |run, seq| {
+                        event(run.run_id.as_str(), run.session_id.as_str(), seq, true)
+                    })
+                    .await
+                    .expect("second reap")
+                    .len(),
+                0
             );
         });
     }

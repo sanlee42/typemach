@@ -50,6 +50,8 @@ macro_rules! id_newtype {
 id_newtype!(RunId);
 id_newtype!(SessionId);
 id_newtype!(ThreadId);
+id_newtype!(WorkerId);
+id_newtype!(LeaseId);
 
 /// Input for a single turn invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,8 +7,8 @@ use crate::error::MachineError;
 use crate::registry::{RunHandle, RunRegistry};
 use crate::run::{RunId, SessionId};
 use crate::store::{
-    FinishRunResult, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish, RunLookup, RunStart,
-    RunStatus, RunStore, StoreStartResult,
+    CommitPlan, FinishRunResult, RunCommit, RunCommitResult, RunEvent, RunEventEnvelope,
+    RunEventPayload, RunFinish, RunLookup, RunStart, RunStatus, RunStore, RunTx, StoreStartResult,
 };
 
 #[derive(Debug)]
@@ -375,17 +375,139 @@ where
         Ok(result)
     }
 
+    pub async fn commit_with<F>(
+        &self,
+        run_id: &RunId,
+        session_id: &SessionId,
+        scope: &S::Scope,
+        plan: CommitPlan<S::FinishData, S::Scope>,
+        mut build_event: F,
+    ) -> Result<RunCommitResult<E>, MachineError>
+    where
+        S: RunTx<E>,
+        F: FnMut(i64) -> E,
+    {
+        if plan.event_count == 0 {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "commit requires at least one event".to_string(),
+            });
+        }
+        if let Some(finish) = &plan.finish {
+            if !finish.status.is_terminal() {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish_run requires a terminal status".to_string(),
+                });
+            }
+            if finish.run_id != *run_id || finish.session_id != *session_id {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish target does not match committed run".to_string(),
+                });
+            }
+        }
+
+        let lock = self.event_lock(run_id).await;
+        let guard = lock.lock().await;
+        if self.store.lookup_run(run_id, scope).await?.is_none() {
+            let active = self.registry.handle(run_id).is_some();
+            drop(guard);
+            if !active {
+                self.remove_event_lock(run_id, &lock).await;
+            }
+            return Err(MachineError::RunNotFound);
+        }
+
+        let mut seqs = Vec::with_capacity(plan.event_count);
+        for _ in 0..plan.event_count {
+            let Some(seq) = self.registry.next_seq(run_id) else {
+                if plan.finish.is_some()
+                    && let Some(terminal_event) = self.store.terminal_event(run_id, scope).await?
+                {
+                    drop(guard);
+                    self.remove_event_lock(run_id, &lock).await;
+                    return Ok(RunCommitResult::Finished {
+                        events: vec![terminal_event.clone()],
+                        result: FinishRunResult::AlreadyFinished(terminal_event),
+                    });
+                }
+                drop(guard);
+                self.remove_event_lock(run_id, &lock).await;
+                return Err(MachineError::RunNotFound);
+            };
+            seqs.push(seq);
+        }
+
+        let events = seqs.iter().map(|seq| build_event(*seq)).collect::<Vec<_>>();
+        if let Err(err) =
+            validate_commit_events(run_id, session_id, plan.finish.as_ref(), &events, &seqs)
+        {
+            rewind_seqs(&self.registry, run_id, &seqs);
+            drop(guard);
+            return Err(err);
+        }
+
+        let commit = RunCommit {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            scope: scope.clone(),
+            lease: plan.lease,
+            checkpoint: plan.checkpoint,
+            events,
+            finish: plan.finish,
+        };
+        let result = match self.store.commit_run(&commit).await {
+            Ok(result) => result,
+            Err(err) => {
+                rewind_seqs(&self.registry, run_id, &seqs);
+                drop(guard);
+                return Err(err);
+            }
+        };
+
+        match &result {
+            RunCommitResult::Recorded(events) => {
+                for event in events {
+                    self.registry.publish(run_id, event.clone());
+                }
+            }
+            RunCommitResult::Finished { events, .. } => {
+                for event in events {
+                    if event.is_terminal() {
+                        self.registry.publish_terminal(run_id, event.clone());
+                    } else {
+                        self.registry.publish(run_id, event.clone());
+                    }
+                }
+                self.registry.remove(run_id);
+            }
+            RunCommitResult::Skipped => {
+                self.registry.remove(run_id);
+            }
+        }
+        drop(guard);
+        if !matches!(result, RunCommitResult::Recorded(_)) {
+            self.remove_event_lock(run_id, &lock).await;
+        }
+        Ok(result)
+    }
+
     pub async fn request_cancel(
         &self,
         run_id: &RunId,
         scope: &S::Scope,
     ) -> Result<Option<RunHandle>, MachineError> {
-        if self.store.lookup_run(run_id, scope).await?.is_none() {
+        let Some(lookup) = self.store.lookup_run(run_id, scope).await? else {
             return Err(MachineError::RunNotFound);
+        };
+        if lookup.status.is_terminal() {
+            return Ok(None);
         }
-        let handle = self.registry.request_cancel(run_id);
+        let Some(handle) = self.registry.request_cancel(run_id) else {
+            return Err(MachineError::NotOwner {
+                owner: lookup.owner,
+            });
+        };
         self.store.mark_cancelled(run_id, scope).await?;
-        Ok(handle)
+        Ok(Some(handle))
     }
 
     pub async fn subscribe(
@@ -411,14 +533,11 @@ where
                 tail: RunTail::new(receiver, last_replay_seq),
             });
         }
-        let lookup = if lookup.status == RunStatus::Running {
-            self.store
-                .lookup_run(run_id, scope)
-                .await?
-                .unwrap_or(lookup)
-        } else {
-            lookup
-        };
+        if lookup.status == RunStatus::Running {
+            return Err(MachineError::NotOwner {
+                owner: lookup.owner,
+            });
+        }
         let replay = self.store.list_events(run_id, scope, after_seq).await?;
         Ok(RunSubscription::Inactive {
             status: lookup.status,
@@ -467,6 +586,67 @@ where
     Ok(())
 }
 
+fn validate_commit_events<E, Data, Scope>(
+    run_id: &RunId,
+    session_id: &SessionId,
+    finish: Option<&RunFinish<Data, Scope>>,
+    events: &[E],
+    seqs: &[i64],
+) -> Result<(), MachineError>
+where
+    E: RunEvent,
+{
+    for (event, seq) in events.iter().zip(seqs) {
+        if event.run_id() != run_id {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "event run_id does not match target run".to_string(),
+            });
+        }
+        if event.session_id() != session_id {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "event session_id does not match target run".to_string(),
+            });
+        }
+        if event.seq() != *seq {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "event seq does not match allocated seq".to_string(),
+            });
+        }
+    }
+
+    match finish {
+        Some(finish) => {
+            let Some((last, seq)) = events.last().zip(seqs.last()) else {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "finish commit requires a terminal event".to_string(),
+                });
+            };
+            for event in &events[..events.len().saturating_sub(1)] {
+                if event.is_terminal() {
+                    return Err(MachineError::InvalidRunEvent {
+                        reason: "only the last commit event may be terminal".to_string(),
+                    });
+                }
+            }
+            validate_finish_event(finish, last, *seq)?;
+        }
+        None => {
+            if events.iter().any(RunEvent::is_terminal) {
+                return Err(MachineError::InvalidRunEvent {
+                    reason: "non-finish commit does not accept terminal events".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewind_seqs<E>(registry: &RunRegistry<E>, run_id: &RunId, seqs: &[i64]) {
+    for seq in seqs.iter().rev() {
+        registry.rewind_seq(run_id, *seq);
+    }
+}
+
 impl<P, S> RunLifecycle<RunEventEnvelope<P>, S>
 where
     P: RunEventPayload,
@@ -512,12 +692,42 @@ where
         })
         .await
     }
+
+    pub async fn commit_events(
+        &self,
+        run_id: &RunId,
+        session_id: &SessionId,
+        scope: &S::Scope,
+        mut plan: CommitPlan<S::FinishData, S::Scope>,
+        payloads: Vec<P>,
+    ) -> Result<RunCommitResult<RunEventEnvelope<P>>, MachineError>
+    where
+        S: RunTx<RunEventEnvelope<P>>,
+    {
+        let event_count = payloads.len();
+        plan.event_count = event_count;
+        let event_run_id = run_id.clone();
+        let event_session_id = session_id.clone();
+        let mut payloads = payloads.into_iter();
+        self.commit_with(run_id, session_id, scope, plan, move |seq| {
+            RunEventEnvelope::new(
+                event_run_id.clone(),
+                event_session_id.clone(),
+                seq,
+                payloads.next().expect("payload count matches event count"),
+            )
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult};
+    use crate::run::{LeaseId, WorkerId};
+    use crate::store::{
+        LeaseClaim, MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult,
+    };
     use async_rt::sync::Notify;
     use async_trait::async_trait;
     use serde_json::Value;
@@ -557,7 +767,18 @@ mod tests {
             retry_of_run_id: None,
             scope: scope(),
             metadata: serde_json::json!({}),
+            lease: None,
         }
+    }
+
+    fn leased_run_start(run_id: &str, owner: &str) -> RunStart {
+        let mut run = run_start(run_id, None);
+        run.lease = Some(LeaseClaim::new(
+            WorkerId::from(owner),
+            LeaseId::from("lease-a"),
+            Duration::from_secs(30),
+        ));
+        run
     }
 
     fn scope() -> Value {
@@ -976,6 +1197,34 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_subscribe_quick_fails_remote_running_run() {
+        block_on(async {
+            let store = Arc::new(MemoryRunStore::<TestEvent>::new());
+            let owner = RunLifecycle::new(RunRegistry::new(), Arc::clone(&store), 8);
+            owner
+                .start_run(
+                    leased_run_start("run-a", "worker-a"),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+            let peer = RunLifecycle::new(RunRegistry::new(), store, 8);
+
+            let err = peer
+                .subscribe(&RunId::from("run-a"), &scope(), 0)
+                .await
+                .expect_err("remote live subscribe must fail");
+            assert!(matches!(
+                err,
+                MachineError::NotOwner {
+                    owner: Some(owner),
+                } if owner == WorkerId::from("worker-a")
+            ));
+        });
+    }
+
+    #[test]
     fn lifecycle_request_cancel_marks_registry_and_store() {
         block_on(async {
             let lifecycle = lifecycle();
@@ -1025,6 +1274,40 @@ mod tests {
             assert!(
                 !lifecycle
                     .store()
+                    .lookup_run(&RunId::from("run-a"), &scope())
+                    .await
+                    .expect("lookup")
+                    .expect("run")
+                    .cancel_requested
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_request_cancel_quick_fails_remote_running_run() {
+        block_on(async {
+            let store = Arc::new(MemoryRunStore::<TestEvent>::new());
+            let owner = RunLifecycle::new(RunRegistry::new(), Arc::clone(&store), 8);
+            let handle = RunHandle::new("token".to_string());
+            owner
+                .start_run(leased_run_start("run-a", "worker-a"), handle.clone(), None)
+                .await
+                .expect("start");
+            let peer = RunLifecycle::new(RunRegistry::new(), Arc::clone(&store), 8);
+
+            let err = peer
+                .request_cancel(&RunId::from("run-a"), &scope())
+                .await
+                .expect_err("remote cancel must fail");
+            assert!(matches!(
+                err,
+                MachineError::NotOwner {
+                    owner: Some(owner),
+                } if owner == WorkerId::from("worker-a")
+            ));
+            assert!(!handle.is_cancelled());
+            assert!(
+                !store
                     .lookup_run(&RunId::from("run-a"), &scope())
                     .await
                     .expect("lookup")
