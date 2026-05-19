@@ -2,20 +2,32 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_rt::sync::{Mutex, mpsc};
-use serde_json::Value;
 
 use crate::error::MachineError;
 use crate::registry::{RunHandle, RunRegistry};
 use crate::run::{RunId, SessionId};
 use crate::store::{
-    FinishRunResult, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish, RunFinishRecord,
-    RunLookup, RunStart, RunStatus, RunStore, StartRunResult,
+    FinishRunResult, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish, RunLookup, RunStart,
+    RunStatus, RunStore, StoreStartResult,
 };
 
 #[derive(Debug)]
 pub enum AppendEventResult<E: RunEvent> {
     Recorded(E),
     Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRunRejection {
+    CapacityExceeded,
+    RunAlreadyActive,
+}
+
+#[derive(Debug, Clone)]
+pub enum StartRunResult {
+    Started,
+    Existing(RunLookup),
+    NotRegistered(StartRunRejection),
 }
 
 #[derive(Debug)]
@@ -92,41 +104,34 @@ where
     pub async fn ensure_session(
         &self,
         session_id: Option<SessionId>,
-        scope: &Value,
+        scope: &S::Scope,
     ) -> Result<SessionId, MachineError> {
         self.store.ensure_session(session_id, scope).await
     }
 
     pub async fn start_run(
         &self,
-        run: RunStart,
+        run: RunStart<S::Scope>,
         handle: RunHandle,
         stream_sender: Option<mpsc::UnboundedSender<E>>,
     ) -> Result<StartRunResult, MachineError> {
-        if let Some(key) = run.client_run_key.as_deref()
-            && let Some(existing) = self
-                .store
-                .find_idempotent_run(&run.scope, &run.session_id, key)
-                .await?
-        {
-            return Ok(StartRunResult::Existing(existing));
-        }
-
-        self.registry.try_insert(
-            run.run_id.clone(),
-            handle,
-            stream_sender,
-            self.max_in_flight,
-        )?;
-        match self.store.start_run(&run).await {
-            Ok(StartRunResult::Created) => Ok(StartRunResult::Created),
-            Ok(StartRunResult::Existing(existing)) => {
-                self.registry.remove(&run.run_id);
-                Ok(StartRunResult::Existing(existing))
-            }
-            Err(err) => {
-                self.registry.remove(&run.run_id);
-                Err(err)
+        let run_id = run.run_id.clone();
+        match self.store.start_run(&run).await? {
+            StoreStartResult::Existing(existing) => Ok(StartRunResult::Existing(existing)),
+            StoreStartResult::Created => {
+                match self
+                    .registry
+                    .try_insert(run_id, handle, stream_sender, self.max_in_flight)
+                {
+                    Ok(()) => Ok(StartRunResult::Started),
+                    Err(MachineError::CapacityExceeded) => Ok(StartRunResult::NotRegistered(
+                        StartRunRejection::CapacityExceeded,
+                    )),
+                    Err(MachineError::RunAlreadyActive) => Ok(StartRunResult::NotRegistered(
+                        StartRunRejection::RunAlreadyActive,
+                    )),
+                    Err(err) => Err(err),
+                }
             }
         }
     }
@@ -140,13 +145,20 @@ where
         )
     }
 
-    async fn remove_event_lock(&self, run_id: &RunId) {
-        self.event_locks.lock().await.remove(run_id);
+    async fn remove_event_lock(&self, run_id: &RunId, lock: &Arc<Mutex<()>>) {
+        let mut locks = self.event_locks.lock().await;
+        if locks
+            .get(run_id)
+            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(current) <= 2)
+        {
+            locks.remove(run_id);
+        }
     }
 
     pub async fn append_with<F>(
         &self,
         run_id: &RunId,
+        scope: &S::Scope,
         build_event: F,
     ) -> Result<AppendEventResult<E>, MachineError>
     where
@@ -154,42 +166,53 @@ where
     {
         let lock = self.event_lock(run_id).await;
         let guard = lock.lock().await;
+        if self.store.lookup_run(run_id, scope).await?.is_none() {
+            let active = self.registry.handle(run_id).is_some();
+            drop(guard);
+            if !active {
+                self.remove_event_lock(run_id, &lock).await;
+            }
+            return Err(MachineError::RunNotFound);
+        }
         let Some(seq) = self.registry.next_seq(run_id) else {
             drop(guard);
-            self.remove_event_lock(run_id).await;
+            self.remove_event_lock(run_id, &lock).await;
             return Err(MachineError::RunNotFound);
         };
         let event = build_event(seq);
         if event.run_id() != run_id {
+            self.registry.rewind_seq(run_id, seq);
             return Err(MachineError::InvalidRunEvent {
                 reason: "event run_id does not match target run".to_string(),
             });
         }
         if event.seq() != seq {
+            self.registry.rewind_seq(run_id, seq);
             return Err(MachineError::InvalidRunEvent {
                 reason: "event seq does not match allocated seq".to_string(),
             });
         }
         if event.is_terminal() {
+            self.registry.rewind_seq(run_id, seq);
             return Err(MachineError::InvalidRunEvent {
                 reason: "append_event does not accept terminal events".to_string(),
             });
         }
-        let recorded = self.store.record_event(run_id, &event).await?;
+        let recorded = self.store.record_event(run_id, scope, &event).await?;
         if recorded {
             self.registry.publish(run_id, event.clone());
             Ok(AppendEventResult::Recorded(event))
         } else {
             self.registry.remove(run_id);
             drop(guard);
-            self.remove_event_lock(run_id).await;
+            self.remove_event_lock(run_id, &lock).await;
             Ok(AppendEventResult::Skipped)
         }
     }
 
     pub async fn finish_with<F>(
         &self,
-        finish: RunFinish,
+        finish: RunFinish<S::FinishData, S::Scope>,
         build_event: F,
     ) -> Result<FinishRunResult<E>, MachineError>
     where
@@ -203,68 +226,134 @@ where
 
         let lock = self.event_lock(&finish.run_id).await;
         let guard = lock.lock().await;
+        if self
+            .store
+            .lookup_run(&finish.run_id, &finish.scope)
+            .await?
+            .is_none()
+        {
+            let active = self.registry.handle(&finish.run_id).is_some();
+            drop(guard);
+            if !active {
+                self.remove_event_lock(&finish.run_id, &lock).await;
+            }
+            return Err(MachineError::RunNotFound);
+        }
         let Some(seq) = self.registry.next_seq(&finish.run_id) else {
-            if let Some(terminal_event) = self.store.terminal_event(&finish.run_id).await? {
+            if let Some(terminal_event) = self
+                .store
+                .terminal_event(&finish.run_id, &finish.scope)
+                .await?
+            {
                 drop(guard);
-                self.remove_event_lock(&finish.run_id).await;
+                self.remove_event_lock(&finish.run_id, &lock).await;
                 return Ok(FinishRunResult::AlreadyFinished(terminal_event));
             }
             drop(guard);
-            self.remove_event_lock(&finish.run_id).await;
+            self.remove_event_lock(&finish.run_id, &lock).await;
             return Err(MachineError::RunNotFound);
         };
 
         let terminal_event = build_event(seq);
-        if terminal_event.run_id() != &finish.run_id {
-            return Err(MachineError::InvalidRunEvent {
-                reason: "event run_id does not match target run".to_string(),
-            });
-        }
-        if terminal_event.session_id() != &finish.session_id {
-            return Err(MachineError::InvalidRunEvent {
-                reason: "event session_id does not match target run".to_string(),
-            });
-        }
-        if terminal_event.seq() != seq {
-            return Err(MachineError::InvalidRunEvent {
-                reason: "event seq does not match allocated seq".to_string(),
-            });
-        }
-        if !terminal_event.is_terminal() {
-            return Err(MachineError::InvalidRunEvent {
-                reason: "finish_run requires a terminal event".to_string(),
-            });
+        if let Err(err) = validate_finish_event(&finish, &terminal_event, seq) {
+            self.registry.rewind_seq(&finish.run_id, seq);
+            drop(guard);
+            return Err(err);
         }
 
         let run_id = finish.run_id.clone();
-        let finish = RunFinishRecord {
-            run_id: finish.run_id,
-            session_id: finish.session_id,
-            status: finish.status,
-            finish_reason: finish.finish_reason,
-            error_code: finish.error_code,
-            terminal_event,
-            snapshot_json: finish.snapshot_json,
-        };
+        let finish = finish.into_record(terminal_event);
         let result = self.store.finish_run(&finish).await?;
         self.registry
             .publish_terminal(&finish.run_id, result.terminal_event().clone());
         self.registry.remove(&run_id);
         drop(guard);
-        self.remove_event_lock(&run_id).await;
+        self.remove_event_lock(&run_id, &lock).await;
         Ok(result)
     }
 
-    pub async fn request_cancel(&self, run_id: &RunId) -> Result<Option<RunHandle>, MachineError> {
+    pub async fn finish_detached_with<F>(
+        &self,
+        finish: RunFinish<S::FinishData, S::Scope>,
+        build_event: F,
+    ) -> Result<FinishRunResult<E>, MachineError>
+    where
+        F: FnOnce(i64) -> E,
+    {
+        if !finish.status.is_terminal() {
+            return Err(MachineError::InvalidRunEvent {
+                reason: "finish_run requires a terminal status".to_string(),
+            });
+        }
+
+        let lock = self.event_lock(&finish.run_id).await;
+        let guard = lock.lock().await;
+        if self
+            .store
+            .lookup_run(&finish.run_id, &finish.scope)
+            .await?
+            .is_none()
+        {
+            let active = self.registry.handle(&finish.run_id).is_some();
+            drop(guard);
+            if !active {
+                self.remove_event_lock(&finish.run_id, &lock).await;
+            }
+            return Err(MachineError::RunNotFound);
+        }
+        if self.registry.handle(&finish.run_id).is_some() {
+            drop(guard);
+            return Err(MachineError::RunAlreadyActive);
+        }
+        if let Some(terminal_event) = self
+            .store
+            .terminal_event(&finish.run_id, &finish.scope)
+            .await?
+        {
+            drop(guard);
+            self.remove_event_lock(&finish.run_id, &lock).await;
+            return Ok(FinishRunResult::AlreadyFinished(terminal_event));
+        }
+
+        let next_seq = self
+            .store
+            .list_events(&finish.run_id, &finish.scope, 0)
+            .await?
+            .last()
+            .map(RunEvent::seq)
+            .unwrap_or(0)
+            + 1;
+        let terminal_event = build_event(next_seq);
+        if let Err(err) = validate_finish_event(&finish, &terminal_event, next_seq) {
+            drop(guard);
+            return Err(err);
+        }
+
+        let run_id = finish.run_id.clone();
+        let finish = finish.into_record(terminal_event);
+        let result = self.store.finish_run(&finish).await?;
+        drop(guard);
+        self.remove_event_lock(&run_id, &lock).await;
+        Ok(result)
+    }
+
+    pub async fn request_cancel(
+        &self,
+        run_id: &RunId,
+        scope: &S::Scope,
+    ) -> Result<Option<RunHandle>, MachineError> {
+        if self.store.lookup_run(run_id, scope).await?.is_none() {
+            return Err(MachineError::RunNotFound);
+        }
         let handle = self.registry.request_cancel(run_id);
-        self.store.mark_cancelled(run_id).await?;
+        self.store.mark_cancelled(run_id, scope).await?;
         Ok(handle)
     }
 
     pub async fn subscribe(
         &self,
         run_id: &RunId,
-        scope: &Value,
+        scope: &S::Scope,
         after_seq: i64,
     ) -> Result<RunSubscription<E>, MachineError> {
         let Some(lookup) = self.store.lookup_run(run_id, scope).await? else {
@@ -301,12 +390,43 @@ where
 
     pub async fn find_idempotent_run(
         &self,
-        scope: &Value,
-        session_id: &crate::run::SessionId,
+        scope: &S::Scope,
+        session_id: &SessionId,
         key: &str,
     ) -> Result<Option<RunLookup>, MachineError> {
         self.store.find_idempotent_run(scope, session_id, key).await
     }
+}
+
+fn validate_finish_event<E, Data, Scope>(
+    finish: &RunFinish<Data, Scope>,
+    terminal_event: &E,
+    seq: i64,
+) -> Result<(), MachineError>
+where
+    E: RunEvent,
+{
+    if terminal_event.run_id() != &finish.run_id {
+        return Err(MachineError::InvalidRunEvent {
+            reason: "event run_id does not match target run".to_string(),
+        });
+    }
+    if terminal_event.session_id() != &finish.session_id {
+        return Err(MachineError::InvalidRunEvent {
+            reason: "event session_id does not match target run".to_string(),
+        });
+    }
+    if terminal_event.seq() != seq {
+        return Err(MachineError::InvalidRunEvent {
+            reason: "event seq does not match allocated seq".to_string(),
+        });
+    }
+    if !terminal_event.is_terminal() {
+        return Err(MachineError::InvalidRunEvent {
+            reason: "finish_run requires a terminal event".to_string(),
+        });
+    }
+    Ok(())
 }
 
 impl<P, S> RunLifecycle<RunEventEnvelope<P>, S>
@@ -318,11 +438,12 @@ where
         &self,
         run_id: &RunId,
         session_id: &SessionId,
+        scope: &S::Scope,
         payload: P,
     ) -> Result<AppendEventResult<RunEventEnvelope<P>>, MachineError> {
         let event_run_id = run_id.clone();
         let event_session_id = session_id.clone();
-        self.append_with(run_id, move |seq| {
+        self.append_with(run_id, scope, move |seq| {
             RunEventEnvelope::new(event_run_id, event_session_id, seq, payload)
         })
         .await
@@ -330,7 +451,7 @@ where
 
     pub async fn finish_run(
         &self,
-        finish: RunFinish,
+        finish: RunFinish<S::FinishData, S::Scope>,
         payload: P,
     ) -> Result<FinishRunResult<RunEventEnvelope<P>>, MachineError> {
         let event_run_id = finish.run_id.clone();
@@ -340,14 +461,28 @@ where
         })
         .await
     }
+
+    pub async fn finish_detached(
+        &self,
+        finish: RunFinish<S::FinishData, S::Scope>,
+        payload: P,
+    ) -> Result<FinishRunResult<RunEventEnvelope<P>>, MachineError> {
+        let event_run_id = finish.run_id.clone();
+        let event_session_id = finish.session_id.clone();
+        self.finish_detached_with(finish, move |seq| {
+            RunEventEnvelope::new(event_run_id, event_session_id, seq, payload)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{MemoryRunStore, RunStart, RunStore};
+    use crate::store::{MemoryRunStore, RunFinishRecord, RunStart, RunStore, StoreStartResult};
     use async_rt::sync::Notify;
     use async_trait::async_trait;
+    use serde_json::Value;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -411,10 +546,11 @@ mod tests {
         RunFinish {
             run_id: RunId::from(run_id),
             session_id: SessionId::from("session-a"),
+            scope: scope(),
             status,
             finish_reason: "stop".to_string(),
             error_code: None,
-            snapshot_json: None,
+            data: (),
         }
     }
 
@@ -436,6 +572,7 @@ mod tests {
                 .append_event(
                     &RunId::from("run-a"),
                     &SessionId::from("session-a"),
+                    &scope(),
                     payload(false),
                 )
                 .await
@@ -476,6 +613,7 @@ mod tests {
                 .append_event(
                     &RunId::from("run-a"),
                     &SessionId::from("session-a"),
+                    &scope(),
                     payload(false),
                 )
                 .await;
@@ -499,6 +637,7 @@ mod tests {
                 .append_event(
                     &RunId::from("run-a"),
                     &SessionId::from("session-a"),
+                    &scope(),
                     payload(false),
                 )
                 .await
@@ -542,7 +681,7 @@ mod tests {
                     )
                     .await
                     .expect("start second"),
-                StartRunResult::Created
+                StartRunResult::Started
             ));
         });
     }
@@ -583,6 +722,48 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_invalid_finish_keeps_active_lock_and_rewinds_seq() {
+        block_on(async {
+            let lifecycle = lifecycle();
+            lifecycle
+                .start_run(
+                    run_start("run-a", None),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+
+            let err = lifecycle
+                .finish_with(finish_request("run-a", RunStatus::Completed), |seq| {
+                    RunEventEnvelope::new(
+                        RunId::from("run-a"),
+                        SessionId::from("wrong-session"),
+                        seq,
+                        payload(true),
+                    )
+                })
+                .await
+                .expect_err("invalid terminal event should fail");
+            assert!(matches!(err, MachineError::InvalidRunEvent { .. }));
+            assert!(
+                lifecycle
+                    .event_locks
+                    .lock()
+                    .await
+                    .contains_key(&RunId::from("run-a")),
+                "active run lock should remain registered after validation failure"
+            );
+
+            let terminal = lifecycle
+                .finish_run(finish_request("run-a", RunStatus::Completed), payload(true))
+                .await
+                .expect("finish");
+            assert_eq!(terminal.terminal_event().seq, 1);
+        });
+    }
+
+    #[test]
     fn lifecycle_serializes_appends_for_one_run() {
         block_on(async {
             let store = Arc::new(BlockingRecordStore::new(1));
@@ -602,6 +783,7 @@ mod tests {
                     .append_event(
                         &RunId::from("run-a"),
                         &SessionId::from("session-a"),
+                        &scope(),
                         payload(false),
                     )
                     .await
@@ -616,6 +798,7 @@ mod tests {
                     .append_event(
                         &RunId::from("run-a"),
                         &SessionId::from("session-a"),
+                        &scope(),
                         payload(false),
                     )
                     .await
@@ -668,6 +851,7 @@ mod tests {
                 .append_event(
                     &RunId::from("run-a"),
                     &SessionId::from("session-a"),
+                    &scope(),
                     payload(false),
                 )
                 .await
@@ -687,6 +871,7 @@ mod tests {
                 .append_event(
                     &RunId::from("run-a"),
                     &SessionId::from("session-a"),
+                    &scope(),
                     payload(false),
                 )
                 .await
@@ -765,13 +950,42 @@ mod tests {
                 .await
                 .expect("start");
             let handle = lifecycle
-                .request_cancel(&RunId::from("run-a"))
+                .request_cancel(&RunId::from("run-a"), &scope())
                 .await
                 .expect("cancel")
                 .expect("active handle");
             assert!(handle.is_cancelled());
             assert!(
                 lifecycle
+                    .store()
+                    .lookup_run(&RunId::from("run-a"), &scope())
+                    .await
+                    .expect("lookup")
+                    .expect("run")
+                    .cancel_requested
+            );
+        });
+    }
+
+    #[test]
+    fn lifecycle_request_cancel_rejects_wrong_scope_without_cancelling_handle() {
+        block_on(async {
+            let lifecycle = lifecycle();
+            let handle = RunHandle::new("token".to_string());
+            lifecycle
+                .start_run(run_start("run-a", None), handle.clone(), None)
+                .await
+                .expect("start");
+
+            let wrong_scope = serde_json::json!({"tenant": "other"});
+            let err = lifecycle
+                .request_cancel(&RunId::from("run-a"), &wrong_scope)
+                .await
+                .expect_err("wrong scope must not cancel");
+            assert!(matches!(err, MachineError::RunNotFound));
+            assert!(!handle.is_cancelled());
+            assert!(
+                !lifecycle
                     .store()
                     .lookup_run(&RunId::from("run-a"), &scope())
                     .await
@@ -795,7 +1009,7 @@ mod tests {
                     )
                     .await
                     .expect("first"),
-                StartRunResult::Created
+                StartRunResult::Started
             ));
             match lifecycle
                 .start_run(
@@ -809,9 +1023,151 @@ mod tests {
                 StartRunResult::Existing(existing) => {
                     assert_eq!(existing.run_id, RunId::from("run-a"));
                 }
-                StartRunResult::Created => panic!("expected idempotent existing run"),
+                StartRunResult::Started | StartRunResult::NotRegistered(_) => {
+                    panic!("expected idempotent existing run")
+                }
             }
             assert_eq!(lifecycle.registry().len(), 1);
+        });
+    }
+
+    #[test]
+    fn lifecycle_start_run_persists_when_registry_is_full() {
+        block_on(async {
+            let lifecycle = RunLifecycle::new(
+                RunRegistry::new(),
+                Arc::new(MemoryRunStore::<TestEvent>::new()),
+                0,
+            );
+
+            assert!(matches!(
+                lifecycle
+                    .start_run(
+                        run_start("run-a", None),
+                        RunHandle::new("token".to_string()),
+                        None,
+                    )
+                    .await
+                    .expect("start"),
+                StartRunResult::NotRegistered(StartRunRejection::CapacityExceeded)
+            ));
+
+            let lookup = lifecycle
+                .store()
+                .lookup_run(&RunId::from("run-a"), &scope())
+                .await
+                .expect("lookup")
+                .expect("stored run");
+            assert_eq!(lookup.status, RunStatus::Running);
+            assert_eq!(lifecycle.registry().len(), 0);
+        });
+    }
+
+    #[test]
+    fn lifecycle_finish_detached_completes_stored_unregistered_run() {
+        block_on(async {
+            let lifecycle = RunLifecycle::new(
+                RunRegistry::new(),
+                Arc::new(MemoryRunStore::<TestEvent>::new()),
+                0,
+            );
+            lifecycle
+                .start_run(
+                    run_start("run-a", None),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+
+            let result = lifecycle
+                .finish_detached(finish_request("run-a", RunStatus::Error), payload(true))
+                .await
+                .expect("detached finish");
+            assert!(matches!(result, FinishRunResult::Finished(_)));
+            assert_eq!(result.terminal_event().seq, 1);
+
+            let lookup = lifecycle
+                .store()
+                .lookup_run(&RunId::from("run-a"), &scope())
+                .await
+                .expect("lookup")
+                .expect("stored run");
+            assert_eq!(lookup.status, RunStatus::Error);
+        });
+    }
+
+    #[test]
+    fn lifecycle_finish_detached_uses_last_stored_event_seq() {
+        block_on(async {
+            let lifecycle = RunLifecycle::new(
+                RunRegistry::new(),
+                Arc::new(MemoryRunStore::<TestEvent>::new()),
+                0,
+            );
+            lifecycle
+                .start_run(
+                    run_start("run-a", None),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+            lifecycle
+                .store()
+                .record_event(&RunId::from("run-a"), &scope(), &event("run-a", 1, false))
+                .await
+                .expect("record");
+
+            let result = lifecycle
+                .finish_detached(finish_request("run-a", RunStatus::Completed), payload(true))
+                .await
+                .expect("detached finish");
+            assert_eq!(result.terminal_event().seq, 2);
+        });
+    }
+
+    #[test]
+    fn lifecycle_finish_detached_rejects_wrong_scope_before_active_check() {
+        block_on(async {
+            let lifecycle = lifecycle();
+            lifecycle
+                .start_run(
+                    run_start("run-a", None),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+
+            let mut finish = finish_request("run-a", RunStatus::Completed);
+            finish.scope = serde_json::json!({"tenant": "other"});
+            let err = lifecycle
+                .finish_detached(finish, payload(true))
+                .await
+                .expect_err("wrong scope must be hidden");
+            assert!(matches!(err, MachineError::RunNotFound));
+        });
+    }
+
+    #[test]
+    fn lifecycle_finish_detached_rejects_active_run() {
+        block_on(async {
+            let lifecycle = lifecycle();
+            lifecycle
+                .start_run(
+                    run_start("run-a", None),
+                    RunHandle::new("token".to_string()),
+                    None,
+                )
+                .await
+                .expect("start");
+
+            let err = lifecycle
+                .finish_detached(finish_request("run-a", RunStatus::Completed), payload(true))
+                .await
+                .expect_err("active run must use registry finish");
+            assert!(matches!(err, MachineError::RunAlreadyActive));
         });
     }
 
@@ -836,6 +1192,9 @@ mod tests {
 
     #[async_trait]
     impl RunStore<TestEvent> for BlockingRecordStore {
+        type Scope = Value;
+        type FinishData = ();
+
         async fn ensure_session(
             &self,
             session_id: Option<SessionId>,
@@ -844,7 +1203,7 @@ mod tests {
             self.inner.ensure_session(session_id, scope).await
         }
 
-        async fn start_run(&self, run: &RunStart) -> Result<StartRunResult, MachineError> {
+        async fn start_run(&self, run: &RunStart<Value>) -> Result<StoreStartResult, MachineError> {
             self.inner.start_run(run).await
         }
 
@@ -858,13 +1217,17 @@ mod tests {
 
         async fn finish_run(
             &self,
-            finish: &RunFinishRecord<TestEvent>,
+            finish: &RunFinishRecord<TestEvent, (), Value>,
         ) -> Result<FinishRunResult<TestEvent>, MachineError> {
             self.inner.finish_run(finish).await
         }
 
-        async fn terminal_event(&self, run_id: &RunId) -> Result<Option<TestEvent>, MachineError> {
-            self.inner.terminal_event(run_id).await
+        async fn terminal_event(
+            &self,
+            run_id: &RunId,
+            scope: &Value,
+        ) -> Result<Option<TestEvent>, MachineError> {
+            self.inner.terminal_event(run_id, scope).await
         }
 
         async fn find_idempotent_run(
@@ -876,20 +1239,21 @@ mod tests {
             self.inner.find_idempotent_run(scope, session_id, key).await
         }
 
-        async fn mark_cancelled(&self, run_id: &RunId) -> Result<(), MachineError> {
-            self.inner.mark_cancelled(run_id).await
+        async fn mark_cancelled(&self, run_id: &RunId, scope: &Value) -> Result<(), MachineError> {
+            self.inner.mark_cancelled(run_id, scope).await
         }
 
         async fn record_event(
             &self,
             run_id: &RunId,
+            scope: &Value,
             event: &TestEvent,
         ) -> Result<bool, MachineError> {
             if event.seq() == self.block_seq {
                 self.blocked.notify_one();
                 self.release.notified().await;
             }
-            self.inner.record_event(run_id, event).await
+            self.inner.record_event(run_id, scope, event).await
         }
 
         async fn list_events(

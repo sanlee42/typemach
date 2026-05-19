@@ -11,7 +11,9 @@ pub mod store;
 
 pub use checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 pub use error::MachineError;
-pub use lifecycle::{AppendEventResult, RunLifecycle, RunSubscription, RunTail};
+pub use lifecycle::{
+    AppendEventResult, RunLifecycle, RunSubscription, RunTail, StartRunRejection, StartRunResult,
+};
 pub use machine::{Machine, MachineState, ResumeAction, Transition};
 pub use registry::{RunHandle, RunRegistry};
 pub use run::{
@@ -21,5 +23,5 @@ pub use run::{
 pub use runner::Runner;
 pub use store::{
     FinishRunResult, MemoryRunStore, RunEvent, RunEventEnvelope, RunEventPayload, RunFinish,
-    RunFinishRecord, RunLookup, RunStart, RunStatus, RunStore, StartRunResult,
+    RunFinishRecord, RunLookup, RunStart, RunStatus, RunStore, StoreStartResult,
 };

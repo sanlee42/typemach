@@ -24,8 +24,12 @@
             if [ -f rust-toolchain.toml ]; then
               rust_version=$(grep 'channel' rust-toolchain.toml | cut -d '"' -f 2)
               rustup override set "$rust_version"
+              rustup component add rustfmt --toolchain "$rust_version" 2>/dev/null || true
+              rustup component add clippy --toolchain "$rust_version" 2>/dev/null || true
               rustup component add rust-src --toolchain "$rust_version" 2>/dev/null || true
               rustup component add rust-analyzer --toolchain "$rust_version" 2>/dev/null || true
+              toolchain_bin=$(dirname "$(rustup which cargo)")
+              export PATH="$toolchain_bin:$PATH"
             fi
           '';
 

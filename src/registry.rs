@@ -112,6 +112,18 @@ impl<E> RunRegistry<E> {
         Some(run.current_seq)
     }
 
+    pub(crate) fn rewind_seq(&self, run_id: &RunId, seq: i64) -> bool {
+        let mut inner = self.inner.lock().expect("run registry lock poisoned");
+        let Some(run) = inner.get_mut(run_id) else {
+            return false;
+        };
+        if run.current_seq != seq {
+            return false;
+        }
+        run.current_seq -= 1;
+        true
+    }
+
     pub fn subscribe(&self, run_id: &RunId) -> Option<mpsc::UnboundedReceiver<E>> {
         let mut inner = self.inner.lock().expect("run registry lock poisoned");
         let run = inner.get_mut(run_id)?;
