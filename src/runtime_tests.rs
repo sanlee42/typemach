@@ -26,12 +26,12 @@ struct State {
     value: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct Input {
     mode: Mode,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 enum Mode {
     Complete,
     Interrupt,

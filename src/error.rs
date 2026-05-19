@@ -56,6 +56,9 @@ pub enum MachineError {
     #[error("entry already exists with different data")]
     EntryConflict,
 
+    #[error("idempotent run start differs")]
+    StartConflict,
+
     #[error("idempotent run input differs")]
     InputConflict,
 

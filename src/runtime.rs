@@ -82,7 +82,6 @@ pub struct Start<Scope = Value> {
     pub parent: Option<RunId>,
     pub retry_of: Option<RunId>,
     pub meta: Value,
-    pub input: Option<Value>,
     pub entries: Vec<EntryWrite>,
     pub token: Option<String>,
 }
@@ -97,7 +96,6 @@ impl<Scope> Start<Scope> {
             parent: None,
             retry_of: None,
             meta: Value::Object(Default::default()),
-            input: None,
             entries: Vec::new(),
             token: None,
         }
@@ -210,12 +208,16 @@ where
         req: RunRequest<M::Input>,
         start: Start<S::Scope>,
         cfg: StreamConfig,
-    ) -> Result<StartResult<MachineRx<M>>, MachineError> {
+    ) -> Result<StartResult<MachineRx<M>>, MachineError>
+    where
+        M::Input: Serialize,
+    {
         self.life
             .ensure_session(Some(req.session_id.clone()), &start.scope)
             .await?;
 
         let scope = start.scope.clone();
+        let input = Some(to_json(&req.input)?);
         let run = RunStart {
             run_id: req.run_id.clone(),
             session_id: req.session_id.clone(),
@@ -227,7 +229,7 @@ where
             retry_of_run_id: start.retry_of,
             scope: start.scope,
             metadata: start.meta,
-            input: start.input,
+            input,
             entries: start.entries,
             lease: None,
         };
@@ -261,7 +263,10 @@ where
         &self,
         req: RunRequest<M::Input>,
         start: Start<S::Scope>,
-    ) -> Result<StartResult<MachineOutput<M>>, MachineError> {
+    ) -> Result<StartResult<MachineOutput<M>>, MachineError>
+    where
+        M::Input: Serialize,
+    {
         let stream = self.stream(req, start, StreamConfig::default()).await?;
         let StartResult::Started(mut rx) = stream else {
             return Ok(stream.map_started(|_| unreachable!()));
@@ -681,6 +686,7 @@ fn error_code(error: &MachineError) -> &'static str {
         MachineError::EffectNotFound => "effect_not_found",
         MachineError::ItemConflict => "item_conflict",
         MachineError::EntryConflict => "entry_conflict",
+        MachineError::StartConflict => "start_conflict",
         MachineError::InputConflict => "input_conflict",
         MachineError::InvalidPageLimit => "invalid_page_limit",
         MachineError::StepTimeout => "step_timeout",

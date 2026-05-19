@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Serialize;
 
 use super::{
     Event, EventRecord, LeaseCfg, MachineOutput, MachineRx, Payload, Start, StartResult,
@@ -162,12 +163,16 @@ where
         req: RunRequest<M::Input>,
         start: Start<S::Scope>,
         cfg: StreamConfig,
-    ) -> Result<StartResult<MachineRx<M>>, MachineError> {
+    ) -> Result<StartResult<MachineRx<M>>, MachineError>
+    where
+        M::Input: Serialize,
+    {
         self.life
             .ensure_session(Some(req.session_id.clone()), &start.scope)
             .await?;
 
         let scope = start.scope.clone();
+        let input = Some(serde_json::to_value(&req.input).map_err(MachineError::Serialization)?);
         let lease_id = new_lease_id();
         let claim = LeaseClaim::new(self.lease.owner.clone(), lease_id.clone(), self.lease.ttl);
         let lease = Lease::new(req.run_id.clone(), self.lease.owner.clone(), lease_id);
@@ -182,7 +187,7 @@ where
             retry_of_run_id: start.retry_of,
             scope: start.scope,
             metadata: start.meta,
-            input: start.input,
+            input,
             entries: start.entries,
             lease: Some(claim),
         };
@@ -246,7 +251,10 @@ where
         &self,
         req: RunRequest<M::Input>,
         start: Start<S::Scope>,
-    ) -> Result<StartResult<MachineOutput<M>>, MachineError> {
+    ) -> Result<StartResult<MachineOutput<M>>, MachineError>
+    where
+        M::Input: Serialize,
+    {
         let stream = self.stream(req, start, StreamConfig::default()).await?;
         let StartResult::Started(mut rx) = stream else {
             return Ok(stream.map_started(|_| unreachable!()));

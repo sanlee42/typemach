@@ -4,7 +4,6 @@ use deadpool_postgres::tokio_postgres::Row;
 use deadpool_postgres::{GenericClient, Transaction};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 
 use super::*;
 use crate::run::LeaseId;
@@ -364,25 +363,6 @@ where
         .await
         .map_err(store_db)?;
     row.map(|row| decode_event(row.get::<_, String>(0).as_str()))
-        .transpose()
-}
-
-pub(super) async fn run_input_tx<C>(
-    client: &C,
-    run_id: &RunId,
-) -> Result<Option<Value>, MachineError>
-where
-    C: GenericClient + Sync,
-{
-    let row = client
-        .query_opt(
-            "SELECT input::text FROM typemach_runs WHERE run_id = $1",
-            &[&run_id.as_str()],
-        )
-        .await
-        .map_err(store_db)?;
-    row.and_then(|row| row.get::<_, Option<String>>(0))
-        .map(|raw| serde_json::from_str(raw.as_str()).map_err(MachineError::Deserialization))
         .transpose()
 }
 

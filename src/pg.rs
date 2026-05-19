@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
-use deadpool_postgres::Pool;
+use deadpool_postgres::{GenericClient, Pool};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -13,7 +13,7 @@ use crate::run::{RunId, SessionId, ThreadId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
     FinishRunResult, RunCommit, RunCommitResult, RunEvent, RunFinish, RunFinishRecord, RunLookup,
-    RunStart, RunStatus, RunStore, RunTx, StoreStartResult,
+    RunStart, RunStatus, RunStore, RunTx, StoreStartResult, start_sig,
 };
 
 type PgTypes<E, Scope, Data> = fn() -> (E, Scope, Data);
@@ -106,6 +106,7 @@ impl<E, Scope, Data> PgStore<E, Scope, Data> {
                     retry_of_run_id TEXT NULL,
                     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                     input JSONB NULL,
+                    start_sig TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
                     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -125,6 +126,8 @@ impl<E, Scope, Data> PgStore<E, Scope, Data> {
                 );
                 ALTER TABLE IF EXISTS typemach_runs
                     ADD COLUMN IF NOT EXISTS input JSONB NULL;
+                ALTER TABLE IF EXISTS typemach_runs
+                    ADD COLUMN IF NOT EXISTS start_sig TEXT NOT NULL DEFAULT '';
                 CREATE INDEX IF NOT EXISTS typemach_runs_session_idx
                     ON typemach_runs (scope_key, session_id, started_at DESC);
                 CREATE INDEX IF NOT EXISTS typemach_runs_scope_status_idx
@@ -288,18 +291,15 @@ where
     async fn start_run(&self, run: &RunStart<Scope>) -> Result<StoreStartResult, MachineError> {
         self.ensure_session(Some(run.session_id.clone()), &run.scope)
             .await?;
+        let scope_key = scope_key(&run.scope)?;
+        let sig = start_sig(run.input.as_ref(), &run.entries)?;
         if let Some(existing) = self.lookup_run(&run.run_id, &run.scope).await? {
             let client = self
                 .pool
                 .get()
                 .await
                 .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-            let input = run_input_tx(&client, &existing.run_id).await?;
-            if input != run.input {
-                return Err(MachineError::InputConflict);
-            }
-            let scope_key = scope_key(&run.scope)?;
-            check_entries_tx(&client, &scope_key, &existing.session_id, &run.entries).await?;
+            check_start(&client, &scope_key, &existing.run_id, &sig).await?;
             return Ok(StoreStartResult::Existing(existing));
         }
         if let Some(client_run_key) = &run.client_run_key
@@ -312,16 +312,10 @@ where
                 .get()
                 .await
                 .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-            let input = run_input_tx(&client, &existing.run_id).await?;
-            if input != run.input {
-                return Err(MachineError::InputConflict);
-            }
-            let scope_key = scope_key(&run.scope)?;
-            check_entries_tx(&client, &scope_key, &existing.session_id, &run.entries).await?;
+            check_start(&client, &scope_key, &existing.run_id, &sig).await?;
             return Ok(StoreStartResult::Existing(existing));
         }
 
-        let scope_key = scope_key(&run.scope)?;
         let scope_json = json_text(&run.scope)?;
         let metadata = json_text(&run.metadata)?;
         let input = run.input.as_ref().map(json_text).transpose()?;
@@ -347,17 +341,17 @@ where
             .execute(
                 "INSERT INTO typemach_runs (
                     run_id, session_id, thread_id, scope_key, scope, agent_kind, model, client_run_key,
-                    parent_run_id, retry_of_run_id, metadata, input, status, owner_id, lease_id,
+                    parent_run_id, retry_of_run_id, metadata, input, start_sig, status, owner_id, lease_id,
                     lease_expires_at, attempt, updated_at
                  )
                  VALUES (
                     $1, $2, $3, $4, $5::text::jsonb, $6, $7, $8,
-                    $9, $10, $11::text::jsonb, $12::text::jsonb, $13, $14, $15,
+                    $9, $10, $11::text::jsonb, $12::text::jsonb, $13, $14, $15, $16,
                     CASE
-                        WHEN $15::text IS NULL THEN NULL
-                        ELSE now() + ($16::double precision * interval '1 second')
+                        WHEN $16::text IS NULL THEN NULL
+                        ELSE now() + ($17::double precision * interval '1 second')
                     END,
-                    $17, now()
+                    $18, now()
                  )",
                 &[
                     &run.run_id.as_str(),
@@ -372,6 +366,7 @@ where
                     &retry,
                     &metadata,
                     &input,
+                    &sig,
                     &RunStatus::Running.as_str(),
                     &owner,
                     &lease_id,
@@ -412,12 +407,7 @@ where
                         .get()
                         .await
                         .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-                    let input = run_input_tx(&client, &existing.run_id).await?;
-                    if input != run.input {
-                        return Err(MachineError::InputConflict);
-                    }
-                    check_entries_tx(&client, &scope_key, &existing.session_id, &run.entries)
-                        .await?;
+                    check_start(&client, &scope_key, &existing.run_id, &sig).await?;
                     return Ok(StoreStartResult::Existing(existing));
                 }
                 if let Some(client_run_key) = &run.client_run_key
@@ -430,12 +420,7 @@ where
                         .get()
                         .await
                         .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-                    let input = run_input_tx(&client, &existing.run_id).await?;
-                    if input != run.input {
-                        return Err(MachineError::InputConflict);
-                    }
-                    check_entries_tx(&client, &scope_key, &existing.session_id, &run.entries)
-                        .await?;
+                    check_start(&client, &scope_key, &existing.run_id, &sig).await?;
                     return Ok(StoreStartResult::Existing(existing));
                 }
                 if let Some((owner, run_id)) = self.running_thread(&run.thread_id).await? {
@@ -568,31 +553,13 @@ where
         entries: &[EntryWrite],
     ) -> Result<(), MachineError> {
         let scope_key = scope_key(scope)?;
+        let sig = start_sig(input, entries)?;
         let client = self
             .pool
             .get()
             .await
             .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-        let row = client
-            .query_opt(
-                "SELECT session_id, input::text
-                 FROM typemach_runs
-                 WHERE run_id = $1 AND scope_key = $2",
-                &[&run_id.as_str(), &scope_key],
-            )
-            .await
-            .map_err(store_db)?
-            .ok_or(MachineError::RunNotFound)?;
-        let stored_input = row
-            .get::<_, Option<String>>(1)
-            .map(|raw| serde_json::from_str(raw.as_str()))
-            .transpose()
-            .map_err(MachineError::Deserialization)?;
-        if stored_input.as_ref() != input {
-            return Err(MachineError::InputConflict);
-        }
-        let session_id = SessionId::from(row.get::<_, String>(0));
-        check_entries_tx(&client, &scope_key, &session_id, entries).await?;
+        check_start(&client, &scope_key, run_id, &sig).await?;
         Ok(())
     }
 
@@ -686,6 +653,32 @@ where
         };
         Ok(Page::new(events, next))
     }
+}
+
+async fn check_start<C>(
+    client: &C,
+    scope_key: &str,
+    run_id: &RunId,
+    sig: &str,
+) -> Result<(), MachineError>
+where
+    C: GenericClient + Sync,
+{
+    let stored = client
+        .query_opt(
+            "SELECT start_sig
+             FROM typemach_runs
+             WHERE run_id = $1 AND scope_key = $2",
+            &[&run_id.as_str(), &scope_key],
+        )
+        .await
+        .map_err(store_db)?
+        .ok_or(MachineError::RunNotFound)?
+        .get::<_, String>(0);
+    if stored != sig {
+        return Err(MachineError::StartConflict);
+    }
+    Ok(())
 }
 
 mod io;

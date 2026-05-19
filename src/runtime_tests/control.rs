@@ -153,6 +153,52 @@ fn idempotent_key_returns_existing_run() {
 }
 
 #[test]
+fn idempotent_key_rejects_different_request_input() {
+    block_on(async {
+        let rt = runtime(8);
+        let result = rt
+            .invoke(
+                request("run-idem-input-1", Mode::Complete),
+                start(Some("key-input")),
+            )
+            .await
+            .expect("first invoke");
+        assert!(matches!(result, StartResult::Started(_)));
+
+        let result = rt
+            .invoke(
+                request("run-idem-input-2", Mode::Slow),
+                start(Some("key-input")),
+            )
+            .await;
+        assert!(matches!(result, Err(MachineError::StartConflict)));
+    });
+}
+
+#[test]
+fn tx_runtime_idempotent_key_rejects_different_request_input() {
+    block_on(async {
+        let rt = tx_runtime(8);
+        let result = rt
+            .invoke(
+                request("run-tx-idem-input-1", Mode::Complete),
+                start(Some("tx-key-input")),
+            )
+            .await
+            .expect("first invoke");
+        assert!(matches!(result, StartResult::Started(_)));
+
+        let result = rt
+            .invoke(
+                request("run-tx-idem-input-2", Mode::Slow),
+                start(Some("tx-key-input")),
+            )
+            .await;
+        assert!(matches!(result, Err(MachineError::StartConflict)));
+    });
+}
+
+#[test]
 fn capacity_rejection_does_not_persist_or_poison_key() {
     block_on(async {
         let rt = runtime(1);

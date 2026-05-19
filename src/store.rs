@@ -144,6 +144,19 @@ pub struct RunStart<Scope = Value> {
     pub lease: Option<LeaseClaim>,
 }
 
+#[derive(Serialize)]
+struct StartSig<'a> {
+    input: Option<&'a Value>,
+    entries: &'a [EntryWrite],
+}
+
+pub(crate) fn start_sig(
+    input: Option<&Value>,
+    entries: &[EntryWrite],
+) -> Result<String, MachineError> {
+    serde_json::to_string(&StartSig { input, entries }).map_err(MachineError::Serialization)
+}
+
 #[derive(Debug, Clone)]
 pub struct RunFinishRecord<E: RunEvent, Data = (), Scope = Value> {
     pub run_id: RunId,

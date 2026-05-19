@@ -155,14 +155,14 @@ where
             .entry(run.session_id.clone())
             .or_insert_with(|| run.scope.clone());
         let scope_key = scope_key(&run.scope)?;
+        let sig = start_sig(run.input.as_ref(), &run.entries)?;
         if let Some(existing) = inner.runs.get(&run.run_id) {
             if existing.start.scope != run.scope {
                 return Err(MachineError::RunNotFound);
             }
-            if existing.start.input != run.input {
-                return Err(MachineError::InputConflict);
+            if start_sig(existing.start.input.as_ref(), &existing.start.entries)? != sig {
+                return Err(MachineError::StartConflict);
             }
-            validate_entries(&inner, &scope_key, &existing.start.session_id, &run.entries)?;
             return Ok(StoreStartResult::Existing(run_lookup(existing)));
         }
         let idempotency_key = if let Some(client_key) = &run.client_run_key {
@@ -174,10 +174,9 @@ where
             if let Some(existing_run_id) = inner.idempotency.get(&key)
                 && let Some(existing) = inner.runs.get(existing_run_id)
             {
-                if existing.start.input != run.input {
-                    return Err(MachineError::InputConflict);
+                if start_sig(existing.start.input.as_ref(), &existing.start.entries)? != sig {
+                    return Err(MachineError::StartConflict);
                 }
-                validate_entries(&inner, &scope_key, &existing.start.session_id, &run.entries)?;
                 return Ok(StoreStartResult::Existing(run_lookup(existing)));
             }
             Some(key)
@@ -334,11 +333,9 @@ where
         if run.start.scope != *scope {
             return Err(MachineError::RunNotFound);
         }
-        if run.start.input.as_ref() != input {
-            return Err(MachineError::InputConflict);
+        if start_sig(run.start.input.as_ref(), &run.start.entries)? != start_sig(input, entries)? {
+            return Err(MachineError::StartConflict);
         }
-        let scope_key = scope_key(scope)?;
-        validate_entries(&inner, &scope_key, &run.start.session_id, entries)?;
         Ok(())
     }
 

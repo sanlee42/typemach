@@ -1,293 +1,138 @@
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deadpool_postgres::tokio_postgres::NoTls;
 use deadpool_postgres::{Pool, Runtime};
 
 use super::*;
-use crate::checkpoint::CheckpointRecord;
-use crate::error::MachineError;
-use crate::run::{LeaseId, RunId, SessionId, WorkerId};
-use crate::runtime::{Event, Payload};
-use crate::store::{
-    Lease, LeaseClaim, RunCommit, RunCommitResult, RunEventEnvelope, RunLease, RunStart, RunStatus,
-    RunStore, RunTx, StoreStartResult,
-};
+use crate::run::{RunId, SessionId, ThreadId};
+use crate::store::{RunStart, RunStore};
 
 #[test]
-fn pg_store_roundtrip_skips_without_test_database_url() {
+fn pg_store_matches_contract() {
     let Some(url) = std::env::var("TEST_DATABASE_URL").ok() else {
+        eprintln!("skip pg_store_matches_contract: set TEST_DATABASE_URL to run postgres tests");
         return;
     };
-    if !url.to_ascii_lowercase().contains("test") || url.ends_with("/postgres") {
-        panic!("refusing to run typemach pg test against non-test database");
-    }
+    check_test_url(&url);
 
     block_on(async {
-        let store = PgStore::<Event>::new(pool(url.clone()));
-        reset_schema(&store).await;
+        let store = PgStore::<crate::testkit::TestEvent>::new(pool(url));
+        reset_schema(&store).await.expect("reset schema");
         store.ensure_schema().await.expect("schema");
-        let scope = serde_json::json!({"tenant": "typemach-test"});
-        let run_id = RunId::from(format!("run-{}", unique()));
-        let session_id = SessionId::from(format!("session-{}", unique()));
-        let thread_id = crate::run::ThreadId::from(format!("thread-{}", unique()));
+        crate::testkit::run_store_contract(&store)
+            .await
+            .expect("contract");
+    });
+}
+
+#[test]
+fn pg_ensure_schema_adds_run_start_columns() {
+    let Some(url) = std::env::var("TEST_DATABASE_URL").ok() else {
+        eprintln!(
+            "skip pg_ensure_schema_adds_run_start_columns: set TEST_DATABASE_URL to run postgres tests"
+        );
+        return;
+    };
+    check_test_url(&url);
+
+    block_on(async {
+        let store = PgStore::<crate::testkit::TestEvent>::new(pool(url));
+        reset_schema(&store).await.expect("reset schema");
+        let client = store.pool().get().await.expect("pool client");
+        client
+            .batch_execute(
+                "CREATE TABLE typemach_runs (
+                    run_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    scope JSONB NOT NULL,
+                    agent_kind TEXT NOT NULL,
+                    model TEXT NULL,
+                    client_run_key TEXT NULL,
+                    parent_run_id TEXT NULL,
+                    retry_of_run_id TEXT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    status TEXT NOT NULL,
+                    cancel_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    finished_at TIMESTAMPTZ NULL,
+                    finish_reason TEXT NULL,
+                    error_code TEXT NULL,
+                    finish_data JSONB NULL,
+                    owner_id TEXT NULL,
+                    lease_id TEXT NULL,
+                    lease_expires_at TIMESTAMPTZ NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );",
+            )
+            .await
+            .expect("old schema");
+        drop(client);
+
+        store.ensure_schema().await.expect("schema");
+        let client = store.pool().get().await.expect("pool client");
+        let columns = client
+            .query(
+                "SELECT column_name
+                 FROM information_schema.columns
+                 WHERE table_name = 'typemach_runs'",
+                &[],
+            )
+            .await
+            .expect("columns")
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(columns.iter().any(|column| column == "input"));
+        assert!(columns.iter().any(|column| column == "start_sig"));
+        drop(client);
+
+        let run_id = RunId::from("pg-upgrade-run");
         store
             .start_run(&RunStart {
                 run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                thread_id: thread_id.clone(),
+                session_id: SessionId::from("pg-upgrade-session"),
+                thread_id: ThreadId::from("pg-upgrade-thread"),
                 agent_kind: "test".to_string(),
                 model: None,
-                client_run_key: Some("key-a".to_string()),
+                client_run_key: Some("upgrade-key".to_string()),
                 parent_run_id: None,
                 retry_of_run_id: None,
-                scope: scope.clone(),
+                scope: serde_json::json!({"tenant": "upgrade"}),
                 metadata: serde_json::json!({}),
-                input: None,
+                input: Some(serde_json::json!({"message": "hello"})),
                 entries: Vec::new(),
                 lease: None,
             })
             .await
             .expect("start");
-
-        let checkpoint = CheckpointRecord::running(
-            serde_json::json!({"value": 1}),
-            Some(serde_json::json!("done")),
-            run_id.as_str(),
-        );
-        let event = RunEventEnvelope::new(
-            run_id.clone(),
-            session_id.clone(),
-            1,
-            Payload::StepDone {
-                step: serde_json::json!("start"),
-                result: crate::run::StepResult::Next,
-            },
-        );
-        let result = store
-            .commit_run(&RunCommit {
-                run_id: run_id.clone(),
-                session_id: session_id.clone(),
-                scope: scope.clone(),
-                lease: None,
-                checkpoint: Some(crate::store::CheckpointWrite::new(
-                    thread_id.clone(),
-                    checkpoint.clone(),
-                )),
-                events: vec![event],
-                effects: Vec::new(),
-                items: Vec::new(),
-                entries: Vec::new(),
-                finish: None,
-            })
-            .await
-            .expect("commit");
-        assert!(matches!(result, RunCommitResult::Recorded(_)));
-        assert_eq!(
-            store
-                .list_events(&run_id, &scope, 0, usize::MAX)
-                .await
-                .expect("events")
-                .len(),
-            1
-        );
-
-        let lease_run = RunId::from(format!("run-lease-{}", unique()));
-        let lease_session = SessionId::from(format!("session-lease-{}", unique()));
-        let lease_thread = crate::run::ThreadId::from(format!("thread-lease-{}", unique()));
-        let owner = WorkerId::from("worker-a");
-        let lease_id = LeaseId::from("lease-a");
-        store
-            .start_run(&RunStart {
-                run_id: lease_run.clone(),
-                session_id: lease_session.clone(),
-                thread_id: lease_thread.clone(),
-                agent_kind: "test".to_string(),
-                model: None,
-                client_run_key: None,
-                parent_run_id: None,
-                retry_of_run_id: None,
-                scope: scope.clone(),
-                metadata: serde_json::json!({}),
-                input: None,
-                entries: Vec::new(),
-                lease: Some(LeaseClaim::new(
-                    owner.clone(),
-                    lease_id.clone(),
-                    Duration::from_secs(30),
-                )),
-            })
-            .await
-            .expect("start leased");
-        let leased_event = RunEventEnvelope::new(
-            lease_run.clone(),
-            lease_session.clone(),
-            1,
-            Payload::Beat {
-                thread_id: lease_thread.clone(),
-            },
-        );
-        let missing_lease = RunCommit {
-            run_id: lease_run.clone(),
-            session_id: lease_session.clone(),
-            scope: scope.clone(),
-            lease: None,
-            checkpoint: None,
-            events: vec![leased_event.clone()],
-            effects: Vec::new(),
-            items: Vec::new(),
-            entries: Vec::new(),
-            finish: None,
-        };
-        assert!(matches!(
-            store.commit_run(&missing_lease).await,
-            Err(MachineError::LeaseLost)
-        ));
-        assert!(matches!(
-            store
-                .commit_run(&RunCommit {
-                    lease: Some(LeaseId::from("wrong-lease")),
-                    ..missing_lease.clone()
-                })
-                .await,
-            Err(MachineError::LeaseLost)
-        ));
         assert!(
             store
-                .renew(
-                    &Lease::new(lease_run.clone(), owner.clone(), lease_id.clone()),
-                    Duration::from_secs(30)
-                )
+                .lookup_run(&run_id, &serde_json::json!({"tenant": "upgrade"}))
                 .await
-                .expect("renew")
+                .expect("lookup")
+                .is_some()
         );
-        assert!(matches!(
-            store
-                .commit_run(&RunCommit {
-                    lease: Some(lease_id),
-                    ..missing_lease
-                })
-                .await
-                .expect("leased commit"),
-            RunCommitResult::Recorded(_)
-        ));
-
-        let stale_run = RunId::from(format!("run-stale-{}", unique()));
-        let stale_session = SessionId::from(format!("session-stale-{}", unique()));
-        let stale_thread = crate::run::ThreadId::from(format!("thread-stale-{}", unique()));
-        store
-            .start_run(&RunStart {
-                run_id: stale_run.clone(),
-                session_id: stale_session.clone(),
-                thread_id: stale_thread,
-                agent_kind: "test".to_string(),
-                model: None,
-                client_run_key: None,
-                parent_run_id: None,
-                retry_of_run_id: None,
-                scope: scope.clone(),
-                metadata: serde_json::json!({}),
-                input: None,
-                entries: Vec::new(),
-                lease: Some(LeaseClaim::new(
-                    WorkerId::from("worker-stale"),
-                    LeaseId::from("lease-stale"),
-                    Duration::from_millis(1),
-                )),
-            })
-            .await
-            .expect("start stale");
-        async_rt::time::sleep(Duration::from_millis(5)).await;
-        let reaped = store
-            .reap_stale(&WorkerId::from("reaper"), 8, |run, seq| {
-                RunEventEnvelope::new(
-                    run.run_id.clone(),
-                    run.session_id.clone(),
-                    seq,
-                    Payload::Fail {
-                        error: "lease expired".to_string(),
-                    },
-                )
-            })
-            .await
-            .expect("reap stale");
-        assert_eq!(reaped.len(), 1);
-        assert_eq!(reaped[0].run_id, stale_run);
-        assert_eq!(reaped[0].status, RunStatus::Error);
-
-        let shared_session = SessionId::from(format!("session-shared-{}", unique()));
-        let scope_a = serde_json::json!({"tenant": "tenant-a"});
-        let scope_b = serde_json::json!({"tenant": "tenant-b"});
-        let run_a = RunId::from(format!("run-a-{}", unique()));
-        let run_b = RunId::from(format!("run-b-{}", unique()));
-        assert!(matches!(
-            store
-                .start_run(&RunStart {
-                    run_id: run_a.clone(),
-                    session_id: shared_session.clone(),
-                    thread_id: crate::run::ThreadId::from(format!("thread-a-{}", unique())),
-                    agent_kind: "test".to_string(),
-                    model: None,
-                    client_run_key: Some("same-key".to_string()),
-                    parent_run_id: None,
-                    retry_of_run_id: None,
-                    scope: scope_a.clone(),
-                    metadata: serde_json::json!({}),
-                    input: None,
-                    entries: Vec::new(),
-                    lease: None,
-                })
-                .await
-                .expect("start scope a"),
-            StoreStartResult::Created
-        ));
-        assert!(matches!(
-            store
-                .start_run(&RunStart {
-                    run_id: run_b.clone(),
-                    session_id: shared_session.clone(),
-                    thread_id: crate::run::ThreadId::from(format!("thread-b-{}", unique())),
-                    agent_kind: "test".to_string(),
-                    model: None,
-                    client_run_key: Some("same-key".to_string()),
-                    parent_run_id: None,
-                    retry_of_run_id: None,
-                    scope: scope_b.clone(),
-                    metadata: serde_json::json!({}),
-                    input: None,
-                    entries: Vec::new(),
-                    lease: None,
-                })
-                .await
-                .expect("start scope b"),
-            StoreStartResult::Created
-        ));
-        assert_eq!(
-            store
-                .find_idempotent_run(&scope_a, &shared_session, "same-key")
-                .await
-                .expect("idem a")
-                .expect("run a")
-                .run_id,
-            run_a
-        );
-        assert_eq!(
-            store
-                .find_idempotent_run(&scope_b, &shared_session, "same-key")
-                .await
-                .expect("idem b")
-                .expect("run b")
-                .run_id,
-            run_b
-        );
-
-        reset_schema(&store).await;
-        store.ensure_schema().await.expect("schema");
-        let contract = PgStore::<crate::testkit::TestEvent>::new(pool(url));
-        crate::testkit::run_store_contract(&contract)
-            .await
-            .expect("contract");
     });
+}
+
+fn check_test_url(url: &str) {
+    let db = database_name(url);
+    if db != "scratch" && !db.contains("test") {
+        panic!("refusing to run typemach pg test against non-test database `{db}`");
+    }
+}
+
+fn database_name(url: &str) -> &str {
+    let without_query = url.split(['?', '#']).next().unwrap_or(url);
+    without_query
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
 }
 
 #[test]
@@ -305,8 +150,8 @@ fn scope_key_is_stable_for_unordered_maps() {
     );
 }
 
-async fn reset_schema(store: &PgStore<Event>) {
-    let client = store.pool().get().await.expect("pool client");
+async fn reset_schema<E, Scope, Data>(store: &PgStore<E, Scope, Data>) -> Result<(), String> {
+    let client = store.pool().get().await.map_err(|err| err.to_string())?;
     client
         .batch_execute(
             "DROP TABLE IF EXISTS typemach_run_events CASCADE;
@@ -316,7 +161,7 @@ async fn reset_schema(store: &PgStore<Event>) {
                  DROP TABLE IF EXISTS typemach_checkpoints CASCADE;",
         )
         .await
-        .expect("reset schema");
+        .map_err(|err| err.to_string())
 }
 
 fn pool(url: String) -> Pool {
@@ -324,17 +169,6 @@ fn pool(url: String) -> Pool {
     cfg.url = Some(url);
     cfg.create_pool(Some(Runtime::Tokio1), NoTls)
         .expect("create pool")
-}
-
-fn unique() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos()
-    )
 }
 
 fn block_on<F>(future: F) -> F::Output

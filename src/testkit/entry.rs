@@ -33,11 +33,33 @@ where
     );
     same.client_run_key = Some("input-key".to_string());
     same.input = Some(json!({"message": "same"}));
+    same.entries = first.entries.clone();
     let existing = store.start_run(&same).await?;
     let StoreStartResult::Existing(existing) = existing else {
         panic!("same idempotent input must return existing run");
     };
     assert_eq!(existing.run_id, first.run_id);
+
+    let existing = store.start_run(&first).await?;
+    let StoreStartResult::Existing(existing) = existing else {
+        panic!("same run_id and start envelope must return existing run");
+    };
+    assert_eq!(existing.run_id, first.run_id);
+
+    let mut same_run_changed = first.clone();
+    same_run_changed.entries = Vec::new();
+    assert!(matches!(
+        store.start_run(&same_run_changed).await,
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut omitted_entry = same.clone();
+    omitted_entry.run_id = RunId::from("contract-input-entry-omitted");
+    omitted_entry.entries = Vec::new();
+    assert!(matches!(
+        store.start_run(&omitted_entry).await,
+        Err(MachineError::StartConflict)
+    ));
 
     let mut conflicting_entry = same.clone();
     conflicting_entry.run_id = RunId::from("contract-input-entry-conflict");
@@ -49,7 +71,20 @@ where
     )];
     assert!(matches!(
         store.start_run(&conflicting_entry).await,
-        Err(MachineError::EntryConflict)
+        Err(MachineError::StartConflict)
+    ));
+
+    let mut extra_entry = same.clone();
+    extra_entry.run_id = RunId::from("contract-input-entry-extra");
+    extra_entry.entries.push(entry(
+        "msg:user:2",
+        "msg",
+        Vis::Public,
+        json!({"text": "extra"}),
+    ));
+    assert!(matches!(
+        store.start_run(&extra_entry).await,
+        Err(MachineError::StartConflict)
     ));
 
     let mut different = same;
@@ -57,7 +92,7 @@ where
     different.input = Some(json!({"message": "different"}));
     assert!(matches!(
         store.start_run(&different).await,
-        Err(MachineError::InputConflict)
+        Err(MachineError::StartConflict)
     ));
     Ok(())
 }

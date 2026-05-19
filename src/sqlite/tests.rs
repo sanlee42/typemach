@@ -15,7 +15,7 @@ fn sqlite_store_matches_contract() {
 }
 
 #[test]
-fn sqlite_ensure_schema_adds_run_input_column() {
+fn sqlite_ensure_schema_adds_run_start_columns() {
     block_on(async {
         let store = SqliteStore::<crate::testkit::TestEvent>::memory()
             .await
@@ -56,7 +56,7 @@ fn sqlite_ensure_schema_adds_run_input_column() {
             .await
             .expect("old schema");
         store.ensure_schema().await.expect("schema");
-        let has_input = store
+        let (has_input, has_start_sig) = store
             .call(|conn| {
                 let mut stmt = conn
                     .prepare("PRAGMA table_info(typemach_runs)")
@@ -64,16 +64,21 @@ fn sqlite_ensure_schema_adds_run_input_column() {
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(1))
                     .map_err(store_db)?;
+                let mut has_input = false;
+                let mut has_start_sig = false;
                 for row in rows {
-                    if row.map_err(store_db)? == "input" {
-                        return Ok(true);
+                    match row.map_err(store_db)?.as_str() {
+                        "input" => has_input = true,
+                        "start_sig" => has_start_sig = true,
+                        _ => {}
                     }
                 }
-                Ok(false)
+                Ok((has_input, has_start_sig))
             })
             .await
             .expect("columns");
         assert!(has_input);
+        assert!(has_start_sig);
 
         let run_id = RunId::from("sqlite-upgrade-run");
         let session_id = SessionId::from("sqlite-upgrade-session");

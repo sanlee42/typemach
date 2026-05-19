@@ -16,7 +16,7 @@ use crate::run::{RunId, SessionId, WorkerId};
 use crate::runtime::Event;
 use crate::store::{
     FinishRunResult, RunCommit, RunCommitResult, RunEvent, RunFinish, RunFinishRecord, RunLookup,
-    RunStart, RunStatus, RunStore, RunTx, StoreStartResult,
+    RunStart, RunStatus, RunStore, RunTx, StoreStartResult, start_sig,
 };
 
 type SqliteTypes<E, Scope, Data> = fn() -> (E, Scope, Data);
@@ -96,6 +96,7 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                     retry_of_run_id TEXT NULL,
                     metadata TEXT NOT NULL DEFAULT '{}',
                     input TEXT NULL,
+                    start_sig TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     cancel_requested INTEGER NOT NULL DEFAULT 0,
                     started_at INTEGER NOT NULL DEFAULT (unixepoch() * 1000),
@@ -193,6 +194,7 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
             )
             .map_err(store_db)?;
             ensure_run_input_column(conn)?;
+            ensure_run_start_sig_column(conn)?;
             Ok(())
         })
         .await
@@ -296,16 +298,16 @@ where
             let scope_key = scope_key(&run.scope)?;
             let scope_json = json_text(&run.scope)?;
             let metadata = json_text(&run.metadata)?;
+            let sig = start_sig(run.input.as_ref(), &run.entries)?;
             let now = now_ms();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(store_db)?;
             insert_session_tx(&tx, &run.session_id, &scope_key, &scope_json, now)?;
             if let Some(existing) = lookup_run_tx(&tx, &run.run_id, &scope_key)? {
-                if run_input_tx(&tx, &existing.run_id)? != run.input {
-                    return Err(MachineError::InputConflict);
+                if run_start_sig_tx(&tx, &existing.run_id)? != sig {
+                    return Err(MachineError::StartConflict);
                 }
-                check_entries_tx(&tx, &scope_key, &existing.session_id, &run.entries)?;
                 tx.commit().map_err(store_db)?;
                 return Ok(StoreStartResult::Existing(existing));
             }
@@ -313,10 +315,9 @@ where
                 && let Some(existing) =
                     find_idempotent_tx(&tx, &scope_key, &run.session_id, key)?
             {
-                if run_input_tx(&tx, &existing.run_id)? != run.input {
-                    return Err(MachineError::InputConflict);
+                if run_start_sig_tx(&tx, &existing.run_id)? != sig {
+                    return Err(MachineError::StartConflict);
                 }
-                check_entries_tx(&tx, &scope_key, &existing.session_id, &run.entries)?;
                 tx.commit().map_err(store_db)?;
                 return Ok(StoreStartResult::Existing(existing));
             }
@@ -340,12 +341,12 @@ where
             tx.execute(
                 "INSERT INTO typemach_runs (
                     run_id, session_id, thread_id, scope_key, scope, agent_kind, model,
-                    client_run_key, parent_run_id, retry_of_run_id, metadata, input, status,
+                    client_run_key, parent_run_id, retry_of_run_id, metadata, input, start_sig, status,
                     owner_id, lease_id, lease_expires_at, attempt, started_at, created_at, updated_at
                  )
                  VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?18, ?18
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?19, ?19
                  )",
                 params![
                     run.run_id.as_str(),
@@ -360,6 +361,7 @@ where
                     retry,
                     metadata,
                     input,
+                    sig,
                     RunStatus::Running.as_str(),
                     owner,
                     lease_id,
@@ -489,22 +491,18 @@ where
     ) -> Result<(), MachineError> {
         let run_id = run_id.clone();
         let scope_key = scope_key(scope)?;
-        let input = input.cloned();
-        let entries = entries.to_vec();
+        let sig = start_sig(input, entries)?;
         self.call(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Deferred)
                 .map_err(store_db)?;
-            let lookup = lookup_run_tx(&tx, &run_id, &scope_key)?;
-            let Some(lookup) = lookup else {
+            if lookup_run_tx(&tx, &run_id, &scope_key)?.is_none() {
                 tx.commit().map_err(store_db)?;
                 return Err(MachineError::RunNotFound);
-            };
-            let stored = run_input_tx(&tx, &run_id)?;
-            if stored != input {
-                return Err(MachineError::InputConflict);
             }
-            check_entries_tx(&tx, &scope_key, &lookup.session_id, &entries)?;
+            if run_start_sig_tx(&tx, &run_id)? != sig {
+                return Err(MachineError::StartConflict);
+            }
             tx.commit().map_err(store_db)?;
             Ok(())
         })
