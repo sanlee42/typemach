@@ -4,13 +4,13 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::checkpoint::CheckpointSaver;
 use crate::error::MachineError;
 use crate::lifecycle::{
-    AppendEventResult, RunLifecycle, RunSubscription, StartRunRejection, StartRunResult,
+    AppendEventResult, RunCursor, RunLifecycle, RunSubscription, StartRunRejection, StartRunResult,
 };
 use crate::machine::Machine;
 use crate::op::EntryWrite;
@@ -29,6 +29,15 @@ mod tx;
 pub use tx::TxRuntime;
 
 pub type Event = RunEventEnvelope<Payload>;
+
+pub type Replay<M> = ReplayPayload<
+    <M as Machine>::Step,
+    <M as Machine>::Signal,
+    <M as Machine>::Output,
+    <M as Machine>::Interrupt,
+>;
+
+pub type ReplayEvent<M> = RunEventEnvelope<Replay<M>>;
 
 pub type Rx<Step, Signal, Output, Interrupt> = RunEventReceiver<Step, Signal, Output, Interrupt>;
 
@@ -100,6 +109,36 @@ impl<Scope> Start<Scope> {
             token: None,
         }
     }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn parent(mut self, run_id: impl Into<RunId>) -> Self {
+        self.parent = Some(run_id.into());
+        self
+    }
+
+    pub fn retry_of(mut self, run_id: impl Into<RunId>) -> Self {
+        self.retry_of = Some(run_id.into());
+        self
+    }
+
+    pub fn meta(mut self, meta: Value) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    pub fn entry(mut self, entry: EntryWrite) -> Self {
+        self.entries.push(entry);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,12 +183,123 @@ pub enum Payload {
     Cancel,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayPayload<Step, Signal, Output, Interrupt> {
+    Started {
+        thread_id: ThreadId,
+    },
+    Heartbeat {
+        thread_id: ThreadId,
+    },
+    StepStarted {
+        step: Step,
+        step_count: u32,
+    },
+    StepFinished {
+        step: Step,
+        result: StepResult,
+    },
+    Signal {
+        signal: Signal,
+    },
+    Completed {
+        trace: Vec<Value>,
+        output: Output,
+        snapshot: Value,
+    },
+    Interrupted {
+        interrupt: Interrupt,
+        snapshot: Value,
+    },
+    Failed {
+        error: String,
+    },
+    Cancelled,
+}
+
+impl<Step, Signal, Output, Interrupt> ReplayPayload<Step, Signal, Output, Interrupt> {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. }
+                | Self::Interrupted { .. }
+                | Self::Failed { .. }
+                | Self::Cancelled
+        )
+    }
+}
+
 impl RunEventPayload for Payload {
     fn is_terminal(&self) -> bool {
         matches!(
             self,
             Self::Done { .. } | Self::Interrupt { .. } | Self::Fail { .. } | Self::Cancel
         )
+    }
+}
+
+impl RunEventEnvelope<Payload> {
+    pub fn typed<M>(&self) -> Result<ReplayEvent<M>, MachineError>
+    where
+        M: Machine,
+        M::Signal: DeserializeOwned,
+        M::Output: DeserializeOwned,
+    {
+        Ok(RunEventEnvelope::new(
+            self.run_id.clone(),
+            self.session_id.clone(),
+            self.seq,
+            self.payload.typed::<M>()?,
+        ))
+    }
+}
+
+impl Payload {
+    pub fn typed<M>(&self) -> Result<Replay<M>, MachineError>
+    where
+        M: Machine,
+        M::Signal: DeserializeOwned,
+        M::Output: DeserializeOwned,
+    {
+        Ok(match self {
+            Self::Start { thread_id } => ReplayPayload::Started {
+                thread_id: thread_id.clone(),
+            },
+            Self::Beat { thread_id } => ReplayPayload::Heartbeat {
+                thread_id: thread_id.clone(),
+            },
+            Self::StepStart { step, n } => ReplayPayload::StepStarted {
+                step: from_json(step)?,
+                step_count: *n,
+            },
+            Self::StepDone { step, result } => ReplayPayload::StepFinished {
+                step: from_json(step)?,
+                result: *result,
+            },
+            Self::Signal { signal } => ReplayPayload::Signal {
+                signal: from_json(signal)?,
+            },
+            Self::Done {
+                trace,
+                output,
+                snapshot,
+            } => ReplayPayload::Completed {
+                trace: trace.clone(),
+                output: from_json(output)?,
+                snapshot: snapshot.clone(),
+            },
+            Self::Interrupt {
+                interrupt,
+                snapshot,
+            } => ReplayPayload::Interrupted {
+                interrupt: from_json(interrupt)?,
+                snapshot: snapshot.clone(),
+            },
+            Self::Fail { error } => ReplayPayload::Failed {
+                error: error.clone(),
+            },
+            Self::Cancel => ReplayPayload::Cancelled,
+        })
     }
 }
 
@@ -312,9 +462,9 @@ where
         &self,
         run_id: &RunId,
         scope: &S::Scope,
-        after_seq: i64,
+        cursor: impl Into<RunCursor>,
     ) -> Result<RunSubscription<Event>, MachineError> {
-        self.life.subscribe(run_id, scope, after_seq).await
+        self.life.subscribe(run_id, scope, cursor).await
     }
 }
 
@@ -607,6 +757,13 @@ where
     T: Serialize,
 {
     serde_json::to_value(value).map_err(MachineError::Serialization)
+}
+
+fn from_json<T>(value: &Value) -> Result<T, MachineError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(value.clone()).map_err(MachineError::Deserialization)
 }
 
 async fn cancel_and_finish<M, C, S>(

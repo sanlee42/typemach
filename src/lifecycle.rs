@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use async_rt::sync::{Mutex, mpsc};
+use serde::{Deserialize, Serialize};
 
 use crate::error::MachineError;
 use crate::registry::{RunHandle, RunRegistry};
@@ -10,6 +12,8 @@ use crate::store::{
     CommitPlan, FinishRunResult, RunCommit, RunCommitResult, RunEvent, RunEventEnvelope,
     RunEventPayload, RunFinish, RunLookup, RunStart, RunStatus, RunStore, RunTx, StoreStartResult,
 };
+
+pub(crate) const REPLAY_LIMIT: usize = 1024;
 
 #[derive(Debug)]
 pub enum AppendEventResult<E: RunEvent> {
@@ -33,34 +37,98 @@ pub enum StartRunResult {
 #[derive(Debug)]
 pub enum RunSubscription<E: RunEvent> {
     Active { replay: Vec<E>, tail: RunTail<E> },
+    Replay { page: ReplayPage<E> },
     Inactive { status: RunStatus, replay: Vec<E> },
     Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunCursor(i64);
+
+impl RunCursor {
+    pub const START: Self = Self(0);
+
+    pub fn new(seq: i64) -> Self {
+        Self(seq)
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+impl Default for RunCursor {
+    fn default() -> Self {
+        Self::START
+    }
+}
+
+impl From<i64> for RunCursor {
+    fn from(seq: i64) -> Self {
+        Self::new(seq)
+    }
+}
+
+impl From<RunCursor> for i64 {
+    fn from(cursor: RunCursor) -> Self {
+        cursor.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayPage<E: RunEvent> {
+    events: Vec<E>,
+    cursor: RunCursor,
+}
+
+impl<E: RunEvent> ReplayPage<E> {
+    fn new(events: Vec<E>, cursor: RunCursor) -> Self {
+        Self { events, cursor }
+    }
+
+    pub fn events(&self) -> &[E] {
+        &self.events
+    }
+
+    pub fn into_events(self) -> Vec<E> {
+        self.events
+    }
+
+    pub fn cursor(&self) -> RunCursor {
+        self.cursor
+    }
+}
+
+impl<E: RunEvent> Deref for ReplayPage<E> {
+    type Target = [E];
+
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
 }
 
 #[derive(Debug)]
 pub struct RunTail<E: RunEvent> {
     receiver: mpsc::UnboundedReceiver<E>,
-    after_seq: i64,
+    cursor: RunCursor,
 }
 
 impl<E: RunEvent> RunTail<E> {
-    fn new(receiver: mpsc::UnboundedReceiver<E>, after_seq: i64) -> Self {
-        Self {
-            receiver,
-            after_seq,
-        }
+    fn new(receiver: mpsc::UnboundedReceiver<E>, cursor: RunCursor) -> Self {
+        Self { receiver, cursor }
     }
 
-    pub fn cursor(&self) -> i64 {
-        self.after_seq
+    pub fn cursor(&self) -> RunCursor {
+        self.cursor
     }
 
     pub async fn next_event(&mut self) -> Option<E> {
         while let Some(event) = self.receiver.recv().await {
-            if event.seq() <= self.after_seq {
+            if event.seq() <= self.cursor.as_i64() {
                 continue;
             }
-            self.after_seq = event.seq();
+            self.cursor = RunCursor::new(event.seq());
             return Some(event);
         }
         None
@@ -524,8 +592,9 @@ where
         &self,
         run_id: &RunId,
         scope: &S::Scope,
-        after_seq: i64,
+        cursor: impl Into<RunCursor>,
     ) -> Result<RunSubscription<E>, MachineError> {
+        let cursor = cursor.into();
         let Some(lookup) = self.store.lookup_run(run_id, scope).await? else {
             return Ok(RunSubscription::Missing);
         };
@@ -534,17 +603,22 @@ where
         {
             let page = self
                 .store
-                .list_events(run_id, scope, after_seq, usize::MAX)
+                .list_events(run_id, scope, cursor.as_i64(), REPLAY_LIMIT)
                 .await?;
+            if let Some(next) = page.next {
+                return Ok(RunSubscription::Replay {
+                    page: ReplayPage::new(page.items, RunCursor::new(next)),
+                });
+            }
             let replay = page.items;
             let last_replay_seq = replay
                 .last()
                 .map(RunEvent::seq)
-                .unwrap_or(after_seq)
-                .max(after_seq);
+                .unwrap_or(cursor.as_i64())
+                .max(cursor.as_i64());
             return Ok(RunSubscription::Active {
                 replay,
-                tail: RunTail::new(receiver, last_replay_seq),
+                tail: RunTail::new(receiver, RunCursor::new(last_replay_seq)),
             });
         }
         if lookup.status == RunStatus::Running {
@@ -554,12 +628,16 @@ where
         }
         let replay = self
             .store
-            .list_events(run_id, scope, after_seq, usize::MAX)
-            .await?
-            .items;
+            .list_events(run_id, scope, cursor.as_i64(), REPLAY_LIMIT)
+            .await?;
+        if let Some(next) = replay.next {
+            return Ok(RunSubscription::Replay {
+                page: ReplayPage::new(replay.items, RunCursor::new(next)),
+            });
+        }
         Ok(RunSubscription::Inactive {
             status: lookup.status,
-            replay,
+            replay: replay.items,
         })
     }
 

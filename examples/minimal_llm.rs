@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 use thiserror::Error;
 use typemach::{
-    Machine, MachineError, MemorySaver, RunCommand, RunContext, RunId, RunRequest, RunStreamEvent,
-    Runner, RuntimeLimits, SessionId, StepResult, StreamConfig, ThreadId, Transition,
+    Machine, MachineError, MemorySaver, RunContext, RunRequest, RunStreamEvent, Runner,
+    RuntimeLimits, StepResult, StreamConfig, Transition,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -339,20 +339,14 @@ fn stream_config() -> StreamConfig {
 
 fn build_request(prompt: String) -> Result<RunRequest<PromptInput>, ExampleError> {
     let suffix = run_suffix()?;
-    Ok(RunRequest {
-        run_id: RunId::from(format!("minimal-llm-{suffix}")),
-        session_id: SessionId::from(format!("minimal-llm-session-{suffix}")),
-        thread_id: ThreadId::from(format!("minimal-llm-thread-{suffix}")),
-        command: RunCommand::Start,
-        input: PromptInput { prompt },
-        snapshot: None,
-        runtime_limits: RuntimeLimits {
-            max_steps: MAX_STEPS,
-            allow_clarification: false,
-            step_timeout: None,
-            run_timeout: None,
-        },
-    })
+    Ok(RunRequest::start(
+        format!("minimal-llm-{suffix}"),
+        format!("minimal-llm-session-{suffix}"),
+        format!("minimal-llm-thread-{suffix}"),
+        PromptInput { prompt },
+        MAX_STEPS,
+    )
+    .limits(RuntimeLimits::new(MAX_STEPS).no_clarify()))
 }
 
 fn prompt_from_args() -> Result<String, ExampleError> {

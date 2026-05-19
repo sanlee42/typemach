@@ -14,7 +14,7 @@ use super::{
 };
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, CheckpointStore};
 use crate::error::MachineError;
-use crate::lifecycle::{RunLifecycle, RunSubscription, StartRunResult};
+use crate::lifecycle::{RunCursor, RunLifecycle, RunSubscription, StartRunResult};
 use crate::machine::Machine;
 use crate::op::RunOps;
 use crate::registry::{RunHandle, RunRegistry};
@@ -300,9 +300,9 @@ where
         &self,
         run_id: &RunId,
         scope: &S::Scope,
-        after_seq: i64,
+        cursor: impl Into<RunCursor>,
     ) -> Result<RunSubscription<Event>, MachineError> {
-        self.life.subscribe(run_id, scope, after_seq).await
+        self.life.subscribe(run_id, scope, cursor).await
     }
 }
 

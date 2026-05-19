@@ -311,7 +311,7 @@ fn lifecycle_subscribe_replays_then_tails_active_run() {
             panic!("expected active subscription");
         };
         assert_eq!(replay.len(), 1);
-        assert_eq!(tail.cursor(), 1);
+        assert_eq!(tail.cursor(), RunCursor::new(1));
 
         lifecycle
             .append_event(
@@ -327,14 +327,66 @@ fn lifecycle_subscribe_replays_then_tails_active_run() {
 }
 
 #[test]
+fn lifecycle_subscribe_returns_replay_page_before_live_tail() {
+    block_on(async {
+        let lifecycle = lifecycle();
+        lifecycle
+            .start_run(
+                run_start("run-replay", None),
+                RunHandle::new("token".to_string()),
+                None,
+            )
+            .await
+            .expect("start");
+        for _ in 0..=crate::lifecycle::REPLAY_LIMIT {
+            lifecycle
+                .append_event(
+                    &RunId::from("run-replay"),
+                    &SessionId::from("session-a"),
+                    &scope(),
+                    payload(false),
+                )
+                .await
+                .expect("append");
+        }
+
+        let RunSubscription::Replay { page } = lifecycle
+            .subscribe(&RunId::from("run-replay"), &scope(), 0)
+            .await
+            .expect("subscribe")
+        else {
+            panic!("expected replay page");
+        };
+        assert_eq!(page.len(), crate::lifecycle::REPLAY_LIMIT);
+        assert_eq!(
+            page.cursor(),
+            RunCursor::new(crate::lifecycle::REPLAY_LIMIT as i64)
+        );
+
+        let RunSubscription::Active { replay, tail } = lifecycle
+            .subscribe(&RunId::from("run-replay"), &scope(), page.cursor())
+            .await
+            .expect("subscribe")
+        else {
+            panic!("expected active");
+        };
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            tail.cursor(),
+            RunCursor::new(crate::lifecycle::REPLAY_LIMIT as i64 + 1)
+        );
+    });
+}
+
+#[test]
 fn run_tail_filters_events_at_or_before_cursor() {
     block_on(async {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let mut tail = RunTail::new(receiver, 1);
+        let mut tail = RunTail::new(receiver, RunCursor::new(1));
         sender.send(event("run-a", 1, false)).expect("send dup");
         sender.send(event("run-a", 2, false)).expect("send fresh");
 
         assert_eq!(tail.next_event().await.expect("fresh").seq, 2);
-        assert_eq!(tail.cursor(), 2);
+        assert_eq!(tail.cursor(), RunCursor::new(2));
     });
 }

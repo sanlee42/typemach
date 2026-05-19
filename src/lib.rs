@@ -18,7 +18,8 @@ pub mod testkit;
 pub use checkpoint::{CheckpointRecord, CheckpointSaver, CheckpointStore, MemorySaver};
 pub use error::MachineError;
 pub use lifecycle::{
-    AppendEventResult, RunLifecycle, RunSubscription, RunTail, StartRunRejection, StartRunResult,
+    AppendEventResult, ReplayPage, RunCursor, RunLifecycle, RunSubscription, RunTail,
+    StartRunRejection, StartRunResult,
 };
 pub use machine::{Machine, MachineState, ResumeAction, Transition};
 pub use op::{
@@ -33,7 +34,10 @@ pub use run::{
     RunStreamEvent, RuntimeLimits, SessionId, StepResult, StreamConfig, ThreadId, WorkerId,
 };
 pub use runner::Runner;
-pub use runtime::{Event, LeaseCfg, Payload, Runtime, Rx, Start, StartResult, TxRuntime};
+pub use runtime::{
+    Event, LeaseCfg, Payload, Replay, ReplayEvent, ReplayPayload, Runtime, Rx, Start, StartResult,
+    TxRuntime,
+};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
 pub use store::{

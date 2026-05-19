@@ -2,7 +2,7 @@ use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 use crate::machine::{ResumeAction, Transition};
 use crate::op::{Effect, EffectStatus, Entry, EntryQuery, Item, Page, Vis};
-use crate::run::{LeaseId, RunCommand, RuntimeLimits};
+use crate::run::LeaseId;
 use crate::store::{
     Lease, LeaseClaim, MemoryRunStore, RunCommit, RunCommitResult, RunFinishRecord, RunLease,
     RunStore, RunTx, StoreStartResult,
@@ -354,26 +354,21 @@ impl RunLease<Event> for TestTxStore {
 }
 
 fn request(run_id: &str, mode: Mode) -> RunRequest<Input> {
-    RunRequest {
-        run_id: RunId::from(run_id),
-        session_id: SessionId::from("session-1"),
-        thread_id: ThreadId::from(format!("thread-{run_id}")),
-        command: RunCommand::Start,
-        input: Input { mode },
-        snapshot: None,
-        runtime_limits: RuntimeLimits {
-            max_steps: 5,
-            allow_clarification: true,
-            step_timeout: None,
-            run_timeout: None,
-        },
-    }
+    RunRequest::start(
+        run_id,
+        "session-1",
+        format!("thread-{run_id}"),
+        Input { mode },
+        5,
+    )
 }
 
 fn start(key: Option<&str>) -> Start {
-    let mut start = Start::new(scope(), "test");
-    start.key = key.map(str::to_string);
-    start
+    let start = Start::new(scope(), "test");
+    match key {
+        Some(key) => start.key(key),
+        None => start,
+    }
 }
 
 fn scope() -> Value {

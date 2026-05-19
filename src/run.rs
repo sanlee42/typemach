@@ -69,6 +69,49 @@ pub struct RunRequest<I> {
     pub runtime_limits: RuntimeLimits,
 }
 
+impl<I> RunRequest<I> {
+    pub fn start(
+        run_id: impl Into<RunId>,
+        session_id: impl Into<SessionId>,
+        thread_id: impl Into<ThreadId>,
+        input: I,
+        max_steps: u32,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            session_id: session_id.into(),
+            thread_id: thread_id.into(),
+            command: RunCommand::Start,
+            input,
+            snapshot: None,
+            runtime_limits: RuntimeLimits::new(max_steps),
+        }
+    }
+
+    pub fn resume(
+        run_id: impl Into<RunId>,
+        session_id: impl Into<SessionId>,
+        thread_id: impl Into<ThreadId>,
+        input: I,
+        max_steps: u32,
+    ) -> Self {
+        Self {
+            command: RunCommand::Resume,
+            ..Self::start(run_id, session_id, thread_id, input, max_steps)
+        }
+    }
+
+    pub fn snapshot(mut self, snapshot: Value) -> Self {
+        self.snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn limits(mut self, limits: RuntimeLimits) -> Self {
+        self.runtime_limits = limits;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunCommand {
@@ -95,6 +138,21 @@ impl RuntimeLimits {
             step_timeout: None,
             run_timeout: None,
         }
+    }
+
+    pub fn no_clarify(mut self) -> Self {
+        self.allow_clarification = false;
+        self
+    }
+
+    pub fn step_timeout(mut self, timeout: Duration) -> Self {
+        self.step_timeout = Some(timeout);
+        self
+    }
+
+    pub fn run_timeout(mut self, timeout: Duration) -> Self {
+        self.run_timeout = Some(timeout);
+        self
     }
 }
 
@@ -284,12 +342,16 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
         self
     }
 
-    pub async fn reserve(
+    pub async fn reserve<T>(
         &self,
         key: &str,
         kind: &str,
-        request: Value,
-    ) -> Result<Effect, crate::error::MachineError> {
+        request: T,
+    ) -> Result<Effect, crate::error::MachineError>
+    where
+        T: Serialize,
+    {
+        let request = to_value(request)?;
         self.ops.reserve(&self.run_id, key, kind, request).await
     }
 
@@ -300,10 +362,10 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
     pub async fn done(
         &self,
         key: impl Into<String>,
-        result: Value,
+        result: impl Serialize,
     ) -> Result<(), crate::error::MachineError> {
         self.ops
-            .push_effect(&self.run_id, EffectUpdate::done(key, result))
+            .push_effect(&self.run_id, EffectUpdate::done(key, to_value(result)?))
             .await
     }
 
@@ -332,7 +394,7 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
         &self,
         key: impl Into<String>,
         kind: impl Into<String>,
-        body: Value,
+        body: impl Serialize,
     ) -> Result<(), crate::error::MachineError> {
         self.ops
             .push_item(
@@ -340,7 +402,7 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
                 ItemWrite {
                     key: key.into(),
                     kind: kind.into(),
-                    body,
+                    body: to_value(body)?,
                 },
             )
             .await
@@ -351,7 +413,7 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
         key: impl Into<String>,
         kind: impl Into<String>,
         vis: Vis,
-        body: Value,
+        body: impl Serialize,
     ) -> Result<(), crate::error::MachineError> {
         self.ops
             .push_entry(
@@ -360,7 +422,7 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
                     key: key.into(),
                     kind: kind.into(),
                     vis,
-                    body,
+                    body: to_value(body)?,
                 },
             )
             .await
@@ -386,4 +448,11 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
     pub fn cancelled(&self) -> impl Future<Output = ()> + '_ {
         self.cancel.cancelled()
     }
+}
+
+fn to_value<T>(value: T) -> Result<Value, crate::error::MachineError>
+where
+    T: Serialize,
+{
+    serde_json::to_value(value).map_err(crate::error::MachineError::Serialization)
 }

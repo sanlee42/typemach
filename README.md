@@ -66,6 +66,14 @@ use typemach::{Machine, MemorySaver, Runner, RunRequest, Transition};
 
 let runner = Runner::new(agent, Arc::new(MemorySaver::new()));
 
+let request = RunRequest::start(
+    run_id,
+    session_id,
+    thread_id,
+    Input { prompt },
+    8,
+);
+
 // Blocking turn
 let output = runner.invoke(request).await?;
 
@@ -90,6 +98,10 @@ runner.cancel_run(&run_id).await;
 Checkpoints are written after every step transition. Interrupts persist state + step + typed payload. Resume loads the record and calls `apply_resume_input`.
 
 For persisted runs, use `TxRuntime` with `PgStore` or `SqliteStore`. Both stores own generic `typemach_*` tables for sessions, runs, run events, thread leases, and checkpoints. They store typed event envelopes as JSON and keep `scope`, metadata, idempotency keys, cancellation, terminal status, and checkpoint writes in one transactional path.
+
+`Start::new(scope, "agent").key(intent_id)` gives the durable idempotency key for a run. `RunContext::reserve/done/item/entry` accept any `Serialize` payload, so business code can pass typed structs instead of manually building JSON. Persisted events can be replayed as machine types with `event.typed::<MyAgent>()`.
+
+Long reconnects return `RunSubscription::Replay { page }` until stored events are caught up. Send `page.events()`, then subscribe again with `page.cursor()`. `Active` means replay is caught up and the returned tail is live.
 
 `TxRuntime` also owns run and thread leases. Each active run carries a `LeaseId`; every commit checks that token before writing checkpoint/events/terminal state. Stores enforce at most one `running` run per `thread_id`, and leased runs also claim the target thread lease, so two workers cannot advance different runs against the same checkpoint thread. If a process dies, another instance can call `TxRuntime::reap(limit)` to finalize expired `running` runs as `error` with `lease_expired`, releasing the thread for a later run.
 

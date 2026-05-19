@@ -39,6 +39,14 @@ fn stream_persists_and_forwards_completed_events() {
             events.last().map(|event| &event.payload),
             Some(Payload::Done { .. })
         ));
+        let replay = events
+            .last()
+            .expect("terminal event")
+            .typed::<TestMachine>();
+        assert!(matches!(
+            replay.expect("typed replay").payload,
+            ReplayPayload::Completed { output, .. } if output == "value=1"
+        ));
         let lookup = rt
             .store()
             .lookup_run(&run_id, &scope())
