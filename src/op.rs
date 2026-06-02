@@ -254,6 +254,8 @@ pub trait RunOps: Send + Sync {
     async fn push_item(&self, run_id: &RunId, item: ItemWrite) -> Result<(), MachineError>;
 
     async fn push_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError>;
+
+    async fn record_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError>;
 }
 
 #[derive(Debug)]
@@ -288,6 +290,10 @@ impl RunOps for NoopRunOps {
     }
 
     async fn push_entry(&self, _run_id: &RunId, _entry: EntryWrite) -> Result<(), MachineError> {
+        Err(MachineError::RuntimeOpUnavailable)
+    }
+
+    async fn record_entry(&self, _run_id: &RunId, _entry: EntryWrite) -> Result<(), MachineError> {
         Err(MachineError::RuntimeOpUnavailable)
     }
 }

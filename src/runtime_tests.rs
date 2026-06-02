@@ -1,7 +1,7 @@
 use super::*;
 use crate::checkpoint::{CheckpointRecord, CheckpointSaver, MemorySaver};
 use crate::machine::{ResumeAction, Transition};
-use crate::op::{Effect, EffectStatus, Entry, EntryQuery, Item, Page, Vis};
+use crate::op::{Effect, EffectStatus, Entry, EntryQuery, EntryWrite, Item, Page, Vis};
 use crate::run::LeaseId;
 use crate::store::{
     Lease, LeaseClaim, MemoryRunStore, RunCommit, RunCommitResult, RunFinishRecord, RunLease,
@@ -38,6 +38,7 @@ enum Mode {
     Loop,
     Slow,
     Ops,
+    Progress,
 }
 
 struct TestMachine;
@@ -105,6 +106,17 @@ impl Machine for TestMachine {
             (Mode::Slow, Step::Slow) => {
                 async_rt::time::sleep(Duration::from_secs(5)).await;
                 Ok(Transition::Complete("slow".to_string()))
+            }
+            (Mode::Progress, Step::Start) => {
+                ctx.record_entry(
+                    "progress-1",
+                    "progress",
+                    Vis::Public,
+                    json!({"stage": "started"}),
+                )
+                .await?;
+                async_rt::time::sleep(Duration::from_secs(5)).await;
+                Ok(Transition::Complete("progress".to_string()))
             }
             (Mode::Ops, Step::Start) => {
                 ctx.reserve("effect-a", "tool", json!({"arg": 1})).await?;
@@ -316,6 +328,16 @@ impl RunTx<Event> for TestTxStore {
         self.runs.list_entries(query).await
     }
 
+    async fn record_entry(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        entry: EntryWrite,
+    ) -> Result<Entry, MachineError> {
+        self.runs.record_entry(run_id, scope, lease, entry).await
+    }
+
     async fn latest_entry(
         &self,
         scope: &Self::Scope,
@@ -375,6 +397,15 @@ fn scope() -> Value {
     json!({"tenant": "demo"})
 }
 
+fn entry_write(key: &str, body: Value) -> EntryWrite {
+    EntryWrite {
+        key: key.to_string(),
+        kind: "progress".to_string(),
+        vis: Vis::Public,
+        body,
+    }
+}
+
 fn block_on<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -388,5 +419,7 @@ where
 
 #[path = "runtime_tests/control.rs"]
 mod control;
+#[path = "runtime_tests/entry.rs"]
+mod entry;
 #[path = "runtime_tests/stream.rs"]
 mod stream;

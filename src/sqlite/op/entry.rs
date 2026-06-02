@@ -67,6 +67,25 @@ pub(in crate::sqlite) fn apply_entries_tx(
     Ok(())
 }
 
+pub(in crate::sqlite) fn record_entry_tx(
+    tx: &Transaction<'_>,
+    scope_key: &str,
+    run_id: &RunId,
+    session_id: &SessionId,
+    thread_id: &ThreadId,
+    entry: &EntryWrite,
+) -> Result<Entry, MachineError> {
+    apply_entries_tx(
+        tx,
+        scope_key,
+        run_id,
+        session_id,
+        thread_id,
+        std::slice::from_ref(entry),
+    )?;
+    load_entry_tx(tx, scope_key, session_id, &entry.key)?.ok_or(MachineError::RunNotFound)
+}
+
 pub(in crate::sqlite) fn check_entries_tx(
     tx: &Transaction<'_>,
     scope_key: &str,

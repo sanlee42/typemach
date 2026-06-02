@@ -74,6 +74,31 @@ where
     Ok(())
 }
 
+pub(in crate::pg) async fn record_entry_tx<C>(
+    tx: &C,
+    scope_key: &str,
+    run_id: &RunId,
+    session_id: &SessionId,
+    thread_id: &ThreadId,
+    entry: &EntryWrite,
+) -> Result<Entry, MachineError>
+where
+    C: GenericClient + Sync,
+{
+    apply_entries_tx(
+        tx,
+        scope_key,
+        run_id,
+        session_id,
+        thread_id,
+        std::slice::from_ref(entry),
+    )
+    .await?;
+    load_entry_tx(tx, scope_key, session_id, &entry.key)
+        .await?
+        .ok_or(MachineError::RunNotFound)
+}
+
 pub(in crate::pg) async fn check_entries_tx<C>(
     tx: &C,
     scope_key: &str,

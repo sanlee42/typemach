@@ -5,7 +5,7 @@ use serde_json::Value;
 use tokio_rusqlite::rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::*;
-use crate::op::{Effect, Entry, EntryQuery, Item, Vis};
+use crate::op::{Effect, Entry, EntryQuery, EntryWrite, Item, Vis};
 use crate::run::{LeaseId, ThreadId};
 use crate::store::RunTx;
 
@@ -285,6 +285,46 @@ where
             };
             tx.commit().map_err(store_db)?;
             Ok(Page::new(entries, next))
+        })
+        .await
+    }
+
+    async fn record_entry(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        entry: EntryWrite,
+    ) -> Result<Entry, MachineError> {
+        let run_id = run_id.clone();
+        let scope_key = scope_key(scope)?;
+        let lease = lease.cloned();
+        self.call(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(store_db)?;
+            let row = commit_row_tx(&tx, &run_id, &scope_key)?.ok_or(MachineError::RunNotFound)?;
+            if row.status.is_terminal() {
+                return Err(MachineError::RunNotFound);
+            }
+            check_sqlite_lease(&row, lease.as_ref())?;
+            let entry = record_entry_tx(
+                &tx,
+                &scope_key,
+                &run_id,
+                &row.session_id,
+                &row.thread_id,
+                &entry,
+            )?;
+            tx.execute(
+                "UPDATE typemach_runs
+                 SET updated_at = ?3
+                 WHERE run_id = ?1 AND scope_key = ?2",
+                params![run_id.as_str(), scope_key, now_ms()],
+            )
+            .map_err(store_db)?;
+            tx.commit().map_err(store_db)?;
+            Ok(entry)
         })
         .await
     }

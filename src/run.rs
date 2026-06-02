@@ -428,6 +428,26 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
             .await
     }
 
+    pub async fn record_entry(
+        &self,
+        key: impl Into<String>,
+        kind: impl Into<String>,
+        vis: Vis,
+        body: impl Serialize,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .record_entry(
+                &self.run_id,
+                EntryWrite {
+                    key: key.into(),
+                    kind: kind.into(),
+                    vis,
+                    body: to_value(body)?,
+                },
+            )
+            .await
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.event_tx.is_some()
     }

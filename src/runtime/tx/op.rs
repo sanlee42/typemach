@@ -127,4 +127,23 @@ where
         pending.entries.push(entry);
         Ok(())
     }
+
+    async fn record_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError> {
+        self.check_run(run_id)?;
+        {
+            let pending = self.pending.lock().await;
+            if let Some(existing) = pending
+                .entries
+                .iter()
+                .find(|existing| existing.key == entry.key)
+                && existing != &entry
+            {
+                return Err(MachineError::EntryConflict);
+            }
+        }
+        self.store
+            .record_entry(run_id, &self.scope, Some(&self.lease), entry)
+            .await?;
+        Ok(())
+    }
 }

@@ -445,6 +445,14 @@ where
         query: EntryQuery<'_, Self::Scope>,
     ) -> Result<Page<Entry>, MachineError>;
 
+    async fn record_entry(
+        &self,
+        run_id: &RunId,
+        scope: &Self::Scope,
+        lease: Option<&LeaseId>,
+        entry: EntryWrite,
+    ) -> Result<Entry, MachineError>;
+
     async fn latest_entry(
         &self,
         scope: &Self::Scope,

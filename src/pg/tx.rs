@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::*;
-use crate::op::{Effect, Entry, EntryQuery, Item, Vis};
+use crate::op::{Effect, Entry, EntryQuery, EntryWrite, Item, Vis};
 use crate::run::LeaseId;
 use crate::store::RunTx;
 
@@ -284,6 +284,55 @@ where
             None
         };
         Ok(Page::new(entries, next))
+    }
+
+    async fn record_entry(
+        &self,
+        run_id: &RunId,
+        scope: &Scope,
+        lease: Option<&LeaseId>,
+        entry: EntryWrite,
+    ) -> Result<Entry, MachineError> {
+        let scope_key = scope_key(scope)?;
+        let mut client = self
+            .pool
+            .get()
+            .await
+            .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
+        let tx = client.transaction().await.map_err(store_db)?;
+        let row = tx
+            .query_opt(
+                "SELECT session_id,
+                        status,
+                        lease_id,
+                        lease_expires_at IS NOT NULL AND lease_expires_at <= now(),
+                        thread_id
+                 FROM typemach_runs
+                 WHERE run_id = $1 AND scope_key = $2
+                 FOR UPDATE",
+                &[&run_id.as_str(), &scope_key],
+            )
+            .await
+            .map_err(store_db)?
+            .ok_or(MachineError::RunNotFound)?;
+        if row_status(&row, 1)?.is_terminal() {
+            return Err(MachineError::RunNotFound);
+        }
+        check_pg_lease(&row, lease)?;
+        let session_id = SessionId::from(row.get::<_, String>(0));
+        let thread_id = ThreadId::from(row.get::<_, String>(4));
+        let entry =
+            record_entry_tx(&tx, &scope_key, run_id, &session_id, &thread_id, &entry).await?;
+        tx.execute(
+            "UPDATE typemach_runs
+             SET updated_at = now()
+             WHERE run_id = $1 AND scope_key = $2",
+            &[&run_id.as_str(), &scope_key],
+        )
+        .await
+        .map_err(store_db)?;
+        tx.commit().await.map_err(store_db)?;
+        Ok(entry)
     }
 
     async fn latest_entry(
