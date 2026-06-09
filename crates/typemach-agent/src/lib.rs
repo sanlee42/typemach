@@ -108,6 +108,8 @@ pub struct AgentToolSpec {
     #[serde(default)]
     pub output_schema: Value,
     #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
     pub annotations: ToolAnnotations,
 }
 
@@ -827,6 +829,7 @@ mod tests {
                     description: "read metric point".to_string(),
                     input_schema: json!({ "type": "object" }),
                     output_schema: Value::Null,
+                    metadata: Value::Null,
                     annotations: ToolAnnotations::default(),
                 },
                 AgentToolSpec {
@@ -834,6 +837,7 @@ mod tests {
                     description: "ask user".to_string(),
                     input_schema: json!({ "type": "object" }),
                     output_schema: Value::Null,
+                    metadata: Value::Null,
                     annotations: ToolAnnotations::default(),
                 },
                 AgentToolSpec {
@@ -841,6 +845,7 @@ mod tests {
                     description: "emit artifact".to_string(),
                     input_schema: json!({ "type": "object" }),
                     output_schema: Value::Null,
+                    metadata: Value::Null,
                     annotations: ToolAnnotations::default(),
                 },
             ])
