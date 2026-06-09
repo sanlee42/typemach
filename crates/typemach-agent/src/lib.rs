@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use typemach::{
     CheckpointSaver, Machine, MachineError, ResumeAction, RunContext, RunEventReceiver, Runner,
     Transition,
@@ -326,9 +327,30 @@ impl AgentError {
     }
 }
 
+#[derive(Clone)]
+pub struct ModelStream {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+impl ModelStream {
+    fn new(tx: mpsc::UnboundedSender<String>) -> Self {
+        Self { tx }
+    }
+
+    pub fn delta(&self, delta: impl Into<String>) -> Result<(), AgentError> {
+        self.tx
+            .send(delta.into())
+            .map_err(|_| AgentError::Model("model delta stream closed".to_string()))
+    }
+}
+
 #[async_trait]
 pub trait AgentModel: Send + Sync {
-    async fn next_step(&self, request: ModelRequest) -> Result<ModelResponse, AgentError>;
+    async fn next_step(
+        &self,
+        request: ModelRequest,
+        stream: ModelStream,
+    ) -> Result<ModelResponse, AgentError>;
 }
 
 #[async_trait]
@@ -482,27 +504,34 @@ where
             .list_tools(&state.context)
             .await
             .map_err(AgentError::machine)?;
-        let response = self
-            .model
-            .next_step(ModelRequest {
-                messages: state.messages.clone(),
-                tools,
-                context: state.context.clone(),
-                turn: state.model_turns,
-            })
-            .await
-            .map_err(AgentError::machine)?;
+        let request = ModelRequest {
+            messages: state.messages.clone(),
+            tools,
+            context: state.context.clone(),
+            turn: state.model_turns,
+        };
+        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+        let response = self.model.next_step(request, ModelStream::new(delta_tx));
+        tokio::pin!(response);
 
         let mut assistant_content = Vec::new();
+        let response = loop {
+            tokio::select! {
+                maybe_delta = delta_rx.recv() => {
+                    if let Some(delta) = maybe_delta {
+                        append_delta(state, ctx, &mut assistant_content, delta).await?;
+                    }
+                }
+                response = &mut response => {
+                    break response.map_err(AgentError::machine)?;
+                }
+            }
+        };
+        while let Ok(delta) = delta_rx.try_recv() {
+            append_delta(state, ctx, &mut assistant_content, delta).await?;
+        }
         for delta in response.deltas {
-            state.answer.push_str(&delta);
-            ctx.emit(AgentSignal::AssistantDelta {
-                delta: delta.clone(),
-                index: state.next_delta_index,
-            })
-            .await?;
-            state.next_delta_index += 1;
-            assistant_content.push(ContentBlock::Text { text: delta });
+            append_delta(state, ctx, &mut assistant_content, delta).await?;
         }
         if let Some(usage) = response.usage {
             state.usage.input_tokens += usage.input_tokens;
@@ -663,6 +692,26 @@ where
     }
 }
 
+async fn append_delta(
+    state: &mut AgentState,
+    ctx: &AgentRunContext,
+    assistant_content: &mut Vec<ContentBlock>,
+    delta: String,
+) -> Result<(), MachineError> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    state.answer.push_str(&delta);
+    ctx.emit(AgentSignal::AssistantDelta {
+        delta: delta.clone(),
+        index: state.next_delta_index,
+    })
+    .await?;
+    state.next_delta_index += 1;
+    assistant_content.push(ContentBlock::Text { text: delta });
+    Ok(())
+}
+
 fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError> {
     let question = tool_use
         .input
@@ -744,13 +793,25 @@ mod tests {
 
     #[async_trait]
     impl AgentModel for ScriptedModel {
-        async fn next_step(&self, request: ModelRequest) -> Result<ModelResponse, AgentError> {
+        async fn next_step(
+            &self,
+            request: ModelRequest,
+            stream: ModelStream,
+        ) -> Result<ModelResponse, AgentError> {
             self.requests.lock().expect("requests lock").push(request);
-            self.responses
+            let response = self
+                .responses
                 .lock()
                 .expect("responses lock")
                 .pop_front()
-                .ok_or_else(|| AgentError::Model("script exhausted".to_string()))
+                .ok_or_else(|| AgentError::Model("script exhausted".to_string()))?;
+            for delta in &response.deltas {
+                stream.delta(delta.clone())?;
+            }
+            Ok(ModelResponse {
+                deltas: Vec::new(),
+                ..response
+            })
         }
     }
 
