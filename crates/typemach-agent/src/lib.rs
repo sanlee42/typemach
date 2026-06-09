@@ -9,6 +9,8 @@ use typemach::{
     Transition,
 };
 
+pub use typemach as core;
+
 pub type AgentRunContext =
     RunContext<AgentRunInput, AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>;
 pub type AgentRunner<M, T, P, S> = Runner<AgentMachine<M, T, P>, S>;
@@ -196,6 +198,12 @@ pub enum AgentSignal {
     ToolCompleted {
         tool_use_id: String,
         name: String,
+        is_error: bool,
+    },
+    ToolResult {
+        tool_use_id: String,
+        name: String,
+        content: Value,
         is_error: bool,
     },
     Artifact {
@@ -581,6 +589,13 @@ where
                     PermissionDecision::Deny(reason) => ToolResult::error(&tool_use, reason),
                 }
             };
+            ctx.emit(AgentSignal::ToolResult {
+                tool_use_id: result.tool_use_id.clone(),
+                name: result.name.clone(),
+                content: result.content.clone(),
+                is_error: result.is_error,
+            })
+            .await?;
             ctx.emit(AgentSignal::ToolCompleted {
                 tool_use_id: result.tool_use_id.clone(),
                 name: result.name.clone(),
@@ -618,6 +633,13 @@ where
         })
         .await?;
         let result = ToolResult::ok(tool_use, json!({ "answer": answer.answer }));
+        ctx.emit(AgentSignal::ToolResult {
+            tool_use_id: result.tool_use_id.clone(),
+            name: result.name.clone(),
+            content: result.content.clone(),
+            is_error: false,
+        })
+        .await?;
         ctx.emit(AgentSignal::ToolCompleted {
             tool_use_id: result.tool_use_id.clone(),
             name: result.name.clone(),
@@ -841,6 +863,12 @@ mod tests {
           RunStreamEvent::Signal {
             signal: AgentSignal::ToolStarted { name, .. },
           } if name == "metric_point"
+        )));
+        assert!(events.iter().any(|event| matches!(
+          event,
+          RunStreamEvent::Signal {
+            signal: AgentSignal::ToolResult { name, content, .. },
+          } if name == "metric_point" && content["value"] == 42
         )));
         let completed = events
             .iter()
