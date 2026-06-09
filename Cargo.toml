@@ -5,6 +5,10 @@ edition = "2024"
 description = "Typed agent machine runtime with checkpoint, interrupt, resume, and cancellation"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = [".", "crates/typemach-agent"]
+resolver = "2"
+
 [features]
 default = []
 postgres = ["dep:deadpool-postgres"]
