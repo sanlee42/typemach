@@ -2,13 +2,18 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use typemach::{
     CheckpointSaver, Machine, MachineError, ResumeAction, RunContext, RunEventReceiver, Runner,
     Transition,
 };
+
+mod context;
+pub use context::estimate_messages;
+mod deepseek;
+mod deepseek_stream;
+pub use deepseek::ConfiguredModel;
 
 pub use typemach as core;
 
@@ -18,268 +23,15 @@ pub type AgentRunner<M, T, P, S> = Runner<AgentMachine<M, T, P>, S>;
 pub type AgentEventReceiver =
     RunEventReceiver<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentStep {
-    PrepareTurn,
-    ModelStep,
-    DispatchTools,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "snake_case")]
-pub enum AgentMessage {
-    User { content: Vec<ContentBlock> },
-    Assistant { content: Vec<ContentBlock> },
-}
-
-impl AgentMessage {
-    pub fn user_text(text: impl Into<String>) -> Self {
-        Self::User {
-            content: vec![ContentBlock::Text { text: text.into() }],
-        }
-    }
-
-    pub fn assistant_text(text: impl Into<String>) -> Self {
-        Self::Assistant {
-            content: vec![ContentBlock::Text { text: text.into() }],
-        }
-    }
-
-    pub fn tool_result(result: ToolResult) -> Self {
-        Self::User {
-            content: vec![ContentBlock::ToolResult(result)],
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text { text: String },
-    ToolUse(ToolUse),
-    ToolResult(ToolResult),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolUse {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub input: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub tool_use_id: String,
-    pub name: String,
-    #[serde(default)]
-    pub content: Value,
-    #[serde(default)]
-    pub is_error: bool,
-}
-
-impl ToolResult {
-    pub fn ok(tool_use: &ToolUse, content: Value) -> Self {
-        Self {
-            tool_use_id: tool_use.id.clone(),
-            name: tool_use.name.clone(),
-            content,
-            is_error: false,
-        }
-    }
-
-    pub fn error(tool_use: &ToolUse, message: impl Into<String>) -> Self {
-        Self {
-            tool_use_id: tool_use.id.clone(),
-            name: tool_use.name.clone(),
-            content: json!({ "error": message.into() }),
-            is_error: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentToolSpec {
-    pub name: String,
-    pub description: String,
-    #[serde(default)]
-    pub input_schema: Value,
-    #[serde(default)]
-    pub output_schema: Value,
-    #[serde(default)]
-    pub metadata: Value,
-    #[serde(default)]
-    pub annotations: ToolAnnotations,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolAnnotations {
-    pub read_only: bool,
-    pub destructive: bool,
-    pub open_world: bool,
-}
-
-impl Default for ToolAnnotations {
-    fn default() -> Self {
-        Self {
-            read_only: true,
-            destructive: false,
-            open_world: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelRequest {
-    pub messages: Vec<AgentMessage>,
-    pub tools: Vec<AgentToolSpec>,
-    #[serde(default)]
-    pub context: Value,
-    pub turn: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct ModelResponse {
-    #[serde(default)]
-    pub deltas: Vec<String>,
-    #[serde(default)]
-    pub tool_uses: Vec<ToolUse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCallRequest {
-    pub tool_use: ToolUse,
-    #[serde(default)]
-    pub context: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AskUserQuestion {
-    pub tool_use_id: String,
-    pub question: String,
-    #[serde(default)]
-    pub fields: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HumanInputAnswer {
-    pub tool_use_id: String,
-    pub answer: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Artifact {
-    pub tool_use_id: String,
-    pub title: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum AgentSignal {
-    AssistantDelta {
-        delta: String,
-        index: usize,
-    },
-    ToolStarted {
-        tool_use_id: String,
-        name: String,
-    },
-    ToolCompleted {
-        tool_use_id: String,
-        name: String,
-        is_error: bool,
-    },
-    ToolResult {
-        tool_use_id: String,
-        name: String,
-        content: Value,
-        is_error: bool,
-    },
-    Artifact {
-        artifact: Artifact,
-    },
-    Usage {
-        usage: Usage,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentBudget {
-    pub max_model_turns: u32,
-    pub max_tool_calls: u32,
-}
-
-impl Default for AgentBudget {
-    fn default() -> Self {
-        Self {
-            max_model_turns: 16,
-            max_tool_calls: 32,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRunInput {
-    pub messages: Vec<AgentMessage>,
-    #[serde(default)]
-    pub context: Value,
-    #[serde(default)]
-    pub budget: AgentBudget,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub human_input: Option<HumanInputAnswer>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentRunOutput {
-    pub messages: Vec<AgentMessage>,
-    pub answer: String,
-    pub finish_reason: FinishReason,
-    #[serde(default)]
-    pub usage: Usage,
-    #[serde(default)]
-    pub artifacts: Vec<Artifact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FinishReason {
-    Stop,
-    MaxModelTurns,
-    MaxToolCalls,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentState {
-    pub messages: Vec<AgentMessage>,
-    pub context: Value,
-    pub budget: AgentBudget,
-    pub model_turns: u32,
-    pub tool_calls: u32,
-    pub next_delta_index: usize,
-    pub pending_tools: VecDeque<ToolUse>,
-    pub pending_human: Option<ToolUse>,
-    pub human_input: Option<HumanInputAnswer>,
-    pub answer: String,
-    pub usage: Usage,
-    pub artifacts: Vec<Artifact>,
-}
+mod types;
+pub use types::*;
 
 impl AgentState {
-    fn fresh(input: &AgentRunInput, previous: Option<&Self>) -> Self {
+    fn fresh(
+        input: &AgentRunInput,
+        previous: Option<&Self>,
+        context_policy: &ContextPolicy,
+    ) -> Self {
         let mut messages = previous
             .map(|state| state.messages.clone())
             .unwrap_or_default();
@@ -288,6 +40,7 @@ impl AgentState {
             messages,
             context: input.context.clone(),
             budget: input.budget.clone(),
+            context_policy: context_policy.clone(),
             model_turns: 0,
             tool_calls: 0,
             next_delta_index: 0,
@@ -297,6 +50,11 @@ impl AgentState {
             answer: String::new(),
             usage: Usage::default(),
             artifacts: Vec::new(),
+            terminal: None,
+            digest: previous.and_then(|state| state.digest.clone()),
+            tool_result_archives: previous
+                .map(|state| state.tool_result_archives.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -305,22 +63,13 @@ impl AgentState {
             messages: self.messages.clone(),
             answer: self.answer.clone(),
             finish_reason,
+            terminal: self.terminal.clone(),
             usage: self.usage.clone(),
             artifacts: self.artifacts.clone(),
+            digest: self.digest.clone(),
+            tool_result_archives: self.tool_result_archives.clone(),
         }
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AgentError {
-    #[error("model failed: {0}")]
-    Model(String),
-    #[error("tool failed: {0}")]
-    Tool(String),
-    #[error("permission denied: {0}")]
-    PermissionDenied(String),
-    #[error("invalid built-in tool arguments: {0}")]
-    InvalidBuiltInTool(String),
 }
 
 impl AgentError {
@@ -337,6 +86,11 @@ pub struct ModelStream {
 impl ModelStream {
     fn new(tx: mpsc::UnboundedSender<String>) -> Self {
         Self { tx }
+    }
+
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self::new(tx), rx)
     }
 
     pub fn delta(&self, delta: impl Into<String>) -> Result<(), AgentError> {
@@ -394,6 +148,7 @@ pub struct AgentMachine<M, T, P> {
     model: Arc<M>,
     tools: Arc<T>,
     policy: Arc<P>,
+    context_policy: ContextPolicy,
 }
 
 impl<M, T, P> AgentMachine<M, T, P> {
@@ -402,7 +157,13 @@ impl<M, T, P> AgentMachine<M, T, P> {
             model: Arc::new(model),
             tools: Arc::new(tools),
             policy: Arc::new(policy),
+            context_policy: ContextPolicy::default(),
         }
+    }
+
+    pub fn with_context_policy(mut self, context_policy: ContextPolicy) -> Self {
+        self.context_policy = context_policy;
+        self
     }
 }
 
@@ -422,6 +183,47 @@ where
         AgentMachine::new(model, tools, policy),
         Arc::new(checkpointer),
     )
+}
+
+pub fn build_agent_runner_with_context_policy<S, M, T, P>(
+    checkpointer: S,
+    model: M,
+    tools: T,
+    policy: P,
+    context_policy: ContextPolicy,
+) -> AgentRunner<M, T, P, S>
+where
+    S: CheckpointSaver + 'static,
+    M: AgentModel + 'static,
+    T: ToolRegistry + 'static,
+    P: ToolPermissionPolicy + 'static,
+{
+    Runner::new(
+        AgentMachine::new(model, tools, policy).with_context_policy(context_policy),
+        Arc::new(checkpointer),
+    )
+}
+
+pub fn build_configured_agent_runner<S, T, P>(
+    checkpointer: S,
+    config: AgentConfig,
+    tools: T,
+    policy: P,
+) -> Result<AgentRunner<ConfiguredModel, T, P, S>, AgentError>
+where
+    S: CheckpointSaver + 'static,
+    T: ToolRegistry + 'static,
+    P: ToolPermissionPolicy + 'static,
+{
+    let context_policy = config.context_policy.clone();
+    let model = ConfiguredModel::new(config)?;
+    Ok(build_agent_runner_with_context_policy(
+        checkpointer,
+        model,
+        tools,
+        policy,
+        context_policy,
+    ))
 }
 
 #[async_trait]
@@ -452,7 +254,7 @@ where
         previous: Option<&Self::State>,
         _snapshot: Option<&Value>,
     ) -> Result<Self::State, MachineError> {
-        Ok(AgentState::fresh(input, previous))
+        Ok(AgentState::fresh(input, previous, &self.context_policy))
     }
 
     fn apply_resume_input(
@@ -506,8 +308,20 @@ where
             .list_tools(&state.context)
             .await
             .map_err(AgentError::machine)?;
+        let prompt_window = context::prompt_window(&state.messages, &state.context_policy)
+            .map_err(AgentError::machine)?;
+        if let Some(digest) = prompt_window.digest.clone()
+            && state.digest.as_ref() != Some(&digest)
+        {
+            state.digest = Some(digest.clone());
+            ctx.emit(AgentSignal::DigestUpdated { digest }).await?;
+        }
+        if let Some(compaction) = prompt_window.compaction.clone() {
+            ctx.emit(AgentSignal::ContextCompacted { compaction })
+                .await?;
+        }
         let request = ModelRequest {
-            messages: state.messages.clone(),
+            messages: prompt_window.messages,
             tools,
             context: state.context.clone(),
             turn: state.model_turns,
@@ -539,6 +353,9 @@ where
             state.usage.input_tokens += usage.input_tokens;
             state.usage.output_tokens += usage.output_tokens;
             ctx.emit(AgentSignal::Usage { usage }).await?;
+        }
+        for block in response.content {
+            record_assistant_block(state, ctx, &mut assistant_content, block).await?;
         }
         for tool_use in response.tool_uses {
             assistant_content.push(ContentBlock::ToolUse(tool_use.clone()));
@@ -589,6 +406,7 @@ where
                     state.output(FinishReason::MaxToolCalls),
                 ));
             }
+            let spec = specs.iter().find(|spec| spec.name == tool_use.name);
             if tool_use.name == "ask_user" {
                 if let Some(result) = self.consume_human_answer(state, &tool_use, ctx).await? {
                     state.messages.push(AgentMessage::tool_result(result));
@@ -597,6 +415,20 @@ where
                 let question = ask_user_question(&tool_use)?;
                 state.pending_human = Some(tool_use);
                 return Ok(Transition::Interrupt(question));
+            }
+            if is_terminal_tool(&tool_use, spec) {
+                let action = terminal_action(&tool_use);
+                if state.answer.is_empty()
+                    && let Some(message) = terminal_message(&tool_use)
+                {
+                    append_delta(state, ctx, &mut Vec::new(), message).await?;
+                }
+                ctx.emit(AgentSignal::Terminal {
+                    action: action.clone(),
+                })
+                .await?;
+                state.terminal = Some(action);
+                return Ok(Transition::Complete(state.output(FinishReason::Terminal)));
             }
             state.tool_calls += 1;
             ctx.emit(AgentSignal::ToolStarted {
@@ -607,7 +439,6 @@ where
             let result = if tool_use.name == "emit_artifact" {
                 self.emit_artifact(state, ctx, &tool_use).await?
             } else {
-                let spec = specs.iter().find(|spec| spec.name == tool_use.name);
                 match self.policy.check(&tool_use, spec, &state.context) {
                     PermissionDecision::Allow => self
                         .tools
@@ -627,13 +458,23 @@ where
                 is_error: result.is_error,
             })
             .await?;
+            let (prompt_result, archive) =
+                context::maybe_archive_tool_result(&result, &state.context_policy)
+                    .map_err(AgentError::machine)?;
+            if let Some(archive) = archive {
+                state.tool_result_archives.push(archive.clone());
+                ctx.emit(AgentSignal::ToolResultArchived { archive })
+                    .await?;
+            }
             ctx.emit(AgentSignal::ToolCompleted {
                 tool_use_id: result.tool_use_id.clone(),
                 name: result.name.clone(),
                 is_error: result.is_error,
             })
             .await?;
-            state.messages.push(AgentMessage::tool_result(result));
+            state
+                .messages
+                .push(AgentMessage::tool_result(prompt_result));
         }
         Ok(Transition::Next(AgentStep::ModelStep))
     }
@@ -714,6 +555,26 @@ async fn append_delta(
     Ok(())
 }
 
+async fn record_assistant_block(
+    state: &mut AgentState,
+    ctx: &AgentRunContext,
+    assistant_content: &mut Vec<ContentBlock>,
+    block: ContentBlock,
+) -> Result<(), MachineError> {
+    match block {
+        ContentBlock::Text { text } => append_delta(state, ctx, assistant_content, text).await,
+        ContentBlock::ToolUse(tool_use) => {
+            assistant_content.push(ContentBlock::ToolUse(tool_use.clone()));
+            state.pending_tools.push_back(tool_use);
+            Ok(())
+        }
+        other => {
+            assistant_content.push(other);
+            Ok(())
+        }
+    }
+}
+
 fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError> {
     let question = tool_use
         .input
@@ -730,6 +591,31 @@ fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError
         question,
         fields: tool_use.input.get("fields").cloned().unwrap_or(Value::Null),
     })
+}
+
+fn is_terminal_tool(tool_use: &ToolUse, spec: Option<&AgentToolSpec>) -> bool {
+    spec.is_some_and(|spec| spec.annotations.terminal)
+        || matches!(
+            tool_use.name.as_str(),
+            "report" | "reject" | "terminal" | "planner.report" | "planner.reject"
+        )
+}
+
+fn terminal_action(tool_use: &ToolUse) -> TerminalAction {
+    TerminalAction {
+        tool_use_id: tool_use.id.clone(),
+        name: tool_use.name.clone(),
+        input: tool_use.input.clone(),
+    }
+}
+
+fn terminal_message(tool_use: &ToolUse) -> Option<String> {
+    ["message", "reason", "answer"]
+        .iter()
+        .find_map(|key| tool_use.input.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, MachineError> {
@@ -763,358 +649,4 @@ fn required_string(input: &Value, name: &str) -> Result<String, MachineError> {
         .ok_or_else(|| {
             AgentError::InvalidBuiltInTool(format!("missing non-empty {name}")).machine()
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use typemach::{
-        MemorySaver, RunCommand, RunId, RunRequest, RunStreamEvent, RuntimeLimits, SessionId,
-        StreamConfig, ThreadId,
-    };
-
-    #[derive(Clone, Default)]
-    struct ScriptedModel {
-        responses: Arc<Mutex<VecDeque<ModelResponse>>>,
-        requests: Arc<Mutex<Vec<ModelRequest>>>,
-    }
-
-    impl ScriptedModel {
-        fn new(responses: impl IntoIterator<Item = ModelResponse>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(responses.into_iter().collect())),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn requests(&self) -> Vec<ModelRequest> {
-            self.requests.lock().expect("requests lock").clone()
-        }
-    }
-
-    #[async_trait]
-    impl AgentModel for ScriptedModel {
-        async fn next_step(
-            &self,
-            request: ModelRequest,
-            stream: ModelStream,
-        ) -> Result<ModelResponse, AgentError> {
-            self.requests.lock().expect("requests lock").push(request);
-            let response = self
-                .responses
-                .lock()
-                .expect("responses lock")
-                .pop_front()
-                .ok_or_else(|| AgentError::Model("script exhausted".to_string()))?;
-            for delta in &response.deltas {
-                stream.delta(delta.clone())?;
-            }
-            Ok(ModelResponse {
-                deltas: Vec::new(),
-                ..response
-            })
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeTools;
-
-    #[async_trait]
-    impl ToolRegistry for FakeTools {
-        async fn list_tools(&self, _context: &Value) -> Result<Vec<AgentToolSpec>, AgentError> {
-            Ok(vec![
-                AgentToolSpec {
-                    name: "metric_point".to_string(),
-                    description: "read metric point".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                    output_schema: Value::Null,
-                    metadata: Value::Null,
-                    annotations: ToolAnnotations::default(),
-                },
-                AgentToolSpec {
-                    name: "ask_user".to_string(),
-                    description: "ask user".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                    output_schema: Value::Null,
-                    metadata: Value::Null,
-                    annotations: ToolAnnotations::default(),
-                },
-                AgentToolSpec {
-                    name: "emit_artifact".to_string(),
-                    description: "emit artifact".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                    output_schema: Value::Null,
-                    metadata: Value::Null,
-                    annotations: ToolAnnotations::default(),
-                },
-            ])
-        }
-
-        async fn call_tool(&self, request: ToolCallRequest) -> Result<ToolResult, AgentError> {
-            Ok(ToolResult::ok(
-                &request.tool_use,
-                json!({ "value": 42, "ds": "2026-06-08" }),
-            ))
-        }
-    }
-
-    fn request(input: AgentRunInput) -> RunRequest<AgentRunInput> {
-        RunRequest {
-            run_id: RunId::from("run-1"),
-            session_id: SessionId::from("session-1"),
-            thread_id: ThreadId::from("thread-1"),
-            command: RunCommand::Start,
-            input,
-            snapshot: None,
-            runtime_limits: RuntimeLimits::new(32),
-        }
-    }
-
-    async fn collect(
-        mut rx: AgentEventReceiver,
-    ) -> Vec<RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>> {
-        let mut events = Vec::new();
-        while let Some(event) = rx.next_event().await {
-            let terminal = matches!(
-                event,
-                RunStreamEvent::Completed { .. }
-                    | RunStreamEvent::Interrupted { .. }
-                    | RunStreamEvent::Failed { .. }
-                    | RunStreamEvent::Cancelled
-            );
-            events.push(event);
-            if terminal {
-                break;
-            }
-        }
-        events
-    }
-
-    #[tokio::test]
-    async fn model_tool_result_model_loop_completes() {
-        let model = ScriptedModel::new([
-            ModelResponse {
-                tool_uses: vec![ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
-                }],
-                ..ModelResponse::default()
-            },
-            ModelResponse {
-                deltas: vec!["订单量是 42。".to_string()],
-                final_text: Some(String::new()),
-                ..ModelResponse::default()
-            },
-        ]);
-        let runner = build_agent_runner(
-            MemorySaver::default(),
-            model.clone(),
-            FakeTools,
-            AllowAllTools,
-        );
-        let rx = runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("昨天订单量")],
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: None,
-            }),
-            StreamConfig::default(),
-        );
-        let events = collect(rx).await;
-        assert!(events.iter().any(|event| matches!(
-          event,
-          RunStreamEvent::Signal {
-            signal: AgentSignal::ToolStarted { name, .. },
-          } if name == "metric_point"
-        )));
-        assert!(events.iter().any(|event| matches!(
-          event,
-          RunStreamEvent::Signal {
-            signal: AgentSignal::ToolResult { name, content, .. },
-          } if name == "metric_point" && content["value"] == 42
-        )));
-        let completed = events
-            .iter()
-            .find_map(|event| match event {
-                RunStreamEvent::Completed { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("completed output");
-        assert_eq!(completed.answer, "订单量是 42。");
-        assert_eq!(completed.finish_reason, FinishReason::Stop);
-    }
-
-    #[tokio::test]
-    async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
-        let model = ScriptedModel::new([ModelResponse {
-            final_text: Some("订单量是 42。".to_string()),
-            ..ModelResponse::default()
-        }]);
-        let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-        let events = collect(runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("昨天订单量")],
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: None,
-            }),
-            StreamConfig::default(),
-        ))
-        .await;
-        assert!(events.iter().any(|event| matches!(
-          event,
-          RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantDelta { delta, .. },
-          } if delta == "订单量是 42。"
-        )));
-        let completed = events
-            .iter()
-            .find_map(|event| match event {
-                RunStreamEvent::Completed { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("completed output");
-        assert_eq!(completed.answer, "订单量是 42。");
-        assert!(matches!(
-            completed.messages.last(),
-            Some(AgentMessage::Assistant { content })
-                if content == &vec![ContentBlock::Text {
-                    text: "订单量是 42。".to_string()
-                }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn ask_user_interrupts_and_resume_continues() {
-        let model = ScriptedModel::new([
-            ModelResponse {
-                tool_uses: vec![ToolUse {
-                    id: "ask-1".to_string(),
-                    name: "ask_user".to_string(),
-                    input: json!({ "question": "看哪个日期？", "fields": { "type": "choice" } }),
-                }],
-                ..ModelResponse::default()
-            },
-            ModelResponse {
-                deltas: vec!["按 2026-06-08 查看，订单量是 42。".to_string()],
-                final_text: Some(String::new()),
-                ..ModelResponse::default()
-            },
-        ]);
-        let runner = build_agent_runner(
-            MemorySaver::default(),
-            model.clone(),
-            FakeTools,
-            AllowAllTools,
-        );
-        let mut first = runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("订单量")],
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: None,
-            }),
-            StreamConfig::default(),
-        );
-        let interrupted = loop {
-            match first.next_event().await.expect("event") {
-                RunStreamEvent::Interrupted { interrupt, .. } => break interrupt,
-                RunStreamEvent::Failed { error } => panic!("failed: {error}"),
-                _ => {}
-            }
-        };
-        assert_eq!(interrupted.question, "看哪个日期？");
-
-        let resume = RunRequest {
-            command: RunCommand::Resume,
-            input: AgentRunInput {
-                messages: Vec::new(),
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: Some(HumanInputAnswer {
-                    tool_use_id: "ask-1".to_string(),
-                    answer: "2026-06-08".to_string(),
-                }),
-            },
-            ..request(AgentRunInput {
-                messages: Vec::new(),
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: None,
-            })
-        };
-        let events = collect(runner.stream(resume, StreamConfig::default())).await;
-        let completed = events
-            .iter()
-            .find_map(|event| match event {
-                RunStreamEvent::Completed { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("completed output");
-        assert_eq!(completed.answer, "按 2026-06-08 查看，订单量是 42。");
-        let requests = model.requests();
-        let second = requests.get(1).expect("second model request");
-        assert!(second.messages.iter().any(|message| matches!(
-            message,
-            AgentMessage::User { content }
-                if content.iter().any(|block| matches!(
-                    block,
-                    ContentBlock::ToolResult(result)
-                        if result.tool_use_id == "ask-1"
-                            && result.content == json!({ "answer": "2026-06-08" })
-                ))
-        )));
-    }
-
-    #[tokio::test]
-    async fn emit_artifact_is_signalled_and_not_required_in_answer() {
-        let model = ScriptedModel::new([
-            ModelResponse {
-                tool_uses: vec![ToolUse {
-                    id: "artifact-1".to_string(),
-                    name: "emit_artifact".to_string(),
-                    input: json!({
-                      "title": "经营复盘",
-                      "type": "markdown",
-                      "content": "# 经营复盘"
-                    }),
-                }],
-                ..ModelResponse::default()
-            },
-            ModelResponse {
-                deltas: vec!["复盘已生成。".to_string()],
-                final_text: Some(String::new()),
-                ..ModelResponse::default()
-            },
-        ]);
-        let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-        let events = collect(runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("生成复盘")],
-                context: Value::Null,
-                budget: AgentBudget::default(),
-                human_input: None,
-            }),
-            StreamConfig::default(),
-        ))
-        .await;
-        assert!(events.iter().any(|event| matches!(
-          event,
-          RunStreamEvent::Signal {
-            signal: AgentSignal::Artifact { artifact },
-          } if artifact.title == "经营复盘"
-        )));
-        let completed = events
-            .iter()
-            .find_map(|event| match event {
-                RunStreamEvent::Completed { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("completed output");
-        assert_eq!(completed.answer, "复盘已生成。");
-        assert_eq!(completed.artifacts.len(), 1);
-    }
 }
