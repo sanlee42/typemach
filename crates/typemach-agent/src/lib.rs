@@ -668,11 +668,23 @@ fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, MachineError> {
         title,
         kind,
         content,
+        source: optional_string(&tool_use.input, "source"),
+        window: optional_string(&tool_use.input, "window"),
+        updated_at: optional_string(&tool_use.input, "updated_at"),
     })
 }
 
 fn is_text_block(block: &ContentBlock) -> bool {
     matches!(block, ContentBlock::Text { .. })
+}
+
+fn optional_string(input: &Value, name: &str) -> Option<String> {
+    input
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn required_string(input: &Value, name: &str) -> Result<String, MachineError> {

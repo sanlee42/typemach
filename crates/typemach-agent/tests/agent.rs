@@ -339,7 +339,10 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
                 input: json!({
                   "title": "经营复盘",
                   "type": "markdown",
-                  "content": "# 经营复盘"
+                  "content": "# 经营复盘",
+                  "source": "stonex metric_point",
+                  "window": "2026-06-01 ~ 2026-06-07",
+                  "updated_at": "2026-06-08T09:00:00+08:00"
                 }),
                 raw: None,
             }],
@@ -367,6 +370,9 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
       RunStreamEvent::Signal {
         signal: AgentSignal::Artifact { artifact },
       } if artifact.title == "经营复盘"
+          && artifact.source.as_deref() == Some("stonex metric_point")
+          && artifact.window.as_deref() == Some("2026-06-01 ~ 2026-06-07")
+          && artifact.updated_at.as_deref() == Some("2026-06-08T09:00:00+08:00")
     )));
     let completed = completed(&events);
     assert_eq!(completed.answer, "复盘已生成。");
