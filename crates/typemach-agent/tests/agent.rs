@@ -197,6 +197,7 @@ async fn model_tool_result_model_loop_completes() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     );
@@ -231,6 +232,7 @@ async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -282,6 +284,7 @@ async fn ask_user_interrupts_and_resume_continues() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     );
@@ -304,12 +307,14 @@ async fn ask_user_interrupts_and_resume_continues() {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
             }),
+            system_suffix: None,
         },
         ..request(AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         })
     };
     let events = collect(runner.stream(resume, StreamConfig::default())).await;
@@ -361,6 +366,7 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -420,6 +426,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -458,6 +465,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -508,6 +516,7 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -566,6 +575,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -651,6 +661,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     );
@@ -670,6 +681,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
+            system_suffix: None,
         }),
         StreamConfig::default(),
     ))
@@ -711,6 +723,81 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
         })
         .expect("new user message");
     assert!(repaired_index < new_message_index);
+}
+
+#[tokio::test]
+async fn system_suffix_reaches_model_request_and_survives_resume() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            tool_uses: vec![ToolUse {
+                id: "ask-1".to_string(),
+                name: "ask_user".to_string(),
+                input: json!({ "question": "看哪个日期？" }),
+                raw: None,
+            }],
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            final_text: Some("好的。".to_string()),
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        FakeTools,
+        AllowAllTools,
+    );
+    let mut first = runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("订单量")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: Some("当前店铺:A".to_string()),
+        }),
+        StreamConfig::default(),
+    );
+    loop {
+        match first.next_event().await.expect("event") {
+            RunStreamEvent::Interrupted { .. } => break,
+            RunStreamEvent::Failed { error } => panic!("failed: {error}"),
+            _ => {}
+        }
+    }
+    let resume = RunRequest {
+        command: RunCommand::Resume,
+        input: AgentRunInput {
+            messages: Vec::new(),
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: Some(HumanInputAnswer {
+                tool_use_id: "ask-1".to_string(),
+                answer: "2026-06-08".to_string(),
+            }),
+            system_suffix: Some("当前店铺:B".to_string()),
+        },
+        ..request(AgentRunInput {
+            messages: Vec::new(),
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        })
+    };
+    let events = collect(runner.stream(resume, StreamConfig::default())).await;
+    completed(&events);
+    let requests = model.requests();
+    assert_eq!(
+        requests[0].system_suffix.as_deref(),
+        Some("当前店铺:A"),
+        "start carries the per-run suffix"
+    );
+    assert_eq!(
+        requests[1].system_suffix.as_deref(),
+        Some("当前店铺:B"),
+        "resume refreshes the suffix"
+    );
 }
 
 fn completed(

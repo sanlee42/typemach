@@ -43,6 +43,7 @@ async fn flash_request_omits_thinking_and_decodes_tool_call() {
                 tools: vec![tool_spec()],
                 context: Value::Null,
                 turn: 1,
+                system_suffix: None,
             },
             stream,
         )
@@ -136,6 +137,7 @@ async fn streaming_emits_text_and_assembles_tool_call() {
                 tools: vec![tool_spec()],
                 context: Value::Null,
                 turn: 1,
+                system_suffix: None,
             },
             stream,
         )
@@ -155,6 +157,77 @@ async fn streaming_emits_text_and_assembles_tool_call() {
             if tool.id == "call-2"
                 && tool.input["metric_id"] == "paid_order_count"
     )));
+}
+
+#[tokio::test]
+async fn system_suffix_is_appended_to_system_message() {
+    let response = json!({
+        "id": "chatcmpl-3",
+        "choices": [{
+            "message": { "content": "好的" },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, captured) = spawn_server(response, "application/json").await;
+    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
+    config.base_url = base_url;
+    config.stream = false;
+    config.system = Some("你是经营分析助手。".to_string());
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    model
+        .next_step(
+            ModelRequest {
+                messages: vec![AgentMessage::user_text("订单量")],
+                tools: Vec::new(),
+                context: Value::Null,
+                turn: 1,
+                system_suffix: Some("当前店铺:demo。".to_string()),
+            },
+            stream,
+        )
+        .await
+        .expect("response");
+
+    let body = captured_json(&captured);
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(
+        body["messages"][0]["content"],
+        "你是经营分析助手。\n\n当前店铺:demo。"
+    );
+
+    // Without a static base prompt the suffix becomes the whole system message.
+    let response = json!({
+        "id": "chatcmpl-4",
+        "choices": [{
+            "message": { "content": "好的" },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, captured) = spawn_server(response, "application/json").await;
+    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
+    config.base_url = base_url;
+    config.stream = false;
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    model
+        .next_step(
+            ModelRequest {
+                messages: vec![AgentMessage::user_text("订单量")],
+                tools: Vec::new(),
+                context: Value::Null,
+                turn: 1,
+                system_suffix: Some("当前店铺:demo。".to_string()),
+            },
+            stream,
+        )
+        .await
+        .expect("response");
+    let body = captured_json(&captured);
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][0]["content"], "当前店铺:demo。");
 }
 
 fn tool_spec() -> AgentToolSpec {

@@ -176,11 +176,7 @@ fn headers(config: &AgentConfig) -> Result<HeaderMap, AgentError> {
 
 fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatRequest, AgentError> {
     let mut messages = Vec::new();
-    if let Some(system) = config
-        .system
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(system) = combined_system(config, &request) {
         messages.push(json!({ "role": "system", "content": system }));
     }
     messages.extend(messages_to_chat(&request.messages)?);
@@ -196,6 +192,25 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
         thinking,
         max_tokens: config.max_tokens,
     })
+}
+
+fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<String> {
+    let base = config
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let suffix = request
+        .system_suffix
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (base, suffix) {
+        (Some(base), Some(suffix)) => Some(format!("{base}\n\n{suffix}")),
+        (Some(base), None) => Some(base.to_string()),
+        (None, Some(suffix)) => Some(suffix.to_string()),
+        (None, None) => None,
+    }
 }
 
 fn thinking_body(config: &AgentConfig) -> Option<Value> {

@@ -42,6 +42,7 @@ impl AgentState {
             context: input.context.clone(),
             budget: input.budget.clone(),
             context_policy: context_policy.clone(),
+            system_suffix: input.system_suffix.clone(),
             model_turns: 0,
             tool_calls: 0,
             next_delta_index: 0,
@@ -265,6 +266,7 @@ where
     ) -> Result<(), MachineError> {
         state.human_input = input.human_input.clone();
         state.context = input.context.clone();
+        state.system_suffix = input.system_suffix.clone();
         if state.human_input.is_some()
             && let Some(tool_use) = state.pending_human.take()
         {
@@ -326,6 +328,7 @@ where
             tools,
             context: state.context.clone(),
             turn: state.model_turns,
+            system_suffix: state.system_suffix.clone(),
         };
         let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
         let response = self.model.next_step(request, ModelStream::new(delta_tx));

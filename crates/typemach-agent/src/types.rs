@@ -146,6 +146,8 @@ pub struct ModelRequest {
     #[serde(default)]
     pub context: Value,
     pub turn: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -469,6 +471,10 @@ pub struct AgentRunInput {
     pub budget: AgentBudget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_input: Option<HumanInputAnswer>,
+    /// Per-run system prompt addition (e.g. shop scope), appended after the
+    /// model's static system prompt. Re-supplied on every Start and Resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -504,6 +510,8 @@ pub struct AgentState {
     pub budget: AgentBudget,
     #[serde(default)]
     pub context_policy: ContextPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_suffix: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
     pub next_delta_index: usize,
