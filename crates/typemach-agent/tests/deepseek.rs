@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -228,6 +229,318 @@ async fn system_suffix_is_appended_to_system_message() {
     let body = captured_json(&captured);
     assert_eq!(body["messages"][0]["role"], "system");
     assert_eq!(body["messages"][0]["content"], "当前店铺:demo。");
+}
+
+fn ok_chat_body(text: &str) -> String {
+    json!({
+        "id": "chatcmpl-ok",
+        "choices": [{
+            "message": { "content": text },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string()
+}
+
+fn flash_config(base_url: String, stream: bool) -> AgentConfig {
+    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
+    config.base_url = base_url;
+    config.stream = stream;
+    config
+}
+
+fn plain_request() -> ModelRequest {
+    ModelRequest {
+        messages: vec![AgentMessage::user_text("订单量")],
+        tools: Vec::new(),
+        context: Value::Null,
+        turn: 1,
+        system_suffix: None,
+    }
+}
+
+#[tokio::test]
+async fn retries_429_then_succeeds() {
+    let (base_url, captured) = spawn_script_server(vec![
+        MockTurn {
+            status: 429,
+            retry_after: Some(0),
+            content_type: "application/json",
+            body: json!({ "error": "rate limited" }).to_string(),
+            delivery: Delivery::Complete,
+        },
+        MockTurn {
+            status: 200,
+            retry_after: None,
+            content_type: "application/json",
+            body: ok_chat_body("好的"),
+            delivery: Delivery::Complete,
+        },
+    ])
+    .await;
+    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    let response = model.next_step(plain_request(), stream).await.expect("ok");
+    assert!(response.content.iter().any(|block| matches!(
+        block,
+        ContentBlock::Text { text } if text == "好的"
+    )));
+    assert_eq!(captured.lock().expect("captured").len(), 2);
+}
+
+#[tokio::test]
+async fn retries_500_then_succeeds() {
+    let (base_url, captured) = spawn_script_server(vec![
+        MockTurn {
+            status: 500,
+            retry_after: None,
+            content_type: "application/json",
+            body: json!({ "error": "boom" }).to_string(),
+            delivery: Delivery::Complete,
+        },
+        MockTurn {
+            status: 200,
+            retry_after: None,
+            content_type: "application/json",
+            body: ok_chat_body("好的"),
+            delivery: Delivery::Complete,
+        },
+    ])
+    .await;
+    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    model.next_step(plain_request(), stream).await.expect("ok");
+    assert_eq!(captured.lock().expect("captured").len(), 2);
+}
+
+#[tokio::test]
+async fn does_not_retry_400() {
+    let (base_url, captured) = spawn_script_server(vec![MockTurn {
+        status: 400,
+        retry_after: None,
+        content_type: "application/json",
+        body: json!({ "error": "bad tool schema" }).to_string(),
+        delivery: Delivery::Complete,
+    }])
+    .await;
+    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    let err = model
+        .next_step(plain_request(), stream)
+        .await
+        .expect_err("must fail fast");
+    let message = err.to_string();
+    assert!(message.contains("after 1 attempts"), "{message}");
+    assert!(message.contains("bad tool schema"), "{message}");
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+}
+
+#[tokio::test]
+async fn retries_dead_stream_before_first_delta() {
+    let broken = sse_line(&json!({
+        "id": "chatcmpl-x",
+        "choices": [{
+            "delta": { "reasoning_content": "th" },
+            "finish_reason": null
+        }]
+    }));
+    let healthy = sse([
+        json!({
+            "id": "chatcmpl-y",
+            "choices": [{
+                "delta": { "content": "订单量 42。" },
+                "finish_reason": null
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-y",
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }),
+    ]);
+    let cut = broken.len();
+    let (base_url, captured) = spawn_script_server(vec![
+        MockTurn {
+            status: 200,
+            retry_after: None,
+            content_type: "text/event-stream",
+            body: broken,
+            delivery: Delivery::TruncateAfter(cut),
+        },
+        MockTurn {
+            status: 200,
+            retry_after: None,
+            content_type: "text/event-stream",
+            body: healthy,
+            delivery: Delivery::Complete,
+        },
+    ])
+    .await;
+    let model = ConfiguredModel::new(flash_config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    model.next_step(plain_request(), stream).await.expect("ok");
+    assert_eq!(rx.recv().await.as_deref(), Some("订单量 42。"));
+    assert_eq!(captured.lock().expect("captured").len(), 2);
+}
+
+#[tokio::test]
+async fn does_not_retry_after_first_delta() {
+    let body = sse_line(&json!({
+        "id": "chatcmpl-x",
+        "choices": [{
+            "delta": { "content": "订单" },
+            "finish_reason": null
+        }]
+    }));
+    let cut = body.len();
+    let (base_url, captured) = spawn_script_server(vec![MockTurn {
+        status: 200,
+        retry_after: None,
+        content_type: "text/event-stream",
+        body,
+        delivery: Delivery::TruncateAfter(cut),
+    }])
+    .await;
+    let model = ConfiguredModel::new(flash_config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    let err = model
+        .next_step(plain_request(), stream)
+        .await
+        .expect_err("must not retry");
+    assert!(err.to_string().contains("after 1 attempts"), "{err}");
+    assert_eq!(rx.recv().await.as_deref(), Some("订单"));
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+}
+
+#[tokio::test]
+async fn stream_idle_gap_aborts_with_small_timeout() {
+    let head = sse_line(&json!({
+        "id": "chatcmpl-x",
+        "choices": [{
+            "delta": { "content": "订单" },
+            "finish_reason": null
+        }]
+    }));
+    let cut = head.len();
+    let mut body = head;
+    body.push_str(&sse_line(&json!({
+        "id": "chatcmpl-x",
+        "choices": [{
+            "delta": { "content": "量" },
+            "finish_reason": "stop"
+        }]
+    })));
+    body.push_str("data: [DONE]\n\n");
+    let (base_url, captured) = spawn_script_server(vec![MockTurn {
+        status: 200,
+        retry_after: None,
+        content_type: "text/event-stream",
+        body,
+        delivery: Delivery::PauseAt(cut, Duration::from_millis(2500)),
+    }])
+    .await;
+    let mut config = flash_config(base_url, true);
+    config.request_timeout_secs = 1;
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    let err = model
+        .next_step(plain_request(), stream)
+        .await
+        .expect_err("idle gap must abort");
+    assert!(err.to_string().contains("after 1 attempts"), "{err}");
+    assert_eq!(rx.recv().await.as_deref(), Some("订单"));
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+}
+
+#[tokio::test]
+async fn exhausts_attempts_and_reports_count() {
+    let unavailable = || MockTurn {
+        status: 503,
+        retry_after: Some(0),
+        content_type: "application/json",
+        body: json!({ "error": "overloaded" }).to_string(),
+        delivery: Delivery::Complete,
+    };
+    let (base_url, captured) =
+        spawn_script_server(vec![unavailable(), unavailable(), unavailable()]).await;
+    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    let err = model
+        .next_step(plain_request(), stream)
+        .await
+        .expect_err("must exhaust");
+    assert!(err.to_string().contains("after 3 attempts"), "{err}");
+    assert_eq!(captured.lock().expect("captured").len(), 3);
+}
+
+enum Delivery {
+    Complete,
+    /// Advertise more bytes than sent, then close: the client observes a
+    /// transport error mid-body.
+    TruncateAfter(usize),
+    /// Send the first N bytes, stall, then send the rest.
+    PauseAt(usize, Duration),
+}
+
+struct MockTurn {
+    status: u16,
+    retry_after: Option<u64>,
+    content_type: &'static str,
+    body: String,
+    delivery: Delivery,
+}
+
+fn sse_line(chunk: &Value) -> String {
+    format!("data: {chunk}\n\n")
+}
+
+async fn spawn_script_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_task = Arc::clone(&captured);
+    tokio::spawn(async move {
+        for turn in turns {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_request(&mut socket).await;
+            captured_for_task
+                .lock()
+                .expect("captured lock")
+                .push(request);
+            let bytes = turn.body.as_bytes();
+            let advertised = match turn.delivery {
+                Delivery::TruncateAfter(_) => bytes.len() + 64,
+                _ => bytes.len(),
+            };
+            let mut header = format!(
+                "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {advertised}\r\n",
+                turn.status, turn.content_type
+            );
+            if let Some(seconds) = turn.retry_after {
+                header.push_str(&format!("retry-after: {seconds}\r\n"));
+            }
+            header.push_str("connection: close\r\n\r\n");
+            socket.write_all(header.as_bytes()).await.expect("header");
+            match turn.delivery {
+                Delivery::Complete => socket.write_all(bytes).await.expect("body"),
+                Delivery::TruncateAfter(cut) => {
+                    let cut = cut.min(bytes.len());
+                    socket.write_all(&bytes[..cut]).await.expect("body head");
+                    socket.flush().await.expect("flush");
+                }
+                Delivery::PauseAt(cut, pause) => {
+                    let cut = cut.min(bytes.len());
+                    socket.write_all(&bytes[..cut]).await.expect("body head");
+                    socket.flush().await.expect("flush");
+                    tokio::time::sleep(pause).await;
+                    let _ = socket.write_all(&bytes[cut..]).await;
+                }
+            }
+        }
+    });
+    (format!("http://{addr}"), captured)
 }
 
 fn tool_spec() -> AgentToolSpec {

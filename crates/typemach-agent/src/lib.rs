@@ -83,11 +83,15 @@ impl AgentError {
 #[derive(Clone)]
 pub struct ModelStream {
     tx: mpsc::UnboundedSender<String>,
+    emitted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ModelStream {
     fn new(tx: mpsc::UnboundedSender<String>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            emitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
     }
 
     pub fn channel() -> (Self, mpsc::UnboundedReceiver<String>) {
@@ -98,7 +102,16 @@ impl ModelStream {
     pub fn delta(&self, delta: impl Into<String>) -> Result<(), AgentError> {
         self.tx
             .send(delta.into())
-            .map_err(|_| AgentError::Model("model delta stream closed".to_string()))
+            .map_err(|_| AgentError::Model("model delta stream closed".to_string()))?;
+        self.emitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Number of deltas already delivered downstream. Retry logic uses this
+    /// to refuse re-sending a response the user has partially seen.
+    pub(crate) fn emitted(&self) -> usize {
+        self.emitted.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

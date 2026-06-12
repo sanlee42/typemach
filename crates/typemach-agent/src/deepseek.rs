@@ -22,8 +22,12 @@ pub struct ConfiguredModel {
 impl ConfiguredModel {
     pub fn new(config: AgentConfig) -> Result<Self, AgentError> {
         validate_config(&config)?;
+        // A total-request timeout would kill healthy long streams, so the
+        // client only bounds connect latency and the idle gap between
+        // chunks; non-streaming calls add a per-request total in attempt().
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(|err| AgentError::Config(format!("failed to build HTTP client: {err}")))?;
         let endpoint = chat_endpoint(&config.base_url);
@@ -53,30 +57,107 @@ impl AgentModel for ConfiguredModel {
         stream: ModelStream,
     ) -> Result<ModelResponse, AgentError> {
         let body = chat_request(&self.config, request)?;
-        let response = self
-            .client
-            .post(&self.endpoint)
-            .headers(headers(&self.config)?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| AgentError::Model(format!("model request failed: {err}")))?;
+        let max_attempts = self.config.max_retries.saturating_add(1);
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            let emitted_before = stream.emitted();
+            let failure = match self.attempt(&body, &stream).await {
+                Ok(response) => return Ok(response),
+                Err(failure) => failure,
+            };
+            // Never replay a response the user has partially seen: once a
+            // delta went out, the failure is final.
+            let streamed = stream.emitted() > emitted_before;
+            if !failure.retryable || streamed || attempt >= max_attempts {
+                return Err(AgentError::Model(format!(
+                    "model request failed after {attempt} attempts: {}",
+                    failure.message
+                )));
+            }
+            tokio::time::sleep(retry_delay(attempt, failure.retry_after)).await;
+        }
+    }
+}
+
+struct AttemptFailure {
+    message: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl ConfiguredModel {
+    async fn attempt(
+        &self,
+        body: &ChatRequest,
+        stream: &ModelStream,
+    ) -> Result<ModelResponse, AttemptFailure> {
+        let headers = headers(&self.config).map_err(|err| AttemptFailure {
+            message: err.to_string(),
+            retryable: false,
+            retry_after: None,
+        })?;
+        let mut request = self.client.post(&self.endpoint).headers(headers).json(body);
+        if !self.config.stream {
+            request = request.timeout(Duration::from_secs(self.config.request_timeout_secs));
+        }
+        let response = request.send().await.map_err(|err| AttemptFailure {
+            message: format!("model request failed: {err}"),
+            retryable: true,
+            retry_after: None,
+        })?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
             let body = response
                 .text()
                 .await
                 .unwrap_or_else(|err| format!("failed to read error body: {err}"));
-            return Err(AgentError::Model(format!(
-                "model request failed ({status}): {body}"
-            )));
+            return Err(AttemptFailure {
+                message: format!("model request failed ({status}): {body}"),
+                retryable: matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504),
+                retry_after,
+            });
         }
-        if self.config.stream {
-            decode_stream(response, stream).await
+        let decoded = if self.config.stream {
+            decode_stream(response, stream.clone()).await
         } else {
             decode_response(response).await
-        }
+        };
+        decoded.map_err(|err| AttemptFailure {
+            message: err.to_string(),
+            retryable: true,
+            retry_after: None,
+        })
     }
+}
+
+/// Server-provided Retry-After (integer seconds form) wins, clamped to 30s;
+/// otherwise exponential backoff with full jitter in [base/2, base].
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after.min(Duration::from_secs(30));
+    }
+    let base = Duration::from_millis(500)
+        .saturating_mul(2_u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(Duration::from_secs(10));
+    let half = base / 2;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos() as u64)
+        .unwrap_or_default();
+    half + Duration::from_nanos(nanos % half.as_nanos().max(1) as u64)
+}
+
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 #[derive(Debug, Serialize)]
@@ -449,5 +530,33 @@ fn tool_result_content(content: &Value) -> Result<String, AgentError> {
         Value::String(value) => Ok(value.clone()),
         other => serde_json::to_string(other)
             .map_err(|err| AgentError::Model(format!("failed to encode tool result: {err}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_with_jitter_and_honors_retry_after() {
+        for _ in 0..16 {
+            let first = retry_delay(1, None);
+            assert!(first >= Duration::from_millis(250), "first: {first:?}");
+            assert!(first <= Duration::from_millis(500), "first: {first:?}");
+            let second = retry_delay(2, None);
+            assert!(second >= Duration::from_millis(500), "second: {second:?}");
+            assert!(second <= Duration::from_millis(1000), "second: {second:?}");
+            let deep = retry_delay(16, None);
+            assert!(deep <= Duration::from_secs(10), "deep: {deep:?}");
+        }
+        assert_eq!(retry_delay(1, Some(Duration::ZERO)), Duration::ZERO);
+        assert_eq!(
+            retry_delay(1, Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            retry_delay(1, Some(Duration::from_secs(9999))),
+            Duration::from_secs(30)
+        );
     }
 }

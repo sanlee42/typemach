@@ -257,10 +257,16 @@ pub struct AgentConfig {
     pub context_policy: ContextPolicy,
     #[serde(default = "default_true")]
     pub stream: bool,
+    /// Total request timeout for non-streaming calls; idle gap between
+    /// chunks for streaming calls (a healthy long stream never trips it).
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Extra attempts after a transient failure (429/5xx/connect/timeout)
+    /// when no answer delta has been streamed yet.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -276,6 +282,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("stream", &self.stream)
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("max_tokens", &self.max_tokens)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -293,6 +300,7 @@ impl AgentConfig {
             stream: true,
             request_timeout_secs: default_request_timeout_secs(),
             max_tokens: None,
+            max_retries: default_max_retries(),
         }
     }
 }
@@ -303,6 +311,10 @@ fn default_deepseek_base_url() -> String {
 
 const fn default_request_timeout_secs() -> u64 {
     120
+}
+
+const fn default_max_retries() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
