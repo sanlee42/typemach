@@ -18,7 +18,9 @@ pub fn prompt_window(
     policy: &ContextPolicy,
 ) -> Result<PromptWindow, AgentError> {
     let before = estimate_messages(messages)?;
-    if before.estimated_tokens < policy.compact_at_tokens || messages.len() <= policy.recent_turns {
+    if before.estimated_tokens < policy.compact_at_tokens
+        || messages.len() <= policy.recent_messages
+    {
         return Ok(PromptWindow {
             messages: messages.to_vec(),
             digest: None,
@@ -26,7 +28,7 @@ pub fn prompt_window(
         });
     }
 
-    let mut keep_count = policy.recent_turns.max(1).min(messages.len());
+    let mut keep_count = policy.recent_messages.max(1).min(messages.len());
     let mut window = build_compacted_window(messages, keep_count)?;
     while window.after.estimated_tokens > policy.max_input_tokens && keep_count > 1 {
         keep_count -= 1;
@@ -181,11 +183,11 @@ mod tests {
         })
     }
 
-    fn policy(recent_turns: usize, max_input_tokens: u64) -> ContextPolicy {
+    fn policy(recent_messages: usize, max_input_tokens: u64) -> ContextPolicy {
         ContextPolicy {
             max_input_tokens,
             compact_at_tokens: 1,
-            recent_turns,
+            recent_messages,
             ..ContextPolicy::default()
         }
     }

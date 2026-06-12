@@ -378,6 +378,19 @@ where
             assistant_content.push(ContentBlock::ToolUse(tool_use.clone()));
             state.pending_tools.push_back(tool_use);
         }
+        if response.stop_reason == Some(StopReason::MaxTokens) {
+            // A length-truncated response may carry half-written tool
+            // arguments; dispatching them would act on garbage. Drop them
+            // and surface the truncation to the caller instead.
+            assistant_content.retain(|block| !matches!(block, ContentBlock::ToolUse(_)));
+            state.pending_tools.clear();
+            if !assistant_content.is_empty() {
+                state.messages.push(AgentMessage::Assistant {
+                    content: assistant_content,
+                });
+            }
+            return Ok(Transition::Complete(state.output(FinishReason::MaxTokens)));
+        }
         if let Some(final_text) = response.final_text {
             if !final_text.is_empty() && !assistant_content.iter().any(is_text_block) {
                 state.answer.push_str(&final_text);

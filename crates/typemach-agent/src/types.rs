@@ -223,7 +223,9 @@ impl Default for ThinkingConfig {
 pub struct ContextPolicy {
     pub max_input_tokens: u64,
     pub compact_at_tokens: u64,
-    pub recent_turns: usize,
+    /// Window size in messages (not conversation turns).
+    #[serde(alias = "recent_turns")]
+    pub recent_messages: usize,
     pub max_tool_result_bytes: usize,
     pub background_digest: bool,
 }
@@ -233,7 +235,7 @@ impl Default for ContextPolicy {
         Self {
             max_input_tokens: 128_000,
             compact_at_tokens: 96_000,
-            recent_turns: 8,
+            recent_messages: 8,
             max_tool_result_bytes: 24 * 1024,
             background_digest: false,
         }
@@ -513,6 +515,8 @@ pub enum FinishReason {
     Terminal,
     MaxModelTurns,
     MaxToolCalls,
+    /// The model hit its output token limit; the answer may be truncated.
+    MaxTokens,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

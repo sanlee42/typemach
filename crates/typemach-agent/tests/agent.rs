@@ -494,7 +494,7 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
     let context_policy = ContextPolicy {
         compact_at_tokens: 1,
         max_input_tokens: 128,
-        recent_turns: 2,
+        recent_messages: 2,
         ..ContextPolicy::default()
     };
     let runner = build_agent_runner_with_context_policy(
@@ -798,6 +798,65 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         Some("当前店铺:B"),
         "resume refreshes the suffix"
     );
+}
+
+#[tokio::test]
+async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
+    let model = ScriptedModel::new([ModelResponse {
+        content: vec![ContentBlock::Text {
+            text: "部分回答".to_string(),
+        }],
+        tool_uses: vec![ToolUse {
+            id: "tool-1".to_string(),
+            name: "metric_point".to_string(),
+            input: json!({ "metric_id": "paid_order_cou" }),
+            raw: None,
+        }],
+        stop_reason: Some(StopReason::MaxTokens),
+        ..ModelResponse::default()
+    }]);
+    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("写个超长报告")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RunStreamEvent::Signal {
+                signal: AgentSignal::ToolStarted { .. },
+            }
+        )),
+        "truncated tool calls must not dispatch"
+    );
+    let completed = completed(&events);
+    assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
+    assert_eq!(completed.answer, "部分回答");
+    assert!(matches!(
+        completed.messages.last(),
+        Some(AgentMessage::Assistant { content })
+            if !content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_)))
+    ));
+}
+
+#[test]
+fn context_policy_accepts_recent_turns_alias() {
+    let policy: ContextPolicy = serde_json::from_value(json!({
+        "max_input_tokens": 1000,
+        "compact_at_tokens": 500,
+        "recent_turns": 5,
+        "max_tool_result_bytes": 1024,
+        "background_digest": false
+    }))
+    .expect("alias accepted");
+    assert_eq!(policy.recent_messages, 5);
 }
 
 fn completed(
