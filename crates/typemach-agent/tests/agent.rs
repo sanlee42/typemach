@@ -615,6 +615,98 @@ fn content_block_serde_shape_is_flat_and_defaults_annotations() {
     assert!(annotations.terminal);
 }
 
+#[tokio::test]
+async fn abandoned_ask_user_is_repaired_on_next_start() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            tool_uses: vec![ToolUse {
+                id: "ask-1".to_string(),
+                name: "ask_user".to_string(),
+                input: json!({ "question": "看哪个日期？" }),
+                raw: None,
+            }],
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            deltas: vec!["库存还有 7 件。".to_string()],
+            final_text: Some(String::new()),
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        FakeTools,
+        AllowAllTools,
+    );
+    let mut first = runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("订单量")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+        }),
+        StreamConfig::default(),
+    );
+    loop {
+        match first.next_event().await.expect("event") {
+            RunStreamEvent::Interrupted { .. } => break,
+            RunStreamEvent::Failed { error } => panic!("failed: {error}"),
+            _ => {}
+        }
+    }
+
+    // The user abandons the question and later sends a fresh message on the
+    // same thread: a plain Start, not a Resume.
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("先看库存")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+    let completed = completed(&events);
+    assert_eq!(completed.answer, "库存还有 7 件。");
+
+    let requests = model.requests();
+    let second = requests.get(1).expect("second model request");
+    let repaired_index = second
+        .messages
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                AgentMessage::User { content }
+                    if content.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::ToolResult(result)
+                            if result.tool_use_id == "ask-1"
+                                && result.is_error
+                                && result.content["error"] == "interrupted before completion"
+                    ))
+            )
+        })
+        .expect("synthetic tool result for the dangling ask_user");
+    let new_message_index = second
+        .messages
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                AgentMessage::User { content }
+                    if content.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::Text { text } if text == "先看库存"
+                    ))
+            )
+        })
+        .expect("new user message");
+    assert!(repaired_index < new_message_index);
+}
+
 fn completed(
     events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
 ) -> &AgentRunOutput {

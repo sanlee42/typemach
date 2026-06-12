@@ -35,6 +35,7 @@ impl AgentState {
         let mut messages = previous
             .map(|state| state.messages.clone())
             .unwrap_or_default();
+        repair_dangling_tool_uses(&mut messages);
         messages.extend(input.messages.clone());
         Self {
             messages,
@@ -532,6 +533,40 @@ where
         state.artifacts.push(artifact.clone());
         ctx.emit(AgentSignal::Artifact { artifact }).await?;
         Ok(ToolResult::ok(tool_use, json!({ "ok": true })))
+    }
+}
+
+/// A run started over an inherited transcript may find tool calls whose
+/// results never arrived (abandoned ask_user, disconnect mid-dispatch).
+/// Chat completion providers reject such transcripts outright, so close
+/// every dangling call with a synthetic error result.
+fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
+    let mut resulted = std::collections::HashSet::new();
+    for message in messages.iter() {
+        let (AgentMessage::User { content } | AgentMessage::Assistant { content }) = message;
+        for block in content {
+            if let ContentBlock::ToolResult(result) = block {
+                resulted.insert(result.tool_use_id.clone());
+            }
+        }
+    }
+    let mut dangling = Vec::new();
+    for message in messages.iter() {
+        if let AgentMessage::Assistant { content } = message {
+            for block in content {
+                if let ContentBlock::ToolUse(tool_use) = block
+                    && !resulted.contains(&tool_use.id)
+                {
+                    dangling.push(tool_use.clone());
+                }
+            }
+        }
+    }
+    for tool_use in dangling {
+        messages.push(AgentMessage::tool_result(ToolResult::error(
+            &tool_use,
+            "interrupted before completion",
+        )));
     }
 }
 
