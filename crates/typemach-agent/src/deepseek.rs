@@ -8,8 +8,8 @@ use serde_json::{Map, Value, json};
 use crate::deepseek_stream::decode_stream;
 use crate::{
     AgentConfig, AgentError, AgentMessage, AgentModel, AgentToolSpec, ContentBlock, ModelRequest,
-    ModelResponse, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolResult, ToolUse,
-    Usage,
+    ModelResponse, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolChoice, ToolResult,
+    ToolUse, Usage,
 };
 
 #[derive(Clone)]
@@ -173,6 +173,8 @@ struct ChatRequest {
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,16 +264,24 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
     }
     messages.extend(messages_to_chat(&request.messages)?);
     let thinking = thinking_body(config);
+    let tools = tools_to_chat(&request.tools);
+    // tool_choice=required is only valid when tools are offered.
+    let tool_choice = if tools.is_empty() {
+        None
+    } else {
+        config.tool_choice.map(tool_choice_value)
+    };
     Ok(ChatRequest {
         model: config.model.clone(),
         messages,
         stream: config.stream,
-        tools: tools_to_chat(&request.tools),
+        tools,
         reasoning_effort: thinking
             .as_ref()
             .map(|_| effort_value(config.thinking.reasoning_effort)),
         thinking,
         max_tokens: config.max_tokens,
+        tool_choice,
     })
 }
 
@@ -291,6 +301,14 @@ fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<Strin
         (Some(base), None) => Some(base.to_string()),
         (None, Some(suffix)) => Some(suffix.to_string()),
         (None, None) => None,
+    }
+}
+
+fn tool_choice_value(choice: ToolChoice) -> &'static str {
+    match choice {
+        ToolChoice::Auto => "auto",
+        ToolChoice::Required => "required",
+        ToolChoice::None => "none",
     }
 }
 
@@ -536,6 +554,7 @@ fn tool_result_content(content: &Value) -> Result<String, AgentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolAnnotations;
 
     #[test]
     fn retry_delay_backs_off_with_jitter_and_honors_retry_after() {
@@ -558,5 +577,52 @@ mod tests {
             retry_delay(1, Some(Duration::from_secs(9999))),
             Duration::from_secs(30)
         );
+    }
+
+    fn spec() -> AgentToolSpec {
+        AgentToolSpec {
+            name: "report".to_string(),
+            description: "finish".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: Value::Null,
+            metadata: Value::Null,
+            annotations: ToolAnnotations::default(),
+        }
+    }
+
+    fn request(tools: Vec<AgentToolSpec>) -> ModelRequest {
+        ModelRequest {
+            messages: vec![AgentMessage::user_text("hi")],
+            tools,
+            context: Value::Null,
+            turn: 1,
+            system_suffix: None,
+        }
+    }
+
+    #[test]
+    fn tool_choice_required_is_sent_when_tools_are_offered() {
+        let mut config = AgentConfig::new("k", "deepseek-v4-flash");
+        config.tool_choice = Some(ToolChoice::Required);
+        let body = serde_json::to_value(chat_request(&config, request(vec![spec()])).unwrap())
+            .expect("serialize");
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn tool_choice_is_omitted_when_no_tools() {
+        let mut config = AgentConfig::new("k", "deepseek-v4-flash");
+        config.tool_choice = Some(ToolChoice::Required);
+        let body = serde_json::to_value(chat_request(&config, request(vec![])).unwrap())
+            .expect("serialize");
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn tool_choice_absent_by_default() {
+        let config = AgentConfig::new("k", "deepseek-v4-flash");
+        let body = serde_json::to_value(chat_request(&config, request(vec![spec()])).unwrap())
+            .expect("serialize");
+        assert!(body.get("tool_choice").is_none());
     }
 }

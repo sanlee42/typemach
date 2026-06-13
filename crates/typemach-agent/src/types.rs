@@ -204,6 +204,17 @@ pub enum ReasoningEffort {
     High,
 }
 
+/// How the model is allowed to pick tools each turn. `Required` forces a tool
+/// call (no bare-prose turns) which protocol-style agents that must always act
+/// via tools rely on to avoid stalls on smaller models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     pub enabled: bool,
@@ -269,6 +280,10 @@ pub struct AgentConfig {
     /// when no answer delta has been streamed yet.
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+    /// Optional tool-choice policy sent to the model (e.g. `Required` to force a
+    /// tool call every turn). `None` leaves it to the provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -285,6 +300,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("max_tokens", &self.max_tokens)
             .field("max_retries", &self.max_retries)
+            .field("tool_choice", &self.tool_choice)
             .finish()
     }
 }
@@ -303,6 +319,7 @@ impl AgentConfig {
             request_timeout_secs: default_request_timeout_secs(),
             max_tokens: None,
             max_retries: default_max_retries(),
+            tool_choice: None,
         }
     }
 }
