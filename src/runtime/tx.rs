@@ -210,6 +210,7 @@ where
         let ops = Arc::new(TxRunOps::new(
             Arc::clone(&self.store),
             req.run_id.clone(),
+            req.session_id.clone(),
             scope.clone(),
             lease.id.clone(),
         ));

@@ -37,6 +37,8 @@ enum Mode {
     Interrupt,
     Loop,
     Slow,
+    LiveSlow,
+    LiveFail,
     Ops,
 }
 
@@ -105,6 +107,19 @@ impl Machine for TestMachine {
             (Mode::Slow, Step::Slow) => {
                 async_rt::time::sleep(Duration::from_secs(5)).await;
                 Ok(Transition::Complete("slow".to_string()))
+            }
+            (Mode::LiveSlow, Step::Start) => {
+                ctx.progress("progress:slow:1", "progress", json!({"phase": "started"}))
+                    .await?;
+                async_rt::time::sleep(Duration::from_secs(5)).await;
+                Ok(Transition::Complete("slow".to_string()))
+            }
+            (Mode::LiveFail, Step::Start) => {
+                ctx.progress("progress:fail:1", "progress", json!({"phase": "started"}))
+                    .await?;
+                Err(MachineError::InvalidRunEvent {
+                    reason: "test failure".to_string(),
+                })
             }
             (Mode::Ops, Step::Start) => {
                 ctx.reserve("effect-a", "tool", json!({"arg": 1})).await?;

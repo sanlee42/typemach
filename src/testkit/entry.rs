@@ -323,6 +323,112 @@ where
     Ok(())
 }
 
+pub(super) async fn live_entries_are_readable_before_terminal<S>(
+    store: &S,
+) -> Result<(), MachineError>
+where
+    S: RunTx<TestEvent, Scope = Value, FinishData = ()>,
+{
+    let scope = scope("live-entry");
+    let run_id = RunId::from("contract-live-entry-run");
+    let session_id = SessionId::from("contract-live-entry-session");
+    let thread_id = ThreadId::from("contract-live-entry-thread");
+    let start = run_start(
+        run_id.as_str(),
+        session_id.as_str(),
+        thread_id.as_str(),
+        scope.clone(),
+    );
+    assert!(matches!(
+        store.start_run(&start).await?,
+        StoreStartResult::Created
+    ));
+
+    let live = RunCommit {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        scope: scope.clone(),
+        lease: None,
+        checkpoint: None,
+        events: Vec::new(),
+        effects: Vec::new(),
+        items: Vec::new(),
+        entries: vec![entry(
+            "progress:1",
+            "progress",
+            Vis::Public,
+            json!({"phase": "running"}),
+        )],
+        finish: None,
+    };
+    assert!(matches!(
+        store.commit_run(&live).await?,
+        RunCommitResult::Recorded(events) if events.is_empty()
+    ));
+    assert_eq!(store.list_events(&run_id, &scope, 0, 8).await?.len(), 0);
+
+    let visible = store
+        .list_entries(
+            EntryQuery::new(&scope, &session_id, 8)
+                .thread(&thread_id)
+                .kind("progress")
+                .vis(Vis::Public),
+        )
+        .await?;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].body["phase"], "running");
+    assert_eq!(
+        store
+            .lookup_run(&run_id, &scope)
+            .await?
+            .expect("running run")
+            .status,
+        RunStatus::Running
+    );
+
+    let finish = RunFinish {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        scope: scope.clone(),
+        status: RunStatus::Error,
+        finish_reason: "failed".to_string(),
+        error_code: Some("test".to_string()),
+        entries: Vec::new(),
+        data: (),
+    };
+    let done = RunCommit {
+        run_id: run_id.clone(),
+        session_id: session_id.clone(),
+        scope: scope.clone(),
+        lease: None,
+        checkpoint: None,
+        events: vec![event(run_id.as_str(), session_id.as_str(), 1, true)],
+        effects: Vec::new(),
+        items: Vec::new(),
+        entries: Vec::new(),
+        finish: Some(finish),
+    };
+    assert!(matches!(
+        store.commit_run(&done).await?,
+        RunCommitResult::Finished { .. }
+    ));
+    assert_eq!(
+        store
+            .latest_entry(
+                &scope,
+                &session_id,
+                Some(&thread_id),
+                "progress",
+                Some(Vis::Public),
+            )
+            .await?
+            .expect("live progress")
+            .body["phase"],
+        "running"
+    );
+    Ok(())
+}
+
 fn entry(key: &str, kind: &str, vis: Vis, body: Value) -> EntryWrite {
     EntryWrite {
         key: key.to_string(),

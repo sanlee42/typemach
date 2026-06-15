@@ -34,6 +34,7 @@ where
     idempotent_start_and_scope(store).await?;
     entry::idempotent_start_checks_input(store).await?;
     entry::entries_are_session_scoped_and_private(store).await?;
+    entry::live_entries_are_readable_before_terminal(store).await?;
     event_checkpoint_and_terminal(store).await?;
     effects_items_and_paged_replay(store).await?;
     rejected_commits_do_not_advance(store).await?;
