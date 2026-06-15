@@ -428,6 +428,29 @@ impl<I, Step, Signal, Output, Interrupt> RunContext<I, Step, Signal, Output, Int
             .await
     }
 
+    /// Append a public entry immediately, outside the step checkpoint commit.
+    ///
+    /// A committed progress entry is readable before the current step finishes
+    /// and remains readable if the step later fails or is cancelled.
+    pub async fn progress(
+        &self,
+        key: impl Into<String>,
+        kind: impl Into<String>,
+        body: impl Serialize,
+    ) -> Result<(), crate::error::MachineError> {
+        self.ops
+            .push_live_entry(
+                &self.run_id,
+                EntryWrite {
+                    key: key.into(),
+                    kind: kind.into(),
+                    vis: Vis::Public,
+                    body: to_value(body)?,
+                },
+            )
+            .await
+    }
+
     pub fn is_streaming(&self) -> bool {
         self.event_tx.is_some()
     }

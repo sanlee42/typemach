@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::op::{Effect, EffectUpdate, EntryWrite, ItemWrite, RunOps};
+use crate::store::{RunCommit, RunCommitResult};
 
 #[derive(Debug, Default)]
 pub(super) struct PendingOps {
@@ -19,6 +20,7 @@ where
 {
     store: Arc<S>,
     run_id: RunId,
+    session_id: SessionId,
     scope: S::Scope,
     lease: LeaseId,
     pending: async_rt::sync::Mutex<PendingOps>,
@@ -28,10 +30,17 @@ impl<S> TxRunOps<S>
 where
     S: RunTx<Event>,
 {
-    pub(super) fn new(store: Arc<S>, run_id: RunId, scope: S::Scope, lease: LeaseId) -> Self {
+    pub(super) fn new(
+        store: Arc<S>,
+        run_id: RunId,
+        session_id: SessionId,
+        scope: S::Scope,
+        lease: LeaseId,
+    ) -> Self {
         Self {
             store,
             run_id,
+            session_id,
             scope,
             lease,
             pending: async_rt::sync::Mutex::new(PendingOps::default()),
@@ -126,5 +135,28 @@ where
         }
         pending.entries.push(entry);
         Ok(())
+    }
+
+    async fn push_live_entry(&self, run_id: &RunId, entry: EntryWrite) -> Result<(), MachineError> {
+        self.check_run(run_id)?;
+        let commit = RunCommit {
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            scope: self.scope.clone(),
+            lease: Some(self.lease.clone()),
+            checkpoint: None,
+            events: Vec::new(),
+            effects: Vec::new(),
+            items: Vec::new(),
+            entries: vec![entry],
+            finish: None,
+        };
+        match self.store.commit_run(&commit).await? {
+            RunCommitResult::Recorded(_) => Ok(()),
+            RunCommitResult::Skipped => Err(MachineError::RunNotFound),
+            RunCommitResult::Finished { .. } => Err(MachineError::InvalidRunEvent {
+                reason: "live entry commit produced a terminal result".to_string(),
+            }),
+        }
     }
 }

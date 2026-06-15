@@ -174,6 +174,104 @@ fn tx_runtime_commits_context_ops_with_step_event() {
 }
 
 #[test]
+fn tx_runtime_progress_is_readable_before_step_finishes_and_survives_cancel() {
+    block_on(async {
+        let rt = tx_runtime(8);
+        let run_id = RunId::from("run-tx-live-cancel");
+        let result = rt
+            .stream(
+                request(run_id.as_str(), Mode::LiveSlow),
+                start(None),
+                StreamConfig {
+                    heartbeat_interval: Duration::from_secs(30),
+                    channel_capacity: 32,
+                },
+            )
+            .await
+            .expect("stream");
+        let StartResult::Started(mut rx) = result else {
+            panic!("expected started");
+        };
+
+        let progress = wait_progress(&rt, &run_id, "progress:slow:1").await;
+        assert_eq!(progress.body, json!({"phase": "started"}));
+
+        let events = rt
+            .store()
+            .list_events(&run_id, &scope(), 0, usize::MAX)
+            .await
+            .expect("events");
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            Payload::StepDone { .. } | Payload::Done { .. } | Payload::Cancel
+        )));
+        assert_eq!(
+            rt.store()
+                .lookup_run(&run_id, &scope())
+                .await
+                .expect("lookup")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+
+        assert!(rt.cancel(&run_id, &scope()).await.expect("cancel"));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut cancelled = false;
+        while let Some(event) = rx.next_event_timeout(deadline).await {
+            if matches!(event, RunStreamEvent::Cancelled) {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(cancelled);
+        assert_eq!(
+            rt.store()
+                .lookup_run(&run_id, &scope())
+                .await
+                .expect("lookup")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+        let progress = wait_progress(&rt, &run_id, "progress:slow:1").await;
+        assert_eq!(progress.body, json!({"phase": "started"}));
+    });
+}
+
+#[test]
+fn tx_runtime_progress_survives_failed_step() {
+    block_on(async {
+        let rt = tx_runtime(8);
+        let run_id = RunId::from("run-tx-live-fail");
+        let err = rt
+            .invoke(request(run_id.as_str(), Mode::LiveFail), start(None))
+            .await
+            .expect_err("invoke should fail");
+        assert!(matches!(err, MachineError::InvalidRunEvent { .. }));
+
+        assert_eq!(
+            rt.store()
+                .lookup_run(&run_id, &scope())
+                .await
+                .expect("lookup")
+                .expect("run")
+                .status,
+            RunStatus::Error
+        );
+        let terminal = rt
+            .store()
+            .terminal_event(&run_id, &scope())
+            .await
+            .expect("terminal")
+            .expect("terminal event");
+        assert!(matches!(terminal.payload, Payload::Fail { .. }));
+        let progress = wait_progress(&rt, &run_id, "progress:fail:1").await;
+        assert_eq!(progress.body, json!({"phase": "started"}));
+    });
+}
+
+#[test]
 fn tx_runtime_commits_interrupt_checkpoint_with_terminal_events() {
     block_on(async {
         let rt = tx_runtime(8);
@@ -330,4 +428,32 @@ fn failed_run_records_error_terminal() {
             .expect("terminal event");
         assert!(matches!(terminal.payload, Payload::Fail { .. }));
     });
+}
+
+async fn wait_progress(
+    rt: &TxRuntime<TestMachine, TestTxStore>,
+    run_id: &RunId,
+    key: &str,
+) -> Entry {
+    let session_id = SessionId::from("session-1");
+    let thread_id = ThreadId::from(format!("thread-{run_id}"));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let scope = scope();
+        let entries = rt
+            .store()
+            .list_entries(
+                EntryQuery::new(&scope, &session_id, 8)
+                    .thread(&thread_id)
+                    .kind("progress")
+                    .vis(Vis::Public),
+            )
+            .await
+            .expect("entries");
+        if let Some(entry) = entries.items.into_iter().find(|entry| entry.key == key) {
+            return entry;
+        }
+        assert!(Instant::now() < deadline);
+        async_rt::time::sleep(Duration::from_millis(10)).await;
+    }
 }
