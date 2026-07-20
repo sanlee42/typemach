@@ -15,6 +15,12 @@ mod deepseek;
 mod deepseek_stream;
 pub use deepseek::ConfiguredModel;
 
+mod sandbox;
+pub use sandbox::{
+    ByteLimit, ExecChild, ExecLimits, ExecSpec, OpenFileLimit, PermissionProfile, SandboxError,
+    helper_requested, run_sandbox_helper,
+};
+
 pub use typemach as core;
 
 pub type AgentRunContext =
