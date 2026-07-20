@@ -352,12 +352,17 @@ fn set_cpu_limit(value: u64) -> Result<(), SandboxError> {
     set_limit_values(libc::RLIMIT_CPU, value, hard, "cpu_time_seconds")
 }
 
+#[cfg(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))]
+type RlimitResource = libc::__rlimit_resource_t;
+
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_env = "gnu", target_env = "uclibc"))
+))]
+type RlimitResource = libc::c_int;
+
 #[cfg(target_os = "linux")]
-fn set_limit(
-    resource: libc::__rlimit_resource_t,
-    value: u64,
-    name: &'static str,
-) -> Result<(), SandboxError> {
+fn set_limit(resource: RlimitResource, value: u64, name: &'static str) -> Result<(), SandboxError> {
     if value == 0 && resource != libc::RLIMIT_CORE {
         return Err(SandboxError::InvalidLimit { name, value });
     }
@@ -366,7 +371,7 @@ fn set_limit(
 
 #[cfg(target_os = "linux")]
 fn set_limit_values(
-    resource: libc::__rlimit_resource_t,
+    resource: RlimitResource,
     soft: u64,
     hard: u64,
     _name: &'static str,
