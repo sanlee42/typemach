@@ -494,6 +494,7 @@ where
         check_memory_lease(run, commit.lease.as_ref())?;
         if let Some(checkpoint) = &commit.checkpoint {
             check_memory_thread(&inner, run, checkpoint, commit.lease.as_ref())?;
+            checkpoint.record.require_run(&commit.run_id)?;
         }
         validate_event_sequence(run, &commit.events)?;
         validate_effect_updates(&inner, &commit.run_id, &commit.effects)?;

@@ -24,6 +24,8 @@ enum Step {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     value: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    padding: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +42,7 @@ enum Mode {
     LiveSlow,
     LiveFail,
     Ops,
+    Large,
 }
 
 struct TestMachine;
@@ -67,7 +70,13 @@ impl Machine for TestMachine {
         _previous: Option<&Self::State>,
         _snapshot: Option<&Value>,
     ) -> Result<Self::State, MachineError> {
-        Ok(State { value: 0 })
+        Ok(State {
+            value: 0,
+            padding: match &_input.mode {
+                Mode::Large => "x".repeat(1_800 * 1024),
+                _ => String::new(),
+            },
+        })
     }
 
     fn apply_resume_input(
@@ -129,6 +138,7 @@ impl Machine for TestMachine {
                 Ok(Transition::Next(Step::Done))
             }
             (Mode::Ops, Step::Done) => Ok(Transition::Complete("ops".to_string())),
+            (Mode::Large, Step::Start) => Ok(Transition::Complete("large".to_string())),
             _ => Ok(Transition::Complete("done".to_string())),
         }
     }

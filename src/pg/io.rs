@@ -106,6 +106,7 @@ where
             reason: "checkpoint thread_id does not match target run".to_string(),
         });
     }
+    checkpoint.record.require_run(&commit.run_id)?;
     if let Some((owner, run_id)) =
         running_thread_tx(tx, &checkpoint.thread_id, Some(&commit.run_id)).await?
     {

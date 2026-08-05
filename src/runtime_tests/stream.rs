@@ -1,4 +1,5 @@
 use super::*;
+use crate::SqliteStore;
 
 #[test]
 fn stream_persists_and_forwards_completed_events() {
@@ -45,7 +46,21 @@ fn stream_persists_and_forwards_completed_events() {
             .typed::<TestMachine>();
         assert!(matches!(
             replay.expect("typed replay").payload,
-            ReplayPayload::Completed { output, .. } if output == "value=1"
+            ReplayPayload::Completed { output, checkpoint }
+                if output == "value=1" && checkpoint == run_id
+        ));
+        let mismatched = Event::new(
+            run_id.clone(),
+            SessionId::from("session-1"),
+            99,
+            Payload::Done {
+                output: json!("value=1"),
+                checkpoint: RunId::from("wrong-run"),
+            },
+        );
+        assert!(matches!(
+            mismatched.typed::<TestMachine>(),
+            Err(MachineError::CheckpointRun { .. })
         ));
         let lookup = rt
             .store()
@@ -139,6 +154,84 @@ fn tx_runtime_commits_final_checkpoint_with_terminal_events() {
             .expect("run");
         assert_eq!(lookup.status, RunStatus::Completed);
     });
+}
+
+#[test]
+fn sqlite_keeps_one_large_checkpoint_and_compact_terminals() {
+    block_on(async {
+        let store = Arc::new(SqliteStore::<Event>::memory().await.expect("store"));
+        store.ensure_schema().await.expect("schema");
+        let rt = TxRuntime::new(TestMachine, Arc::clone(&store), 8);
+        let thread = ThreadId::from("thread-large-state");
+        let session = SessionId::from("session-large-state");
+
+        for index in 0..100 {
+            let run = RunId::from(format!("large-run-{index}"));
+            let req = RunRequest::start(
+                run.clone(),
+                session.clone(),
+                thread.clone(),
+                Input { mode: Mode::Large },
+                5,
+            );
+            assert!(matches!(
+                rt.invoke(req, start(Some(&format!("large-{index}"))))
+                    .await
+                    .expect("invoke"),
+                StartResult::Started(RunOutput::Completed { .. })
+            ));
+        }
+
+        let before = sqlite_counts(&store).await;
+        assert_eq!(before.0, 1);
+        assert_eq!(before.1, 100);
+        assert_eq!(before.2, 0);
+        assert!(before.3 >= 1_800 * 1024);
+
+        let run = RunId::from("large-run-99");
+        let req = RunRequest::start(run, session, thread, Input { mode: Mode::Large }, 5);
+        assert!(matches!(
+            rt.invoke(req, start(Some("large-99")))
+                .await
+                .expect("replay"),
+            StartResult::Existing(_)
+        ));
+        assert_eq!(sqlite_counts(&store).await, before);
+
+        let terminal = store
+            .terminal_event(&RunId::from("large-run-99"), &scope())
+            .await
+            .expect("terminal")
+            .expect("terminal event");
+        let raw = serde_json::to_value(terminal).expect("terminal JSON");
+        assert_eq!(
+            raw["payload"],
+            json!({
+                "type": "done",
+                "output": "large",
+                "checkpoint": "large-run-99"
+            })
+        );
+    });
+}
+
+async fn sqlite_counts(store: &SqliteStore<Event>) -> (i64, i64, i64, i64) {
+    store
+        .conn()
+        .call(|conn| {
+            conn.query_row(
+                "SELECT
+                    (SELECT count(*) FROM typemach_checkpoints),
+                    (SELECT count(*) FROM typemach_run_events WHERE terminal = 1),
+                    (SELECT count(*) FROM typemach_run_events
+                      WHERE terminal = 1 AND instr(event, 'padding') != 0),
+                    (SELECT length(state) FROM typemach_checkpoints)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+        })
+        .await
+        .expect("durable counts")
 }
 
 #[test]

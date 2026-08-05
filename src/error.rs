@@ -98,6 +98,12 @@ pub enum MachineError {
     #[error("checkpoint has invalid step payload: {reason}")]
     InvalidStep { reason: String },
 
+    #[error("checkpoint run identity does not match run {run}")]
+    CheckpointRun {
+        run: crate::run::RunId,
+        checkpoint: Option<crate::run::RunId>,
+    },
+
     #[error("machine transition failed: {0}")]
     Transition(#[source] Box<dyn std::error::Error + Send + Sync>),
 }

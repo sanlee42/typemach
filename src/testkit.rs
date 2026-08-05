@@ -357,6 +357,18 @@ where
 
     let bad_checkpoint =
         CheckpointRecord::running(json!({"step": 999}), Some(json!("bad")), run_id.as_str());
+    let wrong_run = RunCommit {
+        checkpoint: Some(CheckpointWrite::new(
+            thread_id.clone(),
+            CheckpointRecord::running(json!({"step": 999}), None, "wrong-run"),
+        )),
+        events: vec![event(run_id.as_str(), session_id.as_str(), 2, false)],
+        ..first.clone()
+    };
+    assert!(matches!(
+        store.commit_run(&wrong_run).await,
+        Err(MachineError::CheckpointRun { .. })
+    ));
     let bad = RunCommit {
         checkpoint: Some(CheckpointWrite::new(thread_id.clone(), bad_checkpoint)),
         events: vec![event(run_id.as_str(), session_id.as_str(), 1, false)],

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::run::RunId;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointRecord {
@@ -47,6 +49,16 @@ impl CheckpointRecord {
             interrupt: Some(interrupt),
             run_id: Some(run_id.into()),
         }
+    }
+
+    pub(crate) fn require_run(&self, run: &RunId) -> Result<(), MachineError> {
+        if self.run_id.as_deref() == Some(run.as_str()) {
+            return Ok(());
+        }
+        Err(MachineError::CheckpointRun {
+            run: run.clone(),
+            checkpoint: self.run_id.clone().map(RunId::from),
+        })
     }
 }
 

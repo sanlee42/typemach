@@ -151,35 +151,14 @@ pub enum StartResult<T> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Payload {
-    Start {
-        thread_id: ThreadId,
-    },
-    Beat {
-        thread_id: ThreadId,
-    },
-    StepStart {
-        step: Value,
-        n: u32,
-    },
-    StepDone {
-        step: Value,
-        result: StepResult,
-    },
-    Signal {
-        signal: Value,
-    },
-    Done {
-        trace: Vec<Value>,
-        output: Value,
-        snapshot: Value,
-    },
-    Interrupt {
-        interrupt: Value,
-        snapshot: Value,
-    },
-    Fail {
-        error: String,
-    },
+    Start { thread_id: ThreadId },
+    Beat { thread_id: ThreadId },
+    StepStart { step: Value, n: u32 },
+    StepDone { step: Value, result: StepResult },
+    Signal { signal: Value },
+    Done { output: Value, checkpoint: RunId },
+    Interrupt { interrupt: Value, checkpoint: RunId },
+    Fail { error: String },
     Cancel,
 }
 
@@ -203,13 +182,12 @@ pub enum ReplayPayload<Step, Signal, Output, Interrupt> {
         signal: Signal,
     },
     Completed {
-        trace: Vec<Value>,
         output: Output,
-        snapshot: Value,
+        checkpoint: RunId,
     },
     Interrupted {
         interrupt: Interrupt,
-        snapshot: Value,
+        checkpoint: RunId,
     },
     Failed {
         error: String,
@@ -245,6 +223,14 @@ impl RunEventEnvelope<Payload> {
         M::Signal: DeserializeOwned,
         M::Output: DeserializeOwned,
     {
+        if let Some(checkpoint) = self.payload.checkpoint()
+            && checkpoint != &self.run_id
+        {
+            return Err(MachineError::CheckpointRun {
+                run: self.run_id.clone(),
+                checkpoint: Some(checkpoint.clone()),
+            });
+        }
         Ok(RunEventEnvelope::new(
             self.run_id.clone(),
             self.session_id.clone(),
@@ -255,6 +241,13 @@ impl RunEventEnvelope<Payload> {
 }
 
 impl Payload {
+    fn checkpoint(&self) -> Option<&RunId> {
+        match self {
+            Self::Done { checkpoint, .. } | Self::Interrupt { checkpoint, .. } => Some(checkpoint),
+            _ => None,
+        }
+    }
+
     pub fn typed<M>(&self) -> Result<Replay<M>, MachineError>
     where
         M: Machine,
@@ -279,21 +272,16 @@ impl Payload {
             Self::Signal { signal } => ReplayPayload::Signal {
                 signal: from_json(signal)?,
             },
-            Self::Done {
-                trace,
-                output,
-                snapshot,
-            } => ReplayPayload::Completed {
-                trace: trace.clone(),
+            Self::Done { output, checkpoint } => ReplayPayload::Completed {
                 output: from_json(output)?,
-                snapshot: snapshot.clone(),
+                checkpoint: checkpoint.clone(),
             },
             Self::Interrupt {
                 interrupt,
-                snapshot,
+                checkpoint,
             } => ReplayPayload::Interrupted {
                 interrupt: from_json(interrupt)?,
-                snapshot: snapshot.clone(),
+                checkpoint: checkpoint.clone(),
             },
             Self::Fail { error } => ReplayPayload::Failed {
                 error: error.clone(),
@@ -362,10 +350,6 @@ where
     where
         M::Input: Serialize,
     {
-        self.life
-            .ensure_session(Some(req.session_id.clone()), &start.scope)
-            .await?;
-
         let scope = start.scope.clone();
         let input = Some(to_json(&req.input)?);
         let run = RunStart {
@@ -651,7 +635,7 @@ where
     S: RunStore<Event>,
     S::FinishData: Default,
 {
-    match event_record::<M>(event)? {
+    match event_record::<M>(run_id, event)? {
         EventRecord::Append(payload) => {
             match life
                 .append_event(run_id, session_id, scope, payload)
@@ -685,7 +669,7 @@ where
     }
 }
 
-fn event_record<M>(event: &StreamEvent<M>) -> Result<EventRecord, MachineError>
+fn event_record<M>(run_id: &RunId, event: &StreamEvent<M>) -> Result<EventRecord, MachineError>
 where
     M: Machine,
 {
@@ -709,27 +693,19 @@ where
         RunStreamEvent::Signal { signal } => EventRecord::Append(Payload::Signal {
             signal: to_json(signal)?,
         }),
-        RunStreamEvent::Completed {
-            trace,
-            output,
-            snapshot,
-        } => EventRecord::Finish {
+        RunStreamEvent::Completed { output, .. } => EventRecord::Finish {
             payload: Payload::Done {
-                trace: trace.clone(),
                 output: to_json(output)?,
-                snapshot: snapshot.clone(),
+                checkpoint: run_id.clone(),
             },
             status: RunStatus::Completed,
             reason: "completed",
             code: None,
         },
-        RunStreamEvent::Interrupted {
-            interrupt,
-            snapshot,
-        } => EventRecord::Finish {
+        RunStreamEvent::Interrupted { interrupt, .. } => EventRecord::Finish {
             payload: Payload::Interrupt {
                 interrupt: to_json(interrupt)?,
-                snapshot: snapshot.clone(),
+                checkpoint: run_id.clone(),
             },
             status: RunStatus::Interrupted,
             reason: "interrupted",
@@ -857,6 +833,7 @@ fn error_code(error: &MachineError) -> &'static str {
         MachineError::NoInterruptedStep => "no_interrupted_step",
         MachineError::InvalidInterrupt { .. } => "invalid_interrupt",
         MachineError::InvalidStep { .. } => "invalid_step",
+        MachineError::CheckpointRun { .. } => "checkpoint_run",
         MachineError::Transition(_) => "transition",
     }
 }

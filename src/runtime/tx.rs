@@ -167,10 +167,6 @@ where
     where
         M::Input: Serialize,
     {
-        self.life
-            .ensure_session(Some(req.session_id.clone()), &start.scope)
-            .await?;
-
         let scope = start.scope.clone();
         let input = Some(serde_json::to_value(&req.input).map_err(MachineError::Serialization)?);
         let lease_id = new_lease_id();
@@ -426,7 +422,7 @@ where
     S: CheckpointStore + RunLease<Event> + RunTx<Event> + 'static,
     S::FinishData: Default,
 {
-    let record = event_record::<M>(&event);
+    let record = event_record::<M>(&ctx.run_id, &event);
     let record = match record {
         Ok(record) => record,
         Err(error) => {
