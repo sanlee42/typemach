@@ -64,7 +64,10 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
 
     pub async fn ensure_schema(&self) -> Result<(), MachineError> {
         self.call(|conn| {
-            conn.execute_batch(
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(store_db)?;
+            tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS typemach_checkpoints (
                     thread_id TEXT PRIMARY KEY,
                     version INTEGER NOT NULL DEFAULT 1,
@@ -193,8 +196,10 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                 );",
             )
             .map_err(store_db)?;
-            ensure_run_input_column(conn)?;
-            ensure_run_start_sig_column(conn)?;
+            ensure_run_input_column(&tx)?;
+            ensure_run_start_sig_column(&tx)?;
+            validate_terminals_tx(&tx)?;
+            tx.commit().map_err(store_db)?;
             Ok(())
         })
         .await

@@ -187,6 +187,64 @@ pub(super) fn ensure_run_start_sig_column(
     Ok(())
 }
 
+pub(super) fn validate_terminals_tx(tx: &Transaction<'_>) -> Result<(), MachineError> {
+    let invalid = tx
+        .query_row(
+            "SELECT run_id
+              FROM typemach_run_events
+              WHERE terminal = 1
+                AND CASE
+                    WHEN json_valid(event) = 0 THEN 1
+                    WHEN json_type(event) IS NOT 'object'
+                    THEN 1
+                    WHEN json_type(event, '$.run_id') IS NOT 'text'
+                      OR json_type(event, '$.session_id') IS NOT 'text'
+                      OR json_type(event, '$.seq') IS NOT 'integer'
+                      OR json_type(event, '$.payload') IS NOT 'object'
+                    THEN 1
+                    WHEN json_extract(event, '$.run_id') != run_id
+                      OR json_extract(event, '$.session_id') != session_id
+                      OR json_extract(event, '$.seq') != seq
+                      OR json_remove(event, '$.run_id', '$.session_id', '$.seq', '$.payload') != '{}'
+                      OR json_type(event, '$.payload.type') IS NOT 'text'
+                      OR json_extract(event, '$.payload.type') NOT IN (
+                          'done', 'interrupt', 'fail', 'cancel'
+                      )
+                    THEN 1
+                    ELSE CASE json_extract(event, '$.payload.type')
+                        WHEN 'done' THEN
+                            json_type(event, '$.payload.output') IS NULL
+                            OR json_type(event, '$.payload.checkpoint') IS NOT 'text'
+                            OR json_extract(event, '$.payload.checkpoint') != run_id
+                            OR json_remove(
+                                json_extract(event, '$.payload'),
+                                '$.type', '$.output', '$.checkpoint'
+                            ) != '{}'
+                        WHEN 'interrupt' THEN
+                            json_type(event, '$.payload.interrupt') IS NULL
+                            OR json_type(event, '$.payload.checkpoint') IS NOT 'text'
+                            OR json_extract(event, '$.payload.checkpoint') != run_id
+                            OR json_remove(
+                                json_extract(event, '$.payload'),
+                                '$.type', '$.interrupt', '$.checkpoint'
+                            ) != '{}'
+                        ELSE 0
+                    END
+                END
+              LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(store_db)?;
+    match invalid {
+        Some(run) => Err(MachineError::InvalidRunEvent {
+            reason: format!("terminal {run} does not match the compact contract"),
+        }),
+        None => Ok(()),
+    }
+}
+
 pub(super) fn run_start_sig_tx(
     tx: &Transaction<'_>,
     run_id: &RunId,

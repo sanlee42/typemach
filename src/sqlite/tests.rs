@@ -115,6 +115,214 @@ fn sqlite_ensure_schema_adds_run_start_columns() {
 }
 
 #[test]
+fn ensure_schema_rejects_noncompact_terminal_without_mutation() {
+    block_on(async {
+        let store = SqliteStore::<crate::runtime::Event>::memory()
+            .await
+            .expect("store");
+        store.ensure_schema().await.expect("schema");
+        let snapshot = "x".repeat(1_800 * 1024);
+        store
+            .call(move |conn| {
+                conn.execute(
+                    "INSERT INTO typemach_sessions (scope_key, session_id, scope)
+                     VALUES ('{}', 'cutover-session', '{}')",
+                    [],
+                )
+                .map_err(store_db)?;
+                conn.execute(
+                    "INSERT INTO typemach_runs (
+                        run_id, scope_key, session_id, thread_id, scope, agent_kind,
+                        metadata, start_sig, status
+                     ) VALUES (
+                        'cutover-run', '{}', 'cutover-session', 'cutover-thread', '{}',
+                        'test', '{}', '', 'completed'
+                     )",
+                    [],
+                )
+                .map_err(store_db)?;
+                let event = serde_json::json!({
+                    "run_id": "cutover-run",
+                    "session_id": "cutover-session",
+                    "seq": 1,
+                    "payload": {
+                        "type": "done",
+                        "trace": [{"old": true}],
+                        "output": {"ok": true},
+                        "snapshot": {"memory_marker": snapshot}
+                    }
+                });
+                conn.execute(
+                    "INSERT INTO typemach_run_events
+                     (run_id, session_id, seq, terminal, event)
+                     VALUES ('cutover-run', 'cutover-session', 1, 1, ?1)",
+                    [event.to_string()],
+                )
+                .map_err(store_db)?;
+                Ok(())
+            })
+            .await
+            .expect("old terminal");
+
+        let error = store
+            .ensure_schema()
+            .await
+            .expect_err("noncompact terminal must fail schema validation");
+        assert!(matches!(
+            error,
+            MachineError::InvalidRunEvent { ref reason }
+                if reason == "terminal cutover-run does not match the compact contract"
+        ));
+        let payload = store
+            .call(|conn| {
+                conn.query_row(
+                    "SELECT event -> '$.payload'
+                       FROM typemach_run_events
+                      WHERE run_id = 'cutover-run'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(store_db)
+            })
+            .await
+            .expect("compact payload");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).expect("payload JSON"),
+            serde_json::json!({
+                "type": "done",
+                "trace": [{"old": true}],
+                "output": {"ok": true},
+                "snapshot": {"memory_marker": "x".repeat(1_800 * 1024)}
+            })
+        );
+
+        for (name, invalid) in [
+            ("malformed", "{"),
+            ("scalar", "7"),
+            ("array", "[]"),
+            ("empty object", "{}"),
+            ("missing envelope", r#"{"payload":{"type":"cancel"}}"#),
+            (
+                "invalid envelope",
+                r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":"1","payload":{"type":"cancel"}}"#,
+            ),
+        ] {
+            let fixture = invalid.to_owned();
+            store
+                .call(move |conn| {
+                    conn.execute(
+                        "UPDATE typemach_run_events SET event = ?1 WHERE run_id = 'cutover-run'",
+                        [fixture],
+                    )
+                    .map_err(store_db)?;
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{name} terminal fixture: {error}"));
+            let error = match store.ensure_schema().await {
+                Ok(()) => panic!("{name} terminal must fail schema validation"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                MachineError::InvalidRunEvent { ref reason }
+                    if reason == "terminal cutover-run does not match the compact contract"
+            ));
+            let raw = store
+                .call(|conn| {
+                    conn.query_row(
+                        "SELECT event FROM typemach_run_events WHERE run_id = 'cutover-run'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(store_db)
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{name} terminal after rejection: {error}"));
+            assert_eq!(raw, invalid, "{name} terminal mutated");
+        }
+
+        for valid in [
+            r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":1,"payload":{"type":"fail","error":"failed"}}"#,
+            r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":1,"payload":{"type":"cancel"}}"#,
+        ] {
+            let fixture = valid.to_owned();
+            store
+                .call(move |conn| {
+                    conn.execute(
+                        "UPDATE typemach_run_events SET event = ?1 WHERE run_id = 'cutover-run'",
+                        [fixture],
+                    )
+                    .map_err(store_db)?;
+                    Ok(())
+                })
+                .await
+                .expect("valid terminal fixture");
+            store
+                .ensure_schema()
+                .await
+                .expect("valid terminal contract");
+        }
+    });
+}
+
+#[test]
+fn ensure_schema_accepts_ten_thousand_exact_compact_terminals() {
+    block_on(async {
+        let store = SqliteStore::<crate::runtime::Event>::memory()
+            .await
+            .expect("store");
+        store.ensure_schema().await.expect("schema");
+        store
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO typemach_sessions (scope_key, session_id, scope)
+                     VALUES ('{}', 'compact-session', '{}')",
+                    [],
+                )
+                .map_err(store_db)?;
+                conn.execute(
+                    "WITH RECURSIVE n(x) AS (
+                        VALUES(0) UNION ALL SELECT x + 1 FROM n WHERE x < 9999
+                     )
+                     INSERT INTO typemach_runs (
+                        run_id, scope_key, session_id, thread_id, scope, agent_kind,
+                        metadata, start_sig, status
+                     )
+                     SELECT printf('compact-%05d', x), '{}', 'compact-session',
+                            printf('compact-thread-%05d', x), '{}', 'test', '{}', '', 'completed'
+                       FROM n",
+                    [],
+                )
+                .map_err(store_db)?;
+                conn.execute(
+                    "INSERT INTO typemach_run_events (run_id, session_id, seq, terminal, event)
+                     SELECT run_id, 'compact-session', 1, 1,
+                            json_object(
+                                'run_id', run_id,
+                                'session_id', 'compact-session',
+                                'seq', 1,
+                                'payload', json_object(
+                                    'type', 'done',
+                                    'output', json_object('ok', json('true')),
+                                    'checkpoint', run_id
+                                )
+                            )
+                       FROM typemach_runs
+                      WHERE run_id LIKE 'compact-%'",
+                    [],
+                )
+                .map_err(store_db)?;
+                Ok(())
+            })
+            .await
+            .expect("compact terminal");
+
+        store.ensure_schema().await.expect("compact contract");
+    });
+}
+
+#[test]
 fn terminal_lookup_work_is_independent_of_history() {
     block_on(async {
         let store = SqliteStore::<TestEvent>::memory().await.expect("store");

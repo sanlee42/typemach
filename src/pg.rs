@@ -68,14 +68,14 @@ impl<E, Scope, Data> PgStore<E, Scope, Data> {
     }
 
     pub async fn ensure_schema(&self) -> Result<(), MachineError> {
-        let client = self
+        let mut client = self
             .pool
             .get()
             .await
             .map_err(|err| store_msg(format!("acquire pool client: {err}")))?;
-        client
-            .batch_execute(
-                "CREATE TABLE IF NOT EXISTS typemach_checkpoints (
+        let tx = client.transaction().await.map_err(store_db)?;
+        tx.batch_execute(
+            "CREATE TABLE IF NOT EXISTS typemach_checkpoints (
                     thread_id TEXT PRIMARY KEY,
                     version INTEGER NOT NULL DEFAULT 1,
                     state JSONB NOT NULL,
@@ -205,9 +205,57 @@ impl<E, Scope, Data> PgStore<E, Scope, Data> {
                         REFERENCES typemach_sessions(scope_key, session_id)
                         ON DELETE CASCADE
                 );",
+        )
+        .await
+        .map_err(store_db)?;
+        let invalid = tx
+            .query_opt(
+                "SELECT run_id
+                  FROM typemach_run_events
+                  WHERE terminal
+                    AND CASE
+                        WHEN jsonb_typeof(event) IS DISTINCT FROM 'object'
+                        THEN TRUE
+                        WHEN jsonb_typeof(event -> 'run_id') IS DISTINCT FROM 'string'
+                          OR jsonb_typeof(event -> 'session_id') IS DISTINCT FROM 'string'
+                          OR jsonb_typeof(event -> 'seq') IS DISTINCT FROM 'number'
+                          OR jsonb_typeof(event -> 'payload') IS DISTINCT FROM 'object'
+                        THEN TRUE
+                        WHEN event ->> 'run_id' != run_id
+                          OR event ->> 'session_id' != session_id
+                          OR event -> 'seq' != to_jsonb(seq)
+                          OR event - 'run_id' - 'session_id' - 'seq' - 'payload' != '{}'::jsonb
+                          OR jsonb_typeof(event #> '{payload,type}') IS DISTINCT FROM 'string'
+                          OR event #>> '{payload,type}' NOT IN (
+                              'done', 'interrupt', 'fail', 'cancel'
+                          )
+                        THEN TRUE
+                        ELSE CASE event #>> '{payload,type}'
+                            WHEN 'done' THEN
+                                NOT (event -> 'payload' ? 'output')
+                                OR jsonb_typeof(event #> '{payload,checkpoint}') IS DISTINCT FROM 'string'
+                                OR event #>> '{payload,checkpoint}' != run_id
+                                OR (event -> 'payload') - 'type' - 'output' - 'checkpoint' != '{}'::jsonb
+                            WHEN 'interrupt' THEN
+                                NOT (event -> 'payload' ? 'interrupt')
+                                OR jsonb_typeof(event #> '{payload,checkpoint}') IS DISTINCT FROM 'string'
+                                OR event #>> '{payload,checkpoint}' != run_id
+                                OR (event -> 'payload') - 'type' - 'interrupt' - 'checkpoint' != '{}'::jsonb
+                            ELSE FALSE
+                        END
+                    END
+                  LIMIT 1",
+                &[],
             )
             .await
             .map_err(store_db)?;
+        if let Some(row) = invalid {
+            let run = row.get::<_, String>(0);
+            return Err(MachineError::InvalidRunEvent {
+                reason: format!("terminal {run} does not match the compact contract"),
+            });
+        }
+        tx.commit().await.map_err(store_db)?;
         Ok(())
     }
 }

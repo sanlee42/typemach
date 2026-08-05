@@ -119,6 +119,154 @@ fn pg_ensure_schema_adds_run_start_columns() {
     });
 }
 
+#[test]
+fn pg_ensure_schema_rejects_noncompact_terminal_without_mutation() {
+    let Some(url) = std::env::var("TEST_DATABASE_URL").ok() else {
+        eprintln!(
+            "skip pg_ensure_schema_rejects_noncompact_terminal_without_mutation: set TEST_DATABASE_URL to run postgres tests"
+        );
+        return;
+    };
+    check_test_url(&url);
+
+    block_on(async {
+        let store = PgStore::<crate::runtime::Event>::new(pool(url));
+        reset_schema(&store).await.expect("reset schema");
+        store.ensure_schema().await.expect("schema");
+        let client = store.pool().get().await.expect("pool client");
+        client
+            .batch_execute(
+                "INSERT INTO typemach_sessions (scope_key, session_id, scope)
+                 VALUES ('{}', 'cutover-session', '{}');
+                 INSERT INTO typemach_runs (
+                    run_id, scope_key, session_id, thread_id, scope, agent_kind,
+                    metadata, start_sig, status
+                 ) VALUES (
+                    'cutover-run', '{}', 'cutover-session', 'cutover-thread', '{}',
+                    'test', '{}', '', 'completed'
+                 );
+                 INSERT INTO typemach_run_events (run_id, session_id, seq, terminal, event)
+                 VALUES (
+                    'cutover-run', 'cutover-session', 1, TRUE,
+                    '{
+                        \"run_id\": \"cutover-run\",
+                        \"session_id\": \"cutover-session\",
+                        \"seq\": 1,
+                        \"payload\": {
+                            \"type\": \"done\",
+                            \"output\": {\"ok\": true},
+                            \"checkpoint\": \"cutover-run\"
+                        }
+                    }'::jsonb
+                 );",
+            )
+            .await
+            .expect("compact terminal");
+        drop(client);
+        store.ensure_schema().await.expect("compact contract");
+
+        let client = store.pool().get().await.expect("pool client");
+        client
+            .execute(
+                "UPDATE typemach_run_events
+                    SET event = jsonb_set(event, '{payload,snapshot}', '{\"old\": true}'::jsonb)
+                  WHERE run_id = 'cutover-run'",
+                &[],
+            )
+            .await
+            .expect("noncompact fixture");
+        drop(client);
+
+        let error = store
+            .ensure_schema()
+            .await
+            .expect_err("noncompact terminal must fail schema validation");
+        assert!(matches!(
+            error,
+            MachineError::InvalidRunEvent { ref reason }
+                if reason == "terminal cutover-run does not match the compact contract"
+        ));
+        let client = store.pool().get().await.expect("pool client");
+        let snapshot = client
+            .query_one(
+                "SELECT (event #> '{payload,snapshot}')::text
+                   FROM typemach_run_events
+                  WHERE run_id = 'cutover-run'",
+                &[],
+            )
+            .await
+            .expect("stored terminal")
+            .get::<_, String>(0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&snapshot).expect("snapshot JSON"),
+            serde_json::json!({"old": true})
+        );
+
+        for (name, invalid) in [
+            ("scalar", "7"),
+            ("array", "[]"),
+            ("empty object", "{}"),
+            ("missing envelope", r#"{"payload":{"type":"cancel"}}"#),
+            (
+                "invalid envelope",
+                r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":"1","payload":{"type":"cancel"}}"#,
+            ),
+        ] {
+            let client = store.pool().get().await.expect("pool client");
+            client
+                .execute(
+                    "UPDATE typemach_run_events SET event = $1::jsonb WHERE run_id = 'cutover-run'",
+                    &[&invalid],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{name} terminal fixture: {error}"));
+            drop(client);
+            let error = match store.ensure_schema().await {
+                Ok(()) => panic!("{name} terminal must fail schema validation"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                MachineError::InvalidRunEvent { ref reason }
+                    if reason == "terminal cutover-run does not match the compact contract"
+            ));
+            let client = store.pool().get().await.expect("pool client");
+            let raw = client
+                .query_one(
+                    "SELECT event::text FROM typemach_run_events WHERE run_id = 'cutover-run'",
+                    &[],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{name} terminal after rejection: {error}"))
+                .get::<_, String>(0);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&raw).expect("stored JSON"),
+                serde_json::from_str::<serde_json::Value>(invalid).expect("fixture JSON"),
+                "{name} terminal mutated"
+            );
+        }
+
+        for valid in [
+            r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":1,"payload":{"type":"fail","error":"failed"}}"#,
+            r#"{"run_id":"cutover-run","session_id":"cutover-session","seq":1,"payload":{"type":"cancel"}}"#,
+        ] {
+            let client = store.pool().get().await.expect("pool client");
+            client
+                .execute(
+                    "UPDATE typemach_run_events SET event = $1::jsonb WHERE run_id = 'cutover-run'",
+                    &[&valid],
+                )
+                .await
+                .expect("valid terminal fixture");
+            drop(client);
+            store
+                .ensure_schema()
+                .await
+                .expect("valid terminal contract");
+        }
+    });
+}
+
 fn check_test_url(url: &str) {
     let db = database_name(url);
     if db != "scratch" && !db.contains("test") {
