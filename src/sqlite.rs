@@ -193,7 +193,12 @@ impl<E, Scope, Data> SqliteStore<E, Scope, Data> {
                     FOREIGN KEY (scope_key, session_id)
                         REFERENCES typemach_sessions(scope_key, session_id)
                         ON DELETE CASCADE
-                );",
+                );
+                CREATE INDEX IF NOT EXISTS typemach_entries_thread_idx
+                    ON typemach_entries (
+                        scope_key, session_id, thread_id, kind, vis, seq,
+                        run_id, created_at
+                    );",
             )
             .map_err(store_db)?;
             ensure_run_input_column(&tx)?;

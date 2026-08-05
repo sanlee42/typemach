@@ -115,6 +115,105 @@ fn sqlite_ensure_schema_adds_run_start_columns() {
 }
 
 #[test]
+fn sqlite_ensure_schema_adds_thread_entry_index() {
+    block_on(async {
+        let store = SqliteStore::<crate::testkit::TestEvent>::memory()
+            .await
+            .expect("store");
+        store
+            .call(|conn| {
+                conn.execute_batch(
+                    "CREATE TABLE typemach_entries (
+                        scope_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        seq INTEGER NOT NULL,
+                        run_id TEXT NOT NULL,
+                        thread_id TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        vis TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (scope_key, session_id, key),
+                        UNIQUE (scope_key, session_id, seq)
+                    );",
+                )
+                .map_err(store_db)?;
+                Ok(())
+            })
+            .await
+            .expect("old schema");
+
+        store.ensure_schema().await.expect("schema");
+        let columns = store
+            .call(|conn| {
+                let mut stmt = conn
+                    .prepare("PRAGMA index_info(typemach_entries_thread_idx)")
+                    .map_err(store_db)?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(2))
+                    .map_err(store_db)?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(store_db)
+            })
+            .await
+            .expect("index columns");
+
+        assert_eq!(
+            columns,
+            [
+                "scope_key",
+                "session_id",
+                "thread_id",
+                "kind",
+                "vis",
+                "seq",
+                "run_id",
+                "created_at",
+            ]
+        );
+
+        let plans = store
+            .call(|conn| {
+                conn.execute(
+                    "INSERT INTO typemach_entries (
+                        scope_key, session_id, seq, run_id, thread_id, key,
+                        kind, vis, body, created_at, updated_at
+                    ) VALUES ('scope', 'session', 1, 'run', 'thread', 'key',
+                              'kind', 'public', ?1, 1, 1)",
+                    ["x".repeat(256 * 1024)],
+                )
+                .map_err(store_db)?;
+                [
+                    "SELECT run_id FROM typemach_entries
+                     WHERE scope_key = 'scope' AND session_id = 'session'
+                       AND thread_id = 'thread' AND kind = 'kind' AND vis = 'public'
+                     ORDER BY seq DESC LIMIT 1",
+                    "SELECT created_at FROM typemach_entries
+                     WHERE scope_key = 'scope' AND session_id = 'session'
+                       AND thread_id = 'thread' AND kind = 'kind' AND vis = 'public'
+                     ORDER BY seq LIMIT 1",
+                ]
+                .into_iter()
+                .map(|query| {
+                    conn.query_row(&format!("EXPLAIN QUERY PLAN {query}"), [], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .map_err(store_db)
+                })
+                .collect::<Result<Vec<_>, _>>()
+            })
+            .await
+            .expect("query plans");
+        assert!(
+            plans
+                .iter()
+                .all(|plan| { plan.contains("USING COVERING INDEX typemach_entries_thread_idx") })
+        );
+    });
+}
+
+#[test]
 fn ensure_schema_rejects_noncompact_terminal_without_mutation() {
     block_on(async {
         let store = SqliteStore::<crate::runtime::Event>::memory()
