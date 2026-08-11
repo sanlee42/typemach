@@ -167,8 +167,7 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<Value>,
+    thinking: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,7 +262,10 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
         messages.push(json!({ "role": "system", "content": system }));
     }
     messages.extend(messages_to_chat(&request.messages)?);
-    let thinking = thinking_body(config);
+    // DeepSeek defaults an omitted toggle to enabled, so both modes must be explicit.
+    let thinking_enabled = matches!(config.speed_profile, SpeedProfile::FlashWithAutoThinking)
+        && config.thinking.enabled;
+    let thinking = thinking_body(thinking_enabled);
     let tools = tools_to_chat(&request.tools);
     // tool_choice=required is only valid when tools are offered.
     let tool_choice = if tools.is_empty() {
@@ -276,9 +278,7 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
         messages,
         stream: config.stream,
         tools,
-        reasoning_effort: thinking
-            .as_ref()
-            .map(|_| effort_value(config.thinking.reasoning_effort)),
+        reasoning_effort: thinking_enabled.then(|| effort_value(config.thinking.reasoning_effort)),
         thinking,
         max_tokens: config.max_tokens,
         tool_choice,
@@ -312,14 +312,8 @@ fn tool_choice_value(choice: ToolChoice) -> &'static str {
     }
 }
 
-fn thinking_body(config: &AgentConfig) -> Option<Value> {
-    match config.speed_profile {
-        SpeedProfile::Flash => None,
-        SpeedProfile::FlashWithAutoThinking if config.thinking.enabled => {
-            Some(json!({ "type": "enabled" }))
-        }
-        SpeedProfile::FlashWithAutoThinking => None,
-    }
+fn thinking_body(enabled: bool) -> Value {
+    json!({ "type": if enabled { "enabled" } else { "disabled" } })
 }
 
 fn effort_value(effort: ReasoningEffort) -> &'static str {
