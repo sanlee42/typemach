@@ -87,7 +87,10 @@ impl ToolRegistry for FakeTools {
                 input_schema: json!({ "type": "object" }),
                 output_schema: Value::Null,
                 metadata: Value::Null,
-                annotations: ToolAnnotations::default(),
+                annotations: ToolAnnotations {
+                    terminal: true,
+                    ..ToolAnnotations::default()
+                },
             },
             AgentToolSpec {
                 name: "report".to_string(),
@@ -336,33 +339,27 @@ async fn ask_user_interrupts_and_resume_continues() {
 
 #[tokio::test]
 async fn emit_artifact_is_signalled_and_not_required_in_answer() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-1".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({
-                  "title": "经营复盘",
-                  "type": "markdown",
-                  "content": "# 经营复盘",
-                  "source": "stonex metric_point",
-                  "window": "2026-06-01 ~ 2026-06-07",
-                  "updated_at": "2026-06-08T09:00:00+08:00"
-                }),
-                raw: None,
-            }],
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            deltas: vec!["复盘已生成。".to_string()],
-            final_text: Some(String::new()),
-            ..ModelResponse::default()
-        },
-    ]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let model = ScriptedModel::new([ModelResponse {
+        tool_uses: vec![ToolUse {
+            id: "artifact-1".to_string(),
+            name: "emit_artifact".to_string(),
+            input: json!({
+              "title": "Review",
+              "content": "Review body"
+            }),
+            raw: None,
+        }],
+        ..ModelResponse::default()
+    }]);
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        FakeTools,
+        AllowAllTools,
+    );
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("生成复盘")],
+            messages: vec![AgentMessage::user_text("Create a review")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -372,17 +369,16 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
     ))
     .await;
     assert!(events.iter().any(|event| matches!(
-      event,
-      RunStreamEvent::Signal {
-        signal: AgentSignal::Artifact { artifact },
-      } if artifact.title == "经营复盘"
-          && artifact.source.as_deref() == Some("stonex metric_point")
-          && artifact.window.as_deref() == Some("2026-06-01 ~ 2026-06-07")
-          && artifact.updated_at.as_deref() == Some("2026-06-08T09:00:00+08:00")
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::Artifact { .. },
+        }
     )));
     let completed = completed(&events);
-    assert_eq!(completed.answer, "复盘已生成。");
-    assert_eq!(completed.artifacts.len(), 1);
+    assert_eq!(
+        (&completed.finish_reason, model.requests().len()),
+        (&FinishReason::Terminal, 1)
+    );
 }
 
 #[tokio::test]

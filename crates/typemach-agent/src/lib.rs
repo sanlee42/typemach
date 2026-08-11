@@ -452,7 +452,10 @@ where
                 state.pending_human = Some(tool_use);
                 return Ok(Transition::Interrupt(question));
             }
-            if is_terminal_tool(&tool_use, spec) {
+            let terminal = is_terminal_tool(&tool_use, spec);
+            // Registry terminal tools are actions themselves. The built-in
+            // artifact must first be materialized and emitted by this runner.
+            if terminal && tool_use.name != "emit_artifact" {
                 let action = terminal_action(&tool_use);
                 if state.answer.is_empty()
                     && let Some(message) = terminal_message(&tool_use)
@@ -511,6 +514,15 @@ where
             state
                 .messages
                 .push(AgentMessage::tool_result(prompt_result));
+            if terminal {
+                let action = terminal_action(&tool_use);
+                ctx.emit(AgentSignal::Terminal {
+                    action: action.clone(),
+                })
+                .await?;
+                state.terminal = Some(action);
+                return Ok(Transition::Complete(state.output(FinishReason::Terminal)));
+            }
         }
         Ok(Transition::Next(AgentStep::ModelStep))
     }
