@@ -6,11 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use typemach_agent::{
     AgentConfig, AgentMessage, AgentModel, AgentToolSpec, ConfiguredModel, ContentBlock,
-    ModelRequest, ModelStream, StopReason, ToolAnnotations,
+    ModelRequest, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolAnnotations,
 };
 
 #[tokio::test]
-async fn flash_request_omits_thinking_and_decodes_tool_call() {
+async fn flash_request_disables_thinking_and_decodes_tool_call() {
     let response = json!({
         "id": "chatcmpl-1",
         "choices": [{
@@ -54,7 +54,7 @@ async fn flash_request_omits_thinking_and_decodes_tool_call() {
     let body = captured_json(&captured);
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["stream"], false);
-    assert!(body.get("thinking").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
     assert!(body.get("reasoning_effort").is_none());
     assert_eq!(body["tools"][0]["function"]["name"], "metric_point");
     assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
@@ -70,6 +70,47 @@ async fn flash_request_omits_thinking_and_decodes_tool_call() {
                 && tool.name == "metric_point"
                 && tool.input["metric_id"] == "paid_order_count"
     )));
+}
+
+#[tokio::test]
+async fn auto_thinking_request_enables_thinking_with_effort() {
+    let response = json!({
+        "id": "chatcmpl-thinking",
+        "choices": [{
+            "message": {
+                "reasoning_content": "inspect evidence",
+                "content": "result"
+            },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, captured) = spawn_server(response, "application/json").await;
+    let mut config = AgentConfig::new("sk-test", "deepseek-v4-pro");
+    config.base_url = base_url;
+    config.stream = false;
+    config.speed_profile = SpeedProfile::FlashWithAutoThinking;
+    config.thinking.enabled = true;
+    config.thinking.reasoning_effort = ReasoningEffort::High;
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+    model
+        .next_step(
+            ModelRequest {
+                messages: vec![AgentMessage::user_text("analyze deeply")],
+                tools: Vec::new(),
+                context: Value::Null,
+                turn: 1,
+                system_suffix: None,
+            },
+            stream,
+        )
+        .await
+        .expect("response");
+
+    let body = captured_json(&captured);
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "high");
 }
 
 #[tokio::test]
