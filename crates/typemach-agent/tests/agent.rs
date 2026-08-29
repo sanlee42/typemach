@@ -15,6 +15,9 @@ use typemach_agent::{
     ToolResult, ToolUse, build_agent_runner, build_agent_runner_with_context_policy,
 };
 
+#[path = "agent/final_answer.rs"]
+mod final_answer;
+
 #[derive(Clone, Default)]
 struct ScriptedModel {
     responses: Arc<Mutex<VecDeque<ModelResponse>>>,
@@ -448,7 +451,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         tool_uses: vec![ToolUse {
             id: "term-1".to_string(),
             name: "report".to_string(),
-            input: json!({ "message": "当前没有足够证据继续。" }),
+            input: json!({ "message": "Not enough evidence to continue." }),
             raw: None,
         }],
         stop_reason: Some(StopReason::ToolUse),
@@ -457,7 +460,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("生成报告")],
+            messages: vec![AgentMessage::user_text("Create a report")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -474,7 +477,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
     )));
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::Terminal);
-    assert_eq!(completed.answer, "当前没有足够证据继续。");
+    assert!(completed.answer.is_empty());
     assert!(matches!(
         completed.terminal.as_ref(),
         Some(TerminalAction { name, .. }) if name == "report"
@@ -797,10 +800,10 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
 }
 
 #[tokio::test]
-async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
+async fn max_tokens_does_not_commit_a_partial_answer_or_dispatch_tools() {
     let model = ScriptedModel::new([ModelResponse {
         content: vec![ContentBlock::Text {
-            text: "部分回答".to_string(),
+            text: "Partial answer".to_string(),
         }],
         tool_uses: vec![ToolUse {
             id: "tool-1".to_string(),
@@ -814,7 +817,7 @@ async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("写个超长报告")],
+            messages: vec![AgentMessage::user_text("Write a long report")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -834,7 +837,7 @@ async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
     );
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert_eq!(completed.answer, "部分回答");
+    assert!(completed.answer.is_empty());
     assert!(matches!(
         completed.messages.last(),
         Some(AgentMessage::Assistant { content })

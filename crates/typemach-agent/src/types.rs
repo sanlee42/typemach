@@ -532,7 +532,7 @@ pub enum FinishReason {
     Terminal,
     MaxModelTurns,
     MaxToolCalls,
-    /// The model hit its output token limit; the answer may be truncated.
+    /// The model hit its output token limit; partial text remains in messages.
     MaxTokens,
 }
 

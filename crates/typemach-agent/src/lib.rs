@@ -67,9 +67,13 @@ impl AgentState {
     }
 
     fn output(&self, finish_reason: FinishReason) -> AgentRunOutput {
+        self.output_with_answer(finish_reason, String::new())
+    }
+
+    fn output_with_answer(&self, finish_reason: FinishReason, answer: String) -> AgentRunOutput {
         AgentRunOutput {
             messages: self.messages.clone(),
-            answer: self.answer.clone(),
+            answer,
             finish_reason,
             terminal: self.terminal.clone(),
             usage: self.usage.clone(),
@@ -408,20 +412,29 @@ where
                 state.next_delta_index += 1;
                 assistant_content.push(ContentBlock::Text { text: final_text });
             }
+            let answer = final_answer(&assistant_content);
             if !assistant_content.is_empty() {
                 state.messages.push(AgentMessage::Assistant {
                     content: assistant_content,
                 });
             }
-            return Ok(Transition::Complete(state.output(FinishReason::Stop)));
+            if state.pending_tools.is_empty() {
+                return Ok(Transition::Complete(
+                    state.output_with_answer(FinishReason::Stop, answer),
+                ));
+            }
+            return Ok(Transition::Next(AgentStep::DispatchTools));
         }
+        let answer = final_answer(&assistant_content);
         if !assistant_content.is_empty() {
             state.messages.push(AgentMessage::Assistant {
                 content: assistant_content,
             });
         }
         if state.pending_tools.is_empty() {
-            return Ok(Transition::Complete(state.output(FinishReason::Stop)));
+            return Ok(Transition::Complete(
+                state.output_with_answer(FinishReason::Stop, answer),
+            ));
         }
         Ok(Transition::Next(AgentStep::DispatchTools))
     }
@@ -635,6 +648,22 @@ async fn append_delta(
     state.next_delta_index += 1;
     assistant_content.push(ContentBlock::Text { text: delta });
     Ok(())
+}
+
+fn final_answer(content: &[ContentBlock]) -> String {
+    if content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+    {
+        return String::new();
+    }
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn record_assistant_block(
