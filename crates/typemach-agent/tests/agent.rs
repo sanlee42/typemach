@@ -15,6 +15,8 @@ use typemach_agent::{
     ToolResult, ToolUse, build_agent_runner, build_agent_runner_with_context_policy,
 };
 
+#[path = "agent/builtin_validation.rs"]
+mod builtin_validation;
 #[path = "agent/final_answer.rs"]
 mod final_answer;
 

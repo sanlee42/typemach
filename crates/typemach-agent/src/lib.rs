@@ -456,19 +456,25 @@ where
                 ));
             }
             let spec = specs.iter().find(|spec| spec.name == tool_use.name);
-            if tool_use.name == "ask_user" {
+            let built_in_error = if tool_use.name == "ask_user" {
                 if let Some(result) = self.consume_human_answer(state, &tool_use, ctx).await? {
                     state.messages.push(AgentMessage::tool_result(result));
                     continue;
                 }
-                let question = ask_user_question(&tool_use)?;
-                state.pending_human = Some(tool_use);
-                return Ok(Transition::Interrupt(question));
-            }
+                match ask_user_question(&tool_use) {
+                    Ok(question) => {
+                        state.pending_human = Some(tool_use);
+                        return Ok(Transition::Interrupt(question));
+                    }
+                    Err(err) => Some(ToolResult::error(&tool_use, err.to_string())),
+                }
+            } else {
+                None
+            };
             let terminal = is_terminal_tool(&tool_use, spec);
             // Registry terminal tools are actions themselves. The built-in
             // artifact must first be materialized and emitted by this runner.
-            if terminal && tool_use.name != "emit_artifact" {
+            if terminal && built_in_error.is_none() && tool_use.name != "emit_artifact" {
                 let action = terminal_action(&tool_use);
                 if state.answer.is_empty()
                     && let Some(message) = terminal_message(&tool_use)
@@ -488,8 +494,13 @@ where
                 name: tool_use.name.clone(),
             })
             .await?;
-            let result = if tool_use.name == "emit_artifact" {
-                self.emit_artifact(state, ctx, &tool_use).await?
+            let result = if let Some(result) = built_in_error {
+                result
+            } else if tool_use.name == "emit_artifact" {
+                match artifact_from_tool(&tool_use) {
+                    Ok(artifact) => self.emit_artifact(state, ctx, &tool_use, artifact).await?,
+                    Err(err) => ToolResult::error(&tool_use, err.to_string()),
+                }
             } else {
                 match self.policy.check(&tool_use, spec, &state.context) {
                     PermissionDecision::Allow => self
@@ -527,7 +538,7 @@ where
             state
                 .messages
                 .push(AgentMessage::tool_result(prompt_result));
-            if terminal {
+            if terminal && !result.is_error {
                 let action = terminal_action(&tool_use);
                 ctx.emit(AgentSignal::Terminal {
                     action: action.clone(),
@@ -588,8 +599,8 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
         tool_use: &ToolUse,
+        artifact: Artifact,
     ) -> Result<ToolResult, MachineError> {
-        let artifact = artifact_from_tool(tool_use)?;
         state.artifacts.push(artifact.clone());
         ctx.emit(AgentSignal::Artifact { artifact }).await?;
         Ok(ToolResult::ok(tool_use, json!({ "ok": true })))
@@ -686,7 +697,7 @@ async fn record_assistant_block(
     }
 }
 
-fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError> {
+fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, AgentError> {
     let question = tool_use
         .input
         .get("question")
@@ -694,7 +705,6 @@ fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
             AgentError::InvalidBuiltInTool("ask_user requires non-empty question".to_string())
-                .machine()
         })?
         .to_string();
     Ok(AskUserQuestion {
@@ -729,7 +739,7 @@ fn terminal_message(tool_use: &ToolUse) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, MachineError> {
+fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, AgentError> {
     let title = required_string(&tool_use.input, "title")?;
     let content = required_string(&tool_use.input, "content")?;
     let kind = tool_use
@@ -763,13 +773,11 @@ fn optional_string(input: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn required_string(input: &Value, name: &str) -> Result<String, MachineError> {
+fn required_string(input: &Value, name: &str) -> Result<String, AgentError> {
     input
         .get(name)
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
-        .ok_or_else(|| {
-            AgentError::InvalidBuiltInTool(format!("missing non-empty {name}")).machine()
-        })
+        .ok_or_else(|| AgentError::InvalidBuiltInTool(format!("missing non-empty {name}")))
 }
