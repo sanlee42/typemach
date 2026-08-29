@@ -120,13 +120,42 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
 }
 
 #[tokio::test]
-async fn invalid_artifact_is_paired_before_the_model_corrects_it() {
+async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     let model = ScriptedModel::new([
         ModelResponse {
             tool_uses: vec![ToolUse {
-                id: "artifact-bad".to_string(),
+                id: "artifact-missing-type".to_string(),
                 name: "emit_artifact".to_string(),
-                input: json!({ "title": "", "content": "Review body" }),
+                input: json!({ "title": "Review", "content": "Review body" }),
+                raw: None,
+            }],
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            tool_uses: vec![ToolUse {
+                id: "artifact-invalid-type".to_string(),
+                name: "emit_artifact".to_string(),
+                input: json!({
+                    "title": "Review",
+                    "type": "chart",
+                    "content": "Review body"
+                }),
+                raw: None,
+            }],
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            tool_uses: vec![ToolUse {
+                id: "artifact-invalid-source".to_string(),
+                name: "emit_artifact".to_string(),
+                input: json!({
+                    "title": "Review",
+                    "type": "markdown",
+                    "content": "Review body",
+                    "source": 42
+                }),
                 raw: None,
             }],
             stop_reason: Some(StopReason::ToolUse),
@@ -136,7 +165,11 @@ async fn invalid_artifact_is_paired_before_the_model_corrects_it() {
             tool_uses: vec![ToolUse {
                 id: "artifact-good".to_string(),
                 name: "emit_artifact".to_string(),
-                input: json!({ "title": "Review", "content": "Review body" }),
+                input: json!({
+                    "title": "Review",
+                    "type": "table",
+                    "content": "Review body"
+                }),
                 raw: None,
             }],
             stop_reason: Some(StopReason::ToolUse),
@@ -166,17 +199,29 @@ async fn invalid_artifact_is_paired_before_the_model_corrects_it() {
     ))
     .await;
 
-    assert_error_lifecycle(&events, "artifact-bad");
+    for tool_use_id in [
+        "artifact-missing-type",
+        "artifact-invalid-type",
+        "artifact-invalid-source",
+    ] {
+        assert_error_lifecycle(&events, tool_use_id);
+    }
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
             signal: AgentSignal::Artifact { artifact },
-        } if artifact.tool_use_id == "artifact-good"
+        } if artifact.tool_use_id == "artifact-good" && artifact.kind == "table"
     )));
     let output = completed(&events);
     assert_eq!(output.answer, "Review created.");
-    assert_eq!(paired_results(&output.messages, "artifact-bad"), (1, 1));
-    assert_eq!(model.requests().len(), 3);
+    for tool_use_id in [
+        "artifact-missing-type",
+        "artifact-invalid-type",
+        "artifact-invalid-source",
+    ] {
+        assert_eq!(paired_results(&output.messages, tool_use_id), (1, 1));
+    }
+    assert_eq!(model.requests().len(), 5);
 }
 
 fn assert_error_lifecycle(events: &[Event], tool_use_id: &str) {

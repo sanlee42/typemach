@@ -742,19 +742,18 @@ fn terminal_message(tool_use: &ToolUse) -> Option<String> {
 fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, AgentError> {
     let title = required_string(&tool_use.input, "title")?;
     let content = required_string(&tool_use.input, "content")?;
-    let kind = tool_use
-        .input
-        .get("type")
-        .or_else(|| tool_use.input.get("kind"))
-        .and_then(Value::as_str)
-        .unwrap_or("markdown")
-        .to_string();
+    let kind = required_string(&tool_use.input, "type")?;
+    if !matches!(kind.as_str(), "markdown" | "table") {
+        return Err(AgentError::InvalidBuiltInTool(
+            "type must be markdown or table".to_string(),
+        ));
+    }
     Ok(Artifact {
         tool_use_id: tool_use.id.clone(),
         title,
         kind,
         content,
-        source: optional_string(&tool_use.input, "source"),
+        source: optional_source(&tool_use.input)?,
         window: optional_string(&tool_use.input, "window"),
         updated_at: optional_string(&tool_use.input, "updated_at"),
     })
@@ -771,6 +770,21 @@ fn optional_string(input: &Value, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn optional_source(input: &Value) -> Result<Option<String>, AgentError> {
+    let Some(source) = input.get("source") else {
+        return Ok(None);
+    };
+    source
+        .as_str()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .map(str::to_owned)
+        .map(Some)
+        .ok_or_else(|| {
+            AgentError::InvalidBuiltInTool("source must be a non-empty string".to_string())
+        })
 }
 
 fn required_string(input: &Value, name: &str) -> Result<String, AgentError> {
