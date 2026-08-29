@@ -350,6 +350,7 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
             name: "emit_artifact".to_string(),
             input: json!({
               "title": "Review",
+              "type": "markdown",
               "content": "Review body"
             }),
             raw: None,
