@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::deepseek_stream::decode_stream;
+use crate::responses::{decode_response as decode_responses, responses_request};
+use crate::responses_stream::decode_stream as decode_responses_stream;
 use crate::{
     AgentConfig, AgentError, AgentMessage, AgentModel, AgentToolSpec, ContentBlock, ModelRequest,
     ModelResponse, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolChoice, ToolResult,
@@ -16,7 +18,7 @@ use crate::{
 pub struct ConfiguredModel {
     client: reqwest::Client,
     config: AgentConfig,
-    endpoint: String,
+    endpoint: Endpoint,
 }
 
 impl ConfiguredModel {
@@ -30,7 +32,7 @@ impl ConfiguredModel {
             .read_timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(|err| AgentError::Config(format!("failed to build HTTP client: {err}")))?;
-        let endpoint = chat_endpoint(&config.base_url);
+        let endpoint = endpoint(&config.base_url);
         Ok(Self {
             client,
             config,
@@ -40,7 +42,7 @@ impl ConfiguredModel {
 
     pub fn with_client(client: reqwest::Client, config: AgentConfig) -> Result<Self, AgentError> {
         validate_config(&config)?;
-        let endpoint = chat_endpoint(&config.base_url);
+        let endpoint = endpoint(&config.base_url);
         Ok(Self {
             client,
             config,
@@ -56,7 +58,7 @@ impl AgentModel for ConfiguredModel {
         request: ModelRequest,
         stream: ModelStream,
     ) -> Result<ModelResponse, AgentError> {
-        let body = chat_request(&self.config, request)?;
+        let body = self.request_body(request)?;
         let max_attempts = self.config.max_retries.saturating_add(1);
         let mut attempt = 0_u32;
         loop {
@@ -87,9 +89,20 @@ struct AttemptFailure {
 }
 
 impl ConfiguredModel {
+    fn request_body(&self, request: ModelRequest) -> Result<Value, AgentError> {
+        match self.endpoint.kind {
+            ApiKind::Chat => serde_json::to_value(chat_request(&self.config, request)?)
+                .map_err(|err| AgentError::Model(format!("failed to encode chat request: {err}"))),
+            ApiKind::Responses => serde_json::to_value(responses_request(&self.config, request)?)
+                .map_err(|err| {
+                    AgentError::Model(format!("failed to encode responses request: {err}"))
+                }),
+        }
+    }
+
     async fn attempt(
         &self,
-        body: &ChatRequest,
+        body: &Value,
         stream: &ModelStream,
     ) -> Result<ModelResponse, AttemptFailure> {
         let headers = headers(&self.config).map_err(|err| AttemptFailure {
@@ -97,7 +110,11 @@ impl ConfiguredModel {
             retryable: false,
             retry_after: None,
         })?;
-        let mut request = self.client.post(&self.endpoint).headers(headers).json(body);
+        let mut request = self
+            .client
+            .post(&self.endpoint.url)
+            .headers(headers)
+            .json(body);
         if !self.config.stream {
             request = request.timeout(Duration::from_secs(self.config.request_timeout_secs));
         }
@@ -119,10 +136,11 @@ impl ConfiguredModel {
                 retry_after,
             });
         }
-        let decoded = if self.config.stream {
-            decode_stream(response, stream.clone()).await
-        } else {
-            decode_response(response).await
+        let decoded = match (self.endpoint.kind, self.config.stream) {
+            (ApiKind::Chat, true) => decode_stream(response, stream.clone()).await,
+            (ApiKind::Chat, false) => decode_response(response).await,
+            (ApiKind::Responses, true) => decode_responses_stream(response, stream.clone()).await,
+            (ApiKind::Responses, false) => decode_responses(response).await,
         };
         decoded.map_err(|err| AttemptFailure {
             message: err.to_string(),
@@ -235,16 +253,39 @@ fn validate_config(config: &AgentConfig) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn chat_endpoint(base_url: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKind {
+    Chat,
+    Responses,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Endpoint {
+    kind: ApiKind,
+    url: String,
+}
+
+fn endpoint(base_url: &str) -> Endpoint {
     let trimmed = base_url.trim().trim_end_matches('/');
     if trimmed.ends_with("/chat/completions") {
-        trimmed.to_string()
+        Endpoint {
+            kind: ApiKind::Chat,
+            url: trimmed.to_string(),
+        }
+    } else if trimmed.ends_with("/responses") {
+        Endpoint {
+            kind: ApiKind::Responses,
+            url: trimmed.to_string(),
+        }
     } else {
-        format!("{trimmed}/chat/completions")
+        Endpoint {
+            kind: ApiKind::Responses,
+            url: format!("{trimmed}/responses"),
+        }
     }
 }
 
-fn headers(config: &AgentConfig) -> Result<HeaderMap, AgentError> {
+pub(crate) fn headers(config: &AgentConfig) -> Result<HeaderMap, AgentError> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
@@ -288,7 +329,7 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
     })
 }
 
-fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<String> {
+pub(crate) fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<String> {
     let base = config
         .system
         .as_deref()
@@ -307,7 +348,7 @@ fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<Strin
     }
 }
 
-fn tool_choice_value(choice: ToolChoice) -> &'static str {
+pub(crate) fn tool_choice_value(choice: ToolChoice) -> &'static str {
     match choice {
         ToolChoice::Auto => "auto",
         ToolChoice::Required => "required",
@@ -319,7 +360,7 @@ fn thinking_body(enabled: bool) -> Value {
     json!({ "type": if enabled { "enabled" } else { "disabled" } })
 }
 
-fn effort_value(effort: ReasoningEffort) -> &'static str {
+pub(crate) fn effort_value(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
@@ -527,7 +568,7 @@ pub(crate) fn stop_reason(value: String) -> StopReason {
     }
 }
 
-fn encode_arguments(input: &Value) -> Result<String, AgentError> {
+pub(crate) fn encode_arguments(input: &Value) -> Result<String, AgentError> {
     match input {
         Value::Null => Ok("{}".to_string()),
         other => serde_json::to_string(other)
@@ -539,7 +580,7 @@ pub(crate) fn decode_arguments(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
-fn tool_result_content(content: &Value) -> Result<String, AgentError> {
+pub(crate) fn tool_result_content(content: &Value) -> Result<String, AgentError> {
     match content {
         Value::Null => Ok(String::new()),
         Value::String(value) => Ok(value.clone()),
