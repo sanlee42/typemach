@@ -391,86 +391,129 @@ where
             state.pending_tools.clear();
             return Err(AgentError::Incomplete(FinishReason::MaxToolCalls).machine());
         }
-        if self.dispatch_concurrent_read_only(state, ctx).await? {
-            return if let Some(reason) = exhausted_reason(state) {
-                Err(AgentError::Incomplete(reason).machine())
+        if self.concurrent_batch_ready(state) {
+            let checked = state
+                .pending_tools
+                .drain(..)
+                .map(|pending| {
+                    let permission =
+                        self.policy
+                            .check(&pending.tool_use, pending.spec.as_ref(), &state.context);
+                    (pending, permission)
+                })
+                .collect::<Vec<_>>();
+            if checked
+                .iter()
+                .all(|(_, permission)| *permission == PermissionDecision::Allow)
+            {
+                let batch = checked.into_iter().map(|(pending, _)| pending).collect();
+                self.dispatch_concurrent_read_only(state, ctx, batch)
+                    .await?;
             } else {
-                Ok(Transition::Next(AgentStep::ModelStep))
-            };
-        }
-        while let Some(tool_use) = state.pending_tools.pop_front() {
-            let spec = tool_use.spec.as_ref();
-            let built_in_error = if tool_use.tool_use.name == "ask_user" {
-                if let Some(result) = self
-                    .consume_human_answer(state, &tool_use.tool_use, ctx)
+                for (pending, permission) in checked {
+                    if let Some(transition) = self
+                        .dispatch_checked_tool(state, ctx, pending, permission)
+                        .await?
+                    {
+                        return Ok(transition);
+                    }
+                }
+            }
+        } else {
+            while let Some(pending) = state.pending_tools.pop_front() {
+                let permission =
+                    self.policy
+                        .check(&pending.tool_use, pending.spec.as_ref(), &state.context);
+                if let Some(transition) = self
+                    .dispatch_checked_tool(state, ctx, pending, permission)
                     .await?
                 {
-                    state.messages.push(AgentMessage::tool_result(result));
-                    continue;
+                    return Ok(transition);
                 }
-                match ask_user_question(&tool_use.tool_use) {
-                    Ok(question) => {
-                        state.pending_human = Some(tool_use);
-                        return Ok(Transition::Interrupt(question));
-                    }
-                    Err(err) => Some(ToolResult::error(&tool_use.tool_use, err.to_string())),
-                }
-            } else {
-                None
-            };
-            let terminal = is_terminal_tool(&tool_use.tool_use, spec)
-                && tool_use.tool_use.name != "emit_artifact";
-            if terminal && built_in_error.is_none() {
-                let action = terminal_action(&tool_use.tool_use);
-                ctx.emit(AgentSignal::Terminal {
-                    action: action.clone(),
-                })
-                .await?;
-                state.terminal = Some(action);
-                return Ok(Transition::Complete(
-                    state.output_with_answer(FinishReason::Terminal, state.answer.clone()),
-                ));
             }
-            state.tool_calls += 1;
-            ctx.emit(AgentSignal::ToolStarted {
-                tool_use_id: tool_use.tool_use.id.clone(),
-                name: tool_use.tool_use.name.clone(),
-            })
-            .await?;
-            let result = if let Some(result) = built_in_error {
-                result
-            } else if tool_use.tool_use.name == "emit_artifact" {
-                match artifact_from_tool(&tool_use.tool_use) {
-                    Ok(artifact) => {
-                        self.emit_artifact(state, ctx, &tool_use.tool_use, artifact)
-                            .await?
-                    }
-                    Err(err) => ToolResult::error(&tool_use.tool_use, err.to_string()),
-                }
-            } else {
-                match self.policy.check(&tool_use.tool_use, spec, &state.context) {
-                    PermissionDecision::Allow => self
-                        .tools
-                        .call_tool(ToolCallRequest {
-                            tool_use: tool_use.tool_use.clone(),
-                            context: state.context.clone(),
-                        })
-                        .await
-                        .unwrap_or_else(|err| {
-                            ToolResult::error(&tool_use.tool_use, err.to_string())
-                        }),
-                    PermissionDecision::Deny(reason) => {
-                        ToolResult::error(&tool_use.tool_use, reason)
-                    }
-                }
-            };
-            record_tool_result(state, ctx, result).await?;
         }
         if let Some(reason) = exhausted_reason(state) {
             Err(AgentError::Incomplete(reason).machine())
         } else {
             Ok(Transition::Next(AgentStep::ModelStep))
         }
+    }
+
+    async fn dispatch_checked_tool(
+        &self,
+        state: &mut AgentState,
+        ctx: &AgentRunContext,
+        pending: PendingToolCall,
+        permission: PermissionDecision,
+    ) -> Result<Option<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>, MachineError> {
+        let tool_use = &pending.tool_use;
+        if let PermissionDecision::Deny(reason) = permission {
+            if tool_use.name == "ask_user" {
+                state.pending_human = None;
+                state.human_input = None;
+            }
+            state.tool_calls += 1;
+            ctx.emit(AgentSignal::ToolStarted {
+                tool_use_id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+            })
+            .await?;
+            record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
+            return Ok(None);
+        }
+        let spec = pending.spec.as_ref();
+        let built_in_error = if tool_use.name == "ask_user" {
+            if let Some(result) = self.consume_human_answer(state, tool_use, ctx).await? {
+                state.messages.push(AgentMessage::tool_result(result));
+                return Ok(None);
+            }
+            match ask_user_question(tool_use) {
+                Ok(question) => {
+                    state.pending_human = Some(pending);
+                    return Ok(Some(Transition::Interrupt(question)));
+                }
+                Err(err) => Some(ToolResult::error(tool_use, err.to_string())),
+            }
+        } else {
+            None
+        };
+        let terminal = is_terminal_tool(tool_use, spec) && tool_use.name != "emit_artifact";
+        if terminal && built_in_error.is_none() {
+            let action = terminal_action(tool_use);
+            ctx.emit(AgentSignal::Terminal {
+                action: action.clone(),
+            })
+            .await?;
+            state.terminal = Some(action);
+            return Ok(Some(Transition::Complete(state.output_with_answer(
+                FinishReason::Terminal,
+                state.answer.clone(),
+            ))));
+        }
+        state.tool_calls += 1;
+        ctx.emit(AgentSignal::ToolStarted {
+            tool_use_id: tool_use.id.clone(),
+            name: tool_use.name.clone(),
+        })
+        .await?;
+        let result = if let Some(result) = built_in_error {
+            result
+        } else if tool_use.name == "emit_artifact" {
+            match artifact_from_tool(tool_use) {
+                Ok(artifact) => self.emit_artifact(state, ctx, tool_use, artifact).await?,
+                Err(err) => ToolResult::error(tool_use, err.to_string()),
+            }
+        } else {
+            self.tools
+                .call_tool(ToolCallRequest {
+                    tool_use: tool_use.clone(),
+                    context: state.context.clone(),
+                })
+                .await
+                .unwrap_or_else(|err| ToolResult::error(tool_use, err.to_string()))
+        };
+        record_tool_result(state, ctx, result).await?;
+        Ok(None)
     }
 
     async fn consume_human_answer(
@@ -532,11 +575,8 @@ where
         &self,
         state: &mut AgentState,
         ctx: &AgentRunContext,
-    ) -> Result<bool, MachineError> {
-        if state.pending_tools.is_empty() || !self.concurrent_batch_ready(state) {
-            return Ok(false);
-        }
-        let batch = state.pending_tools.drain(..).collect::<Vec<_>>();
+        batch: Vec<PendingToolCall>,
+    ) -> Result<(), MachineError> {
         state.tool_calls += batch.len() as u32;
         for pending in &batch {
             ctx.emit(AgentSignal::ToolStarted {
@@ -563,25 +603,22 @@ where
         for result in join_all(calls).await {
             record_tool_result(state, ctx, result).await?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
-        state.pending_tools.iter().all(|pending| {
-            let Some(spec) = pending.spec.as_ref() else {
-                return false;
-            };
-            spec.annotations.read_only
-                && !spec.annotations.destructive
-                && !spec.annotations.open_world
-                && !spec.annotations.terminal
-                && !agent_builtin(&pending.tool_use)
-                && !is_terminal_tool(&pending.tool_use, Some(spec))
-                && self
-                    .policy
-                    .check(&pending.tool_use, Some(spec), &state.context)
-                    == PermissionDecision::Allow
-        })
+        !state.pending_tools.is_empty()
+            && state.pending_tools.iter().all(|pending| {
+                let Some(spec) = pending.spec.as_ref() else {
+                    return false;
+                };
+                spec.annotations.read_only
+                    && !spec.annotations.destructive
+                    && !spec.annotations.open_world
+                    && !spec.annotations.terminal
+                    && !agent_builtin(&pending.tool_use)
+                    && !is_terminal_tool(&pending.tool_use, Some(spec))
+            })
     }
 }
 

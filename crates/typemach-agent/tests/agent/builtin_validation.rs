@@ -38,6 +38,144 @@ impl ToolRegistry for BuiltinTools {
     }
 }
 
+#[derive(Default)]
+struct NoTools;
+
+#[async_trait]
+impl ToolRegistry for NoTools {
+    async fn list_tools(&self, _context: &Value) -> Result<Vec<AgentToolSpec>, AgentError> {
+        Ok(Vec::new())
+    }
+
+    async fn call_tool(&self, _request: ToolCallRequest) -> Result<ToolResult, AgentError> {
+        panic!("unlisted tools must not reach the registry")
+    }
+}
+
+#[derive(Default)]
+struct ListedToolsOnly;
+
+impl typemach_agent::ToolPermissionPolicy for ListedToolsOnly {
+    fn check(
+        &self,
+        _tool: &ToolUse,
+        spec: Option<&AgentToolSpec>,
+        _context: &Value,
+    ) -> typemach_agent::PermissionDecision {
+        if spec.is_some() {
+            typemach_agent::PermissionDecision::Allow
+        } else {
+            typemach_agent::PermissionDecision::Deny("tool is not listed".to_string())
+        }
+    }
+}
+
+async fn run_unlisted(tool_use: ToolUse) -> (Vec<Event>, ScriptedModel) {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
+                calls: vec![tool_use],
+            }),
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Permission denial handled.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        NoTools,
+        ListedToolsOnly,
+    );
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Run the tool")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 2,
+                max_tool_calls: 4,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+    (events, model)
+}
+
+#[tokio::test]
+async fn denied_unlisted_ask_does_not_interrupt() {
+    let (events, model) = run_unlisted(ToolUse {
+        id: "ask-denied".to_string(),
+        name: "ask_user".to_string(),
+        input: json!({ "question": "Which date?" }),
+        raw: None,
+    })
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Interrupted { .. }))
+    );
+    assert_error_lifecycle(&events, "ask-denied");
+    assert_eq!(completed(&events).answer, "Permission denial handled.");
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn denied_unlisted_artifact_is_not_emitted() {
+    let (events, _) = run_unlisted(ToolUse {
+        id: "artifact-denied".to_string(),
+        name: "emit_artifact".to_string(),
+        input: json!({
+            "title": "Review",
+            "type": "markdown",
+            "content": "Review body"
+        }),
+        raw: None,
+    })
+    .await;
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::Artifact { .. },
+        }
+    )));
+    assert_error_lifecycle(&events, "artifact-denied");
+    assert!(completed(&events).artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn denied_unlisted_terminal_continues_to_the_model() {
+    let (events, model) = run_unlisted(ToolUse {
+        id: "terminal-denied".to_string(),
+        name: "report".to_string(),
+        input: json!({ "message": "Finish" }),
+        raw: None,
+    })
+    .await;
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::Terminal { .. },
+        }
+    )));
+    assert_error_lifecycle(&events, "terminal-denied");
+    assert_eq!(completed(&events).finish_reason, FinishReason::Stop);
+    assert_eq!(model.requests().len(), 2);
+}
+
 #[tokio::test]
 async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it() {
     let model = ScriptedModel::new([
