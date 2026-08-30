@@ -262,6 +262,25 @@ async fn malformed_refusal_and_mixed_responses_fail_structurally() {
                 }
             ]
         }),
+        json!({
+            "id": "resp-missing-call-id",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "id": "item-1",
+                "name": "metric_point",
+                "arguments": "{}"
+            }]
+        }),
+        json!({
+            "id": "resp-missing-arguments",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point"
+            }]
+        }),
     ] {
         let (base_url, _captured) = spawn_server(vec![MockTurn::ok(response.to_string())]).await;
         let model = ConfiguredModel::new(config(base_url, false)).expect("model");

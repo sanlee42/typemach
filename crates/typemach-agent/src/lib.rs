@@ -321,7 +321,6 @@ where
         match turn.outcome {
             Some(model_turn::TurnOutcome::FinalAnswer(content)) => {
                 let reason = finish_reason(turn.stop_reason.as_ref())?;
-                state.messages = phase::final_messages(&state.messages);
                 if !content.is_empty() {
                     state.messages.push(AgentMessage::Assistant { content });
                 }
@@ -329,10 +328,13 @@ where
                     state.output_with_answer(reason, state.answer.clone()),
                 ))
             }
-            Some(model_turn::TurnOutcome::ToolCalls(tool_uses)) => {
-                if turn.stop_reason == Some(StopReason::MaxTokens) {
+            Some(model_turn::TurnOutcome::ToolCalls {
+                content,
+                calls: tool_uses,
+            }) => {
+                if !matches!(turn.stop_reason, Some(StopReason::ToolUse) | None) {
                     return Err(AgentError::Model(
-                        "planning stopped mid tool call at the output token limit".to_string(),
+                        "planning stopped before completing tool calls".to_string(),
                     )
                     .machine());
                 }
@@ -342,10 +344,14 @@ where
                     )
                     .machine());
                 }
+                let remaining =
+                    state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
+                if tool_uses.len() > remaining {
+                    enter_final_answer(state);
+                    return Ok(Transition::Next(AgentStep::FinalAnswer));
+                }
                 state.pending_tools.extend(tool_uses.clone());
-                state.messages.push(AgentMessage::Assistant {
-                    content: tool_uses.into_iter().map(ContentBlock::ToolUse).collect(),
-                });
+                state.messages.push(AgentMessage::Assistant { content });
                 Ok(Transition::Next(AgentStep::DispatchTools))
             }
             None if turn.stop_reason == Some(StopReason::MaxTokens) => {
@@ -377,7 +383,7 @@ where
         let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
         let content = match turn.outcome {
             Some(model_turn::TurnOutcome::FinalAnswer(content)) => content,
-            Some(model_turn::TurnOutcome::ToolCalls(_)) => {
+            Some(model_turn::TurnOutcome::ToolCalls { .. }) => {
                 return Err(AgentError::Model(
                     "final answer step returned a tool call even though tools were disabled"
                         .to_string(),
@@ -388,7 +394,6 @@ where
             None => return Err(no_outcome_error(turn.stop_reason).machine()),
         };
         let reason = finish_reason(turn.stop_reason.as_ref())?;
-        state.messages = messages;
         if !content.is_empty() {
             state.messages.push(AgentMessage::Assistant { content });
         }

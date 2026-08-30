@@ -81,6 +81,7 @@ pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, Age
     let stop_reason = stop_reason(&raw, &decoded);
     Ok(ModelResponse {
         outcome: decoded.outcome,
+        reasoning: decoded.reasoning,
         stop_reason,
         response_id: raw
             .get("id")
@@ -103,7 +104,6 @@ pub(crate) fn model_response_shape(
 pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
     let call_id = item
         .get("call_id")
-        .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| AgentError::Model("function_call missing call_id".to_string()))?;
     let name = item
@@ -113,7 +113,7 @@ pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
     let arguments = item
         .get("arguments")
         .and_then(Value::as_str)
-        .unwrap_or("{}");
+        .ok_or_else(|| AgentError::Model("function_call missing arguments".to_string()))?;
     Ok(ToolUse {
         id: call_id.to_string(),
         name: name.to_string(),
@@ -125,6 +125,7 @@ pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
 #[derive(Debug)]
 pub(crate) struct DecodedOutput {
     pub(crate) outcome: Option<ModelOutcome>,
+    pub(crate) reasoning: Vec<String>,
     pub(crate) message_seen: bool,
     pub(crate) tool_seen: bool,
 }
@@ -267,9 +268,10 @@ fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutpu
         .and_then(Value::as_array)
         .ok_or_else(|| AgentError::Model("responses output must be an array".to_string()))?;
     let mut kind = OutputKind::Undecided;
+    let mut reasoning = Vec::new();
     for item in output {
         match item.get("type").and_then(Value::as_str) {
-            Some("reasoning") => {}
+            Some("reasoning") => extend_reasoning(&mut reasoning, item)?,
             Some("message") => {
                 let text = message_text(item)?;
                 kind = kind.message(if include_message_text {
@@ -294,7 +296,35 @@ fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutpu
             }
         }
     }
-    Ok(kind.into_decoded())
+    Ok(kind.into_decoded(reasoning))
+}
+
+fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), AgentError> {
+    let Some(parts) = item.get("content").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let text = parts.iter().try_fold(String::new(), |mut text, part| {
+        match part.get("type").and_then(Value::as_str) {
+            Some("reasoning_text") => {
+                let part_text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AgentError::Model("reasoning_text missing text".to_string()))?;
+                text.push_str(part_text);
+                Ok(text)
+            }
+            Some(other) => Err(AgentError::Model(format!(
+                "unsupported reasoning content item: {other}"
+            ))),
+            None => Err(AgentError::Model(
+                "reasoning content item missing type".to_string(),
+            )),
+        }
+    })?;
+    if !text.is_empty() {
+        content.push(text);
+    }
+    Ok(())
 }
 
 fn message_text(item: &Value) -> Result<String, AgentError> {
@@ -363,20 +393,23 @@ impl OutputKind {
         }
     }
 
-    fn into_decoded(self) -> DecodedOutput {
+    fn into_decoded(self, reasoning: Vec<String>) -> DecodedOutput {
         match self {
             Self::Undecided => DecodedOutput {
                 outcome: None,
+                reasoning,
                 message_seen: false,
                 tool_seen: false,
             },
             Self::Message(text) => DecodedOutput {
                 outcome: Some(ModelOutcome::FinalAnswer { text }),
+                reasoning,
                 message_seen: true,
                 tool_seen: false,
             },
             Self::FunctionCalls(calls) => DecodedOutput {
                 outcome: Some(ModelOutcome::ToolCalls { calls }),
+                reasoning,
                 message_seen: false,
                 tool_seen: true,
             },

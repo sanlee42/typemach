@@ -35,6 +35,7 @@ struct Accumulator {
     status: Option<String>,
     output: OutputKind,
     completed_text: String,
+    reasoning: Vec<String>,
     streamed_text: bool,
     usage: Option<Usage>,
     stop_reason: Option<StopReason>,
@@ -75,8 +76,10 @@ pub(crate) async fn decode_stream(
     }
     let response_id = acc.response_id.clone();
     let usage = acc.usage.clone();
+    let reasoning = acc.reasoning.clone();
     Ok(ModelResponse {
         outcome: outcome(acc)?,
+        reasoning,
         stop_reason,
         response_id,
         usage,
@@ -120,6 +123,7 @@ fn handle_stream_line(
             acc.streamed_text = true;
             stream.output_text(delta)?;
         }
+        "response.reasoning_text.delta" => {}
         "response.function_call_arguments.delta" => {
             let index = event.output_index.ok_or_else(|| {
                 AgentError::Model("function_call delta missing output_index".to_string())
@@ -159,19 +163,21 @@ fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), Ag
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
             let builder = acc.function_call(index)?;
-            if let Some(call_id) = item
+            let call_id = item
                 .get("call_id")
-                .or_else(|| item.get("id"))
                 .and_then(Value::as_str)
-            {
-                builder.call_id = Some(call_id.to_string());
-            }
-            if let Some(name) = item.get("name").and_then(Value::as_str) {
-                builder.name = Some(name.to_string());
-            }
-            if let Some(arguments) = item.get("arguments").and_then(Value::as_str)
-                && builder.arguments.is_empty()
-            {
+                .ok_or_else(|| AgentError::Model("function_call missing call_id".to_string()))?;
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AgentError::Model("function_call missing name".to_string()))?;
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AgentError::Model("function_call missing arguments".to_string()))?;
+            builder.call_id = Some(call_id.to_string());
+            builder.name = Some(name.to_string());
+            if builder.arguments.is_empty() {
                 builder.arguments.push_str(arguments);
             }
             builder.raw = Some(item);
@@ -181,7 +187,10 @@ fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), Ag
             model_response_shape(&raw, false)?;
             acc.message()?;
         }
-        Some("reasoning") => {}
+        Some("reasoning") => {
+            let raw = serde_json::json!({ "output": [item] });
+            model_response_shape(&raw, false)?;
+        }
         Some(other) => {
             return Err(AgentError::Model(format!(
                 "unsupported responses output item: {other}"
@@ -214,6 +223,7 @@ fn merge_response(acc: &mut Accumulator, response: Value) -> Result<(), AgentErr
     if let Some(reason) = response_stop(&response, &decoded) {
         acc.stop_reason = Some(reason);
     }
+    acc.reasoning = decoded.reasoning;
     match decoded.outcome {
         Some(ModelOutcome::FinalAnswer { text }) => {
             acc.message()?;

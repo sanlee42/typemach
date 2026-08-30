@@ -54,12 +54,21 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
                 "response": {
                     "id": "resp-tools",
                     "status": "completed",
-                    "output": [{
-                        "type": "function_call",
-                        "call_id": "call-1",
-                        "name": "metric_point",
-                        "arguments": "{\"metric_id\":\"paid_order_count\"}"
-                    }]
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": "Inspect metric privately."
+                            }]
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "metric_point",
+                            "arguments": "{\"metric_id\":\"paid_order_count\"}"
+                        }
+                    ]
                 }
             }),
         ])),
@@ -106,6 +115,7 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     assert_eq!(final_deltas(&events), vec!["The answer ", "is 42."]);
     let completed = completed(&events);
     assert_eq!(completed.answer, "The answer is 42.");
+    assert!(!completed.answer.contains("privately"));
     assert_eq!(
         assistant_texts(&completed.messages),
         vec!["The answer is 42."]
@@ -116,6 +126,19 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     assert_eq!(bodies[1]["tool_choice"], "auto");
     assert!(input_has_type(&bodies[1], "function_call"));
     assert!(input_has_type(&bodies[1], "function_call_output"));
+    assert_ordered_input_types(
+        &bodies[1],
+        &["reasoning", "function_call", "function_call_output"],
+    );
+    assert_eq!(
+        bodies[1]["input"]
+            .as_array()
+            .expect("input array")
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("reasoning item")["content"][0]["text"],
+        "Inspect metric privately."
+    );
 }
 
 #[tokio::test]
@@ -361,6 +384,21 @@ fn input_has_type(body: &Value, kind: &str) -> bool {
         .expect("input array")
         .iter()
         .any(|item| item["type"] == kind)
+}
+
+fn assert_ordered_input_types(body: &Value, expected: &[&str]) {
+    let input = body["input"].as_array().expect("input array");
+    let mut next = 0;
+    for item in input {
+        if next < expected.len() && item["type"] == expected[next] {
+            next += 1;
+        }
+    }
+    assert_eq!(
+        next,
+        expected.len(),
+        "missing ordered input types {expected:?}"
+    );
 }
 
 struct MockTurn {

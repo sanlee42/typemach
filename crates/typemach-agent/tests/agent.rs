@@ -295,6 +295,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
                     raw: Some(json!({ "id": "tool-1", "index": 0 })),
                 }],
             }),
+            reasoning: vec!["private tool reasoning".to_string()],
             stop_reason: Some(StopReason::ToolUse),
             response_id: Some("msg-1".to_string()),
             raw: Some(json!({ "id": "msg-1" })),
@@ -304,6 +305,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             outcome: Some(ModelOutcome::FinalAnswer {
                 text: "The order count is 42.".to_string(),
             }),
+            reasoning: vec!["private final reasoning".to_string()],
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -327,11 +329,34 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     .await;
     let completed = completed(&events);
     assert_eq!(completed.answer, "The order count is 42.");
-    assert!(!completed.messages.iter().any(|message| matches!(
+    assert!(!completed.answer.contains("private"));
+    assert!(model.requests()[1].messages.iter().any(|message| matches!(
         message,
         AgentMessage::Assistant { content }
-            if content.iter().any(|block| matches!(block, ContentBlock::Thinking { .. }))
+            if matches!(
+                content.as_slice(),
+                [
+                    ContentBlock::Thinking { text, .. },
+                    ContentBlock::ToolUse(call),
+                ] if text == "private tool reasoning" && call.id == "tool-1"
+            )
     )));
+    assert_eq!(
+        completed
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Assistant { content } => Some(content),
+                _ => None,
+            })
+            .flat_map(|content| content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        ["private tool reasoning", "private final reasoning"]
+    );
 }
 
 #[tokio::test]
@@ -741,7 +766,7 @@ async fn max_tokens_does_not_dispatch_truncated_tool_calls() {
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Failed { error }
-            if error.to_string().contains("planning stopped mid tool call at the output token limit")
+            if error.to_string().contains("planning stopped before completing tool calls")
     )));
 }
 
