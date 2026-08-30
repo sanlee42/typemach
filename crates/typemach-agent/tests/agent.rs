@@ -10,10 +10,10 @@ use typemach::{
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentModel, AgentRunInput,
     AgentRunOutput, AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools,
-    AskUserQuestion, ContentBlock, ContextPolicy, FinishReason, HumanInputAnswer, ModelOutcome,
-    ModelRequest, ModelResponse, ModelStream, StopReason, TerminalAction, ToolAnnotations,
-    ToolCallRequest, ToolRegistry, ToolResult, ToolUse, build_agent_runner,
-    build_agent_runner_with_context_policy,
+    AskUserQuestion, AssistantMessagePhase, ContentBlock, ContextPolicy, FinishReason,
+    HumanInputAnswer, ModelOutcome, ModelRequest, ModelResponse, ModelStream, StopReason,
+    TerminalAction, ToolAnnotations, ToolCallRequest, ToolRegistry, ToolResult, ToolUse,
+    build_agent_runner, build_agent_runner_with_context_policy,
 };
 
 #[path = "agent/builtin_validation.rs"]
@@ -404,15 +404,15 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::FinalAnswerDelta { delta, .. },
+                signal: AgentSignal::AssistantMessageDelta { delta, .. },
             } => Some(delta.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::Terminal);
-    assert_eq!(completed.answer, deltas.concat());
-    assert_eq!(completed.answer, "The report cannot continue. ");
+    assert_eq!(deltas.concat(), "The report cannot continue. ");
+    assert!(completed.answer.is_empty());
     assert!(matches!(
         completed.terminal.as_ref(),
         Some(TerminalAction { name, .. }) if name == "report"
@@ -424,7 +424,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         .expect("load checkpoint")
         .expect("checkpoint");
     let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
-    assert_eq!(state.answer, completed.answer);
+    assert!(state.answer.is_empty());
 }
 
 #[tokio::test]

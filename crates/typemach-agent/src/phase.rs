@@ -103,6 +103,10 @@ fn project_message(
         AgentMessage::User { content } => (content, false),
         AgentMessage::Assistant { content } => (content, true),
     };
+    let commentary = assistant
+        && content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse(_)));
     let content = content
         .iter()
         .enumerate()
@@ -114,6 +118,7 @@ fn project_message(
                 },
                 block,
                 pairs,
+                commentary,
             )
         })
         .map(|(_, block)| block)
@@ -129,9 +134,14 @@ fn project_message(
     })
 }
 
-fn keep_block(position: Position, block: &ContentBlock, pairs: &SuccessfulPairs) -> bool {
+fn keep_block(
+    position: Position,
+    block: &ContentBlock,
+    pairs: &SuccessfulPairs,
+    commentary: bool,
+) -> bool {
     match block {
-        ContentBlock::Text { .. } => true,
+        ContentBlock::Text { .. } => !commentary,
         ContentBlock::ConversationDigest(_) => true,
         ContentBlock::Thinking { .. } => false,
         ContentBlock::ToolUse(_) => pairs.calls.contains(&position),
@@ -183,17 +193,17 @@ mod tests {
 
         let projected = final_messages(&messages);
         let encoded = serde_json::to_string(&projected).expect("serialize projection");
-        assert!(encoded.contains("First public update."));
-        assert!(encoded.contains("Later public update."));
+        assert!(!encoded.contains("First public update."));
+        assert!(!encoded.contains("Later public update."));
         assert!(!encoded.contains("SECRET_LATER_CALL"));
         assert!(!encoded.contains("SECRET_FAILED_PAYLOAD"));
-        assert_eq!(projected.len(), 4);
+        assert_eq!(projected.len(), 3);
         assert!(matches!(
             &projected[1],
             AgentMessage::Assistant { content }
                 if matches!(
                     content.as_slice(),
-                    [ContentBlock::Text { .. }, ContentBlock::ToolUse(call)]
+                    [ContentBlock::ToolUse(call)]
                         if call.input["metric"] == "paid_orders"
                 )
         ));
@@ -203,14 +213,6 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [ContentBlock::ToolResult(result)] if result.content["value"] == 42
-                )
-        ));
-        assert!(matches!(
-            &projected[3],
-            AgentMessage::Assistant { content }
-                if matches!(
-                    content.as_slice(),
-                    [ContentBlock::Text { text }] if text == "Later public update. "
                 )
         ));
     }

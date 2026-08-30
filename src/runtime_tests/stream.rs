@@ -1,4 +1,5 @@
 use super::*;
+#[cfg(feature = "sqlite")]
 use crate::SqliteStore;
 
 #[test]
@@ -157,6 +158,7 @@ fn tx_runtime_commits_final_checkpoint_with_terminal_events() {
 }
 
 #[test]
+#[cfg(feature = "sqlite")]
 fn sqlite_keeps_one_large_checkpoint_and_compact_terminals() {
     block_on(async {
         let store = Arc::new(SqliteStore::<Event>::memory().await.expect("store"));
@@ -215,6 +217,7 @@ fn sqlite_keeps_one_large_checkpoint_and_compact_terminals() {
     });
 }
 
+#[cfg(feature = "sqlite")]
 async fn sqlite_counts(store: &SqliteStore<Event>) -> (i64, i64, i64, i64) {
     store
         .conn()

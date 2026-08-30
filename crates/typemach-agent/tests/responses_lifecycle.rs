@@ -11,8 +11,8 @@ use typemach::{
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentRunInput, AgentRunOutput,
     AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion,
-    ConfiguredModel, ContentBlock, FinishReason, ToolAnnotations, ToolCallRequest, ToolRegistry,
-    ToolResult, build_agent_runner,
+    AssistantMessagePhase, ConfiguredModel, ContentBlock, FinishReason, ToolAnnotations,
+    ToolCallRequest, ToolRegistry, ToolResult, build_agent_runner,
 };
 
 #[tokio::test]
@@ -44,8 +44,7 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     let deltas = final_deltas(&events);
     assert_eq!(deltas, vec!["Checking orders. ", "The answer ", "is 42."]);
     let completed = completed(&events);
-    assert_eq!(completed.answer, deltas.concat());
-    assert_eq!(completed.answer, "Checking orders. The answer is 42.");
+    assert_eq!(completed.answer, "The answer is 42.");
     assert!(!completed.answer.contains("privately"));
     assert_eq!(
         assistant_texts(&completed.messages),
@@ -150,10 +149,7 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
         final_deltas(&events),
         vec!["Checking orders. ", "The answer is 42."]
     );
-    assert_eq!(
-        completed(&events).answer,
-        "Checking orders. The answer is 42."
-    );
+    assert_eq!(completed(&events).answer, "The answer is 42.");
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
@@ -334,7 +330,7 @@ async fn max_tokens_final_delta_returns_partial_once() {
     let completed = completed(&events);
     assert_eq!(final_deltas(&events), vec!["Partial answer"]);
     assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert_eq!(completed.answer, "Partial answer");
+    assert!(completed.answer.is_empty());
     assert_eq!(assistant_texts(&completed.messages), vec!["Partial answer"]);
 }
 
@@ -462,13 +458,17 @@ fn final_deltas(
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::FinalAnswerDelta { delta, .. },
+                signal: AgentSignal::AssistantMessageDelta { delta, .. },
                 ..
             } => Some(delta.clone()),
             RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantDelta { .. },
+                signal:
+                    AgentSignal::AssistantMessageDone {
+                        phase: AssistantMessagePhase::Commentary,
+                        ..
+                    },
                 ..
-            } => panic!("planning deltas must stay private"),
+            } => None,
             _ => None,
         })
         .collect()

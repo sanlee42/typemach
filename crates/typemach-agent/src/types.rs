@@ -452,18 +452,44 @@ pub struct TerminalAction {
     pub input: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AssistantMessageId(String);
+
+impl AssistantMessageId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AssistantMessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSignal {
-    /// Legacy serialized shape. Planning text is internal and no longer emits it.
-    AssistantDelta {
+    AssistantMessageDelta {
+        message_id: AssistantMessageId,
         delta: String,
         index: usize,
     },
-    /// A user-visible fragment of the authoritative final answer.
-    FinalAnswerDelta {
-        delta: String,
-        index: usize,
+    AssistantMessageDone {
+        message_id: AssistantMessageId,
+        phase: AssistantMessagePhase,
     },
     ToolStarted {
         tool_use_id: String,
@@ -571,11 +597,10 @@ pub struct AgentState {
     pub system_suffix: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
-    pub next_delta_index: usize,
     #[serde(default)]
-    pub next_final_delta_index: usize,
-    pub pending_tools: VecDeque<ToolUse>,
-    pub pending_human: Option<ToolUse>,
+    pub pending_tools: VecDeque<PendingToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_human: Option<PendingToolCall>,
     pub human_input: Option<HumanInputAnswer>,
     pub answer: String,
     pub usage: Usage,
@@ -585,6 +610,45 @@ pub struct AgentState {
     pub digest: Option<ConversationDigest>,
     #[serde(default)]
     pub tool_result_archives: Vec<ToolResultArchive>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingToolCall {
+    pub tool_use: ToolUse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<AgentToolSpec>,
+}
+
+impl PendingToolCall {
+    pub fn new(tool_use: ToolUse, spec: Option<AgentToolSpec>) -> Self {
+        Self { tool_use, spec }
+    }
+}
+
+impl<'de> Deserialize<'de> for PendingToolCall {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Current {
+                tool_use: ToolUse,
+                #[serde(default)]
+                spec: Option<AgentToolSpec>,
+            },
+            Legacy(ToolUse),
+        }
+
+        match Shape::deserialize(deserializer)? {
+            Shape::Current { tool_use, spec } => Ok(Self { tool_use, spec }),
+            Shape::Legacy(tool_use) => Ok(Self {
+                tool_use,
+                spec: None,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -606,15 +670,18 @@ mod checkpoint_compatibility {
     use super::*;
 
     #[test]
-    fn old_state_defaults_final_delta_index_and_step_remains_planning() {
+    fn old_state_defaults_pending_specs_and_step_remains_planning() {
         let state: AgentState = serde_json::from_value(json!({
             "messages": [],
             "context": null,
             "budget": { "max_model_turns": 4, "max_tool_calls": 8 },
             "model_turns": 1,
             "tool_calls": 0,
-            "next_delta_index": 2,
-            "pending_tools": [],
+            "pending_tools": [{
+                "id": "tool-1",
+                "name": "metric_point",
+                "input": {}
+            }],
             "pending_human": null,
             "human_input": null,
             "answer": "",
@@ -626,7 +693,9 @@ mod checkpoint_compatibility {
         let step: AgentStep =
             serde_json::from_value(json!("model_step")).expect("deserialize legacy planning step");
 
-        assert_eq!(state.next_final_delta_index, 0);
+        assert_eq!(state.pending_tools.len(), 1);
+        assert!(state.pending_tools[0].spec.is_none());
+        assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);
         assert_eq!(
             serde_json::to_value(AgentStep::FinalAnswer).expect("serialize final step"),

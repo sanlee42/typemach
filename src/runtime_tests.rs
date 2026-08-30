@@ -42,6 +42,7 @@ enum Mode {
     LiveSlow,
     LiveFail,
     Ops,
+    #[cfg(feature = "sqlite")]
     Large,
 }
 
@@ -73,6 +74,7 @@ impl Machine for TestMachine {
         Ok(State {
             value: 0,
             padding: match &_input.mode {
+                #[cfg(feature = "sqlite")]
                 Mode::Large => "x".repeat(1_800 * 1024),
                 _ => String::new(),
             },
@@ -138,6 +140,7 @@ impl Machine for TestMachine {
                 Ok(Transition::Next(Step::Done))
             }
             (Mode::Ops, Step::Done) => Ok(Transition::Complete("ops".to_string())),
+            #[cfg(feature = "sqlite")]
             (Mode::Large, Step::Start) => Ok(Transition::Complete("large".to_string())),
             _ => Ok(Transition::Complete("done".to_string())),
         }

@@ -2,12 +2,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use typemach::{
     CheckpointSaver, Machine, MachineError, ResumeAction, RunContext, RunEventReceiver, Runner,
     Transition,
 };
 
+mod builtins;
 mod context;
 pub use context::estimate_messages;
 mod deepseek;
@@ -36,6 +38,10 @@ pub type AgentEventReceiver =
 mod types;
 pub use types::*;
 
+use builtins::{
+    agent_builtin, artifact_from_tool, ask_user_question, is_terminal_tool, terminal_action,
+};
+
 impl AgentState {
     fn fresh(
         input: &AgentRunInput,
@@ -55,8 +61,6 @@ impl AgentState {
             system_suffix: input.system_suffix.clone(),
             model_turns: 0,
             tool_calls: 0,
-            next_delta_index: 0,
-            next_final_delta_index: 0,
             pending_tools: VecDeque::new(),
             pending_human: None,
             human_input: input.human_input.clone(),
@@ -311,7 +315,7 @@ where
             state,
             ctx,
             messages,
-            tools,
+            tools.clone(),
             suffix,
             Some(ToolChoice::Auto),
             planning_turn,
@@ -319,13 +323,14 @@ where
         .await?;
         let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
         match turn.outcome {
-            Some(model_turn::TurnOutcome::FinalAnswer(content)) => {
+            Some(model_turn::TurnOutcome::FinalAnswer { content, text }) => {
                 let reason = finish_reason(turn.stop_reason.as_ref())?;
                 if !content.is_empty() {
                     state.messages.push(AgentMessage::Assistant { content });
                 }
+                let answer = commit_answer(state, reason.clone(), text);
                 Ok(Transition::Complete(
-                    state.output_with_answer(reason, state.answer.clone()),
+                    state.output_with_answer(reason, answer),
                 ))
             }
             Some(model_turn::TurnOutcome::ToolCalls {
@@ -350,7 +355,12 @@ where
                     enter_final_answer(state);
                     return Ok(Transition::Next(AgentStep::FinalAnswer));
                 }
-                state.pending_tools.extend(tool_uses.clone());
+                state
+                    .pending_tools
+                    .extend(tool_uses.clone().into_iter().map(|tool_use| {
+                        let spec = tools.iter().find(|spec| spec.name == tool_use.name);
+                        PendingToolCall::new(tool_use, spec.cloned())
+                    }));
                 state.messages.push(AgentMessage::Assistant { content });
                 Ok(Transition::Next(AgentStep::DispatchTools))
             }
@@ -381,8 +391,8 @@ where
         )
         .await?;
         let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
-        let content = match turn.outcome {
-            Some(model_turn::TurnOutcome::FinalAnswer(content)) => content,
+        let (content, text) = match turn.outcome {
+            Some(model_turn::TurnOutcome::FinalAnswer { content, text }) => (content, text),
             Some(model_turn::TurnOutcome::ToolCalls { .. }) => {
                 return Err(AgentError::Model(
                     "final answer step returned a tool call even though tools were disabled"
@@ -390,15 +400,16 @@ where
                 )
                 .machine());
             }
-            None if turn.stop_reason == Some(StopReason::MaxTokens) => Vec::new(),
+            None if turn.stop_reason == Some(StopReason::MaxTokens) => (Vec::new(), String::new()),
             None => return Err(no_outcome_error(turn.stop_reason).machine()),
         };
         let reason = finish_reason(turn.stop_reason.as_ref())?;
         if !content.is_empty() {
             state.messages.push(AgentMessage::Assistant { content });
         }
+        let answer = commit_answer(state, reason.clone(), text);
         Ok(Transition::Complete(
-            state.output_with_answer(reason, state.answer.clone()),
+            state.output_with_answer(reason, answer),
         ))
     }
 
@@ -413,31 +424,38 @@ where
             enter_final_answer(state);
             return Ok(Transition::Next(AgentStep::FinalAnswer));
         }
-        let specs = self
-            .tools
-            .list_tools(&state.context)
-            .await
-            .map_err(AgentError::machine)?;
+        if self.dispatch_concurrent_read_only(state, ctx).await? {
+            return if planning_budget_exhausted(state) {
+                enter_final_answer(state);
+                Ok(Transition::Next(AgentStep::FinalAnswer))
+            } else {
+                Ok(Transition::Next(AgentStep::ModelStep))
+            };
+        }
         while let Some(tool_use) = state.pending_tools.pop_front() {
-            let spec = specs.iter().find(|spec| spec.name == tool_use.name);
-            let built_in_error = if tool_use.name == "ask_user" {
-                if let Some(result) = self.consume_human_answer(state, &tool_use, ctx).await? {
+            let spec = tool_use.spec.as_ref();
+            let built_in_error = if tool_use.tool_use.name == "ask_user" {
+                if let Some(result) = self
+                    .consume_human_answer(state, &tool_use.tool_use, ctx)
+                    .await?
+                {
                     state.messages.push(AgentMessage::tool_result(result));
                     continue;
                 }
-                match ask_user_question(&tool_use) {
+                match ask_user_question(&tool_use.tool_use) {
                     Ok(question) => {
                         state.pending_human = Some(tool_use);
                         return Ok(Transition::Interrupt(question));
                     }
-                    Err(err) => Some(ToolResult::error(&tool_use, err.to_string())),
+                    Err(err) => Some(ToolResult::error(&tool_use.tool_use, err.to_string())),
                 }
             } else {
                 None
             };
-            let terminal = is_terminal_tool(&tool_use, spec) && tool_use.name != "emit_artifact";
+            let terminal = is_terminal_tool(&tool_use.tool_use, spec)
+                && tool_use.tool_use.name != "emit_artifact";
             if terminal && built_in_error.is_none() {
-                let action = terminal_action(&tool_use);
+                let action = terminal_action(&tool_use.tool_use);
                 ctx.emit(AgentSignal::Terminal {
                     action: action.clone(),
                 })
@@ -449,28 +467,35 @@ where
             }
             state.tool_calls += 1;
             ctx.emit(AgentSignal::ToolStarted {
-                tool_use_id: tool_use.id.clone(),
-                name: tool_use.name.clone(),
+                tool_use_id: tool_use.tool_use.id.clone(),
+                name: tool_use.tool_use.name.clone(),
             })
             .await?;
             let result = if let Some(result) = built_in_error {
                 result
-            } else if tool_use.name == "emit_artifact" {
-                match artifact_from_tool(&tool_use) {
-                    Ok(artifact) => self.emit_artifact(state, ctx, &tool_use, artifact).await?,
-                    Err(err) => ToolResult::error(&tool_use, err.to_string()),
+            } else if tool_use.tool_use.name == "emit_artifact" {
+                match artifact_from_tool(&tool_use.tool_use) {
+                    Ok(artifact) => {
+                        self.emit_artifact(state, ctx, &tool_use.tool_use, artifact)
+                            .await?
+                    }
+                    Err(err) => ToolResult::error(&tool_use.tool_use, err.to_string()),
                 }
             } else {
-                match self.policy.check(&tool_use, spec, &state.context) {
+                match self.policy.check(&tool_use.tool_use, spec, &state.context) {
                     PermissionDecision::Allow => self
                         .tools
                         .call_tool(ToolCallRequest {
-                            tool_use: tool_use.clone(),
+                            tool_use: tool_use.tool_use.clone(),
                             context: state.context.clone(),
                         })
                         .await
-                        .unwrap_or_else(|err| ToolResult::error(&tool_use, err.to_string())),
-                    PermissionDecision::Deny(reason) => ToolResult::error(&tool_use, reason),
+                        .unwrap_or_else(|err| {
+                            ToolResult::error(&tool_use.tool_use, err.to_string())
+                        }),
+                    PermissionDecision::Deny(reason) => {
+                        ToolResult::error(&tool_use.tool_use, reason)
+                    }
                 }
             };
             record_tool_result(state, ctx, result).await?;
@@ -537,6 +562,62 @@ where
         ctx.emit(AgentSignal::Artifact { artifact }).await?;
         Ok(ToolResult::ok(tool_use, json!({ "ok": true })))
     }
+
+    async fn dispatch_concurrent_read_only(
+        &self,
+        state: &mut AgentState,
+        ctx: &AgentRunContext,
+    ) -> Result<bool, MachineError> {
+        if state.pending_tools.is_empty() || !self.concurrent_batch_ready(state) {
+            return Ok(false);
+        }
+        let batch = state.pending_tools.drain(..).collect::<Vec<_>>();
+        state.tool_calls += batch.len() as u32;
+        for pending in &batch {
+            ctx.emit(AgentSignal::ToolStarted {
+                tool_use_id: pending.tool_use.id.clone(),
+                name: pending.tool_use.name.clone(),
+            })
+            .await?;
+        }
+        let context = state.context.clone();
+        let calls = batch.iter().map(|pending| {
+            let tools = Arc::clone(&self.tools);
+            let context = context.clone();
+            let tool_use = pending.tool_use.clone();
+            async move {
+                tools
+                    .call_tool(ToolCallRequest {
+                        tool_use: tool_use.clone(),
+                        context,
+                    })
+                    .await
+                    .unwrap_or_else(|err| ToolResult::error(&tool_use, err.to_string()))
+            }
+        });
+        for result in join_all(calls).await {
+            record_tool_result(state, ctx, result).await?;
+        }
+        Ok(true)
+    }
+
+    fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
+        state.pending_tools.iter().all(|pending| {
+            let Some(spec) = pending.spec.as_ref() else {
+                return false;
+            };
+            spec.annotations.read_only
+                && !spec.annotations.destructive
+                && !spec.annotations.open_world
+                && !spec.annotations.terminal
+                && !agent_builtin(&pending.tool_use)
+                && !is_terminal_tool(&pending.tool_use, Some(spec))
+                && self
+                    .policy
+                    .check(&pending.tool_use, Some(spec), &state.context)
+                    == PermissionDecision::Allow
+        })
+    }
 }
 
 /// A run started over an inherited transcript may find tool calls whose
@@ -577,6 +658,15 @@ fn enter_final_answer(state: &mut AgentState) {
     state.pending_tools.clear();
     state.pending_human = None;
     state.human_input = None;
+}
+
+fn commit_answer(state: &mut AgentState, reason: FinishReason, text: String) -> String {
+    if reason == FinishReason::Stop {
+        state.answer = text;
+        state.answer.clone()
+    } else {
+        String::new()
+    }
 }
 
 fn planning_budget_exhausted(state: &AgentState) -> bool {
@@ -643,90 +733,4 @@ async fn record_tool_result(
         .messages
         .push(AgentMessage::tool_result(prompt_result));
     Ok(())
-}
-
-fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, AgentError> {
-    let question = tool_use
-        .input
-        .get("question")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            AgentError::InvalidBuiltInTool("ask_user requires non-empty question".to_string())
-        })?
-        .to_string();
-    Ok(AskUserQuestion {
-        tool_use_id: tool_use.id.clone(),
-        question,
-        fields: tool_use.input.get("fields").cloned().unwrap_or(Value::Null),
-    })
-}
-
-fn is_terminal_tool(tool_use: &ToolUse, spec: Option<&AgentToolSpec>) -> bool {
-    spec.is_some_and(|spec| spec.annotations.terminal)
-        || matches!(
-            tool_use.name.as_str(),
-            "report" | "reject" | "terminal" | "planner.report" | "planner.reject"
-        )
-}
-
-fn terminal_action(tool_use: &ToolUse) -> TerminalAction {
-    TerminalAction {
-        tool_use_id: tool_use.id.clone(),
-        name: tool_use.name.clone(),
-        input: tool_use.input.clone(),
-    }
-}
-
-fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, AgentError> {
-    let title = required_string(&tool_use.input, "title")?;
-    let content = required_string(&tool_use.input, "content")?;
-    let kind = required_string(&tool_use.input, "type")?;
-    if !matches!(kind.as_str(), "markdown" | "table") {
-        return Err(AgentError::InvalidBuiltInTool(
-            "type must be markdown or table".to_string(),
-        ));
-    }
-    Ok(Artifact {
-        tool_use_id: tool_use.id.clone(),
-        title,
-        kind,
-        content,
-        source: optional_source(&tool_use.input)?,
-        window: optional_string(&tool_use.input, "window"),
-        updated_at: optional_string(&tool_use.input, "updated_at"),
-    })
-}
-
-fn optional_string(input: &Value, name: &str) -> Option<String> {
-    input
-        .get(name)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn optional_source(input: &Value) -> Result<Option<String>, AgentError> {
-    let Some(source) = input.get("source") else {
-        return Ok(None);
-    };
-    source
-        .as_str()
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
-        .map(str::to_owned)
-        .map(Some)
-        .ok_or_else(|| {
-            AgentError::InvalidBuiltInTool("source must be a non-empty string".to_string())
-        })
-}
-
-fn required_string(input: &Value, name: &str) -> Result<String, AgentError> {
-    input
-        .get(name)
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| AgentError::InvalidBuiltInTool(format!("missing non-empty {name}")))
 }
