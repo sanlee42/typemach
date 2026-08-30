@@ -2,23 +2,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 
-use crate::deepseek_stream::decode_stream;
 use crate::responses::{decode_response as decode_responses, responses_request};
 use crate::responses_stream::decode_stream as decode_responses_stream;
 use crate::{
-    AgentConfig, AgentError, AgentMessage, AgentModel, AgentToolSpec, ContentBlock, ModelRequest,
-    ModelResponse, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolChoice, ToolResult,
-    ToolUse, Usage,
+    AgentConfig, AgentError, AgentModel, ModelRequest, ModelResponse, ModelStream, ReasoningEffort,
+    ToolChoice,
 };
 
 #[derive(Clone)]
 pub struct ConfiguredModel {
     client: reqwest::Client,
     config: AgentConfig,
-    endpoint: Endpoint,
+    endpoint: String,
 }
 
 impl ConfiguredModel {
@@ -32,7 +29,7 @@ impl ConfiguredModel {
             .read_timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(|err| AgentError::Config(format!("failed to build HTTP client: {err}")))?;
-        let endpoint = endpoint(&config.base_url);
+        let endpoint = endpoint(&config.base_url)?;
         Ok(Self {
             client,
             config,
@@ -42,7 +39,7 @@ impl ConfiguredModel {
 
     pub fn with_client(client: reqwest::Client, config: AgentConfig) -> Result<Self, AgentError> {
         validate_config(&config)?;
-        let endpoint = endpoint(&config.base_url);
+        let endpoint = endpoint(&config.base_url)?;
         Ok(Self {
             client,
             config,
@@ -90,14 +87,8 @@ struct AttemptFailure {
 
 impl ConfiguredModel {
     fn request_body(&self, request: ModelRequest) -> Result<Value, AgentError> {
-        match self.endpoint.kind {
-            ApiKind::Chat => serde_json::to_value(chat_request(&self.config, request)?)
-                .map_err(|err| AgentError::Model(format!("failed to encode chat request: {err}"))),
-            ApiKind::Responses => serde_json::to_value(responses_request(&self.config, request)?)
-                .map_err(|err| {
-                    AgentError::Model(format!("failed to encode responses request: {err}"))
-                }),
-        }
+        serde_json::to_value(responses_request(&self.config, request)?)
+            .map_err(|err| AgentError::Model(format!("failed to encode responses request: {err}")))
     }
 
     async fn attempt(
@@ -110,11 +101,7 @@ impl ConfiguredModel {
             retryable: false,
             retry_after: None,
         })?;
-        let mut request = self
-            .client
-            .post(&self.endpoint.url)
-            .headers(headers)
-            .json(body);
+        let mut request = self.client.post(&self.endpoint).headers(headers).json(body);
         if !self.config.stream {
             request = request.timeout(Duration::from_secs(self.config.request_timeout_secs));
         }
@@ -136,11 +123,9 @@ impl ConfiguredModel {
                 retry_after,
             });
         }
-        let decoded = match (self.endpoint.kind, self.config.stream) {
-            (ApiKind::Chat, true) => decode_stream(response, stream.clone()).await,
-            (ApiKind::Chat, false) => decode_response(response).await,
-            (ApiKind::Responses, true) => decode_responses_stream(response, stream.clone()).await,
-            (ApiKind::Responses, false) => decode_responses(response).await,
+        let decoded = match self.config.stream {
+            true => decode_responses_stream(response, stream.clone()).await,
+            false => decode_responses(response).await,
         };
         decoded.map_err(|err| AttemptFailure {
             message: err.to_string(),
@@ -178,63 +163,6 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<Value>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<Value>,
-    thinking: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'static str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    id: Option<String>,
-    choices: Vec<ChatChoice>,
-    usage: Option<ChatUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    message: ChatMessage,
-    finish_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatMessage {
-    content: Option<String>,
-    reasoning_content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ChatToolCall>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ChatToolCall {
-    id: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    function: ChatFunctionCall,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ChatFunctionCall {
-    name: Option<String>,
-    arguments: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ChatUsage {
-    pub(crate) prompt_tokens: Option<u64>,
-    pub(crate) completion_tokens: Option<u64>,
-}
-
 fn validate_config(config: &AgentConfig) -> Result<(), AgentError> {
     if config.api_key.trim().is_empty() {
         return Err(AgentError::Config("api_key must not be empty".to_string()));
@@ -250,39 +178,23 @@ fn validate_config(config: &AgentConfig) -> Result<(), AgentError> {
             "request_timeout_secs must be greater than zero".to_string(),
         ));
     }
+    endpoint(&config.base_url)?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiKind {
-    Chat,
-    Responses,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Endpoint {
-    kind: ApiKind,
-    url: String,
-}
-
-fn endpoint(base_url: &str) -> Endpoint {
+fn endpoint(base_url: &str) -> Result<String, AgentError> {
     let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/chat/completions") {
-        Endpoint {
-            kind: ApiKind::Chat,
-            url: trimmed.to_string(),
-        }
-    } else if trimmed.ends_with("/responses") {
-        Endpoint {
-            kind: ApiKind::Responses,
-            url: trimmed.to_string(),
-        }
-    } else {
-        Endpoint {
-            kind: ApiKind::Responses,
-            url: format!("{trimmed}/responses"),
-        }
+    if trimmed.ends_with("/responses") {
+        return Ok(trimmed.to_string());
     }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|err| AgentError::Config(format!("base_url is not a valid URL: {err}")))?;
+    if parsed.path().trim_end_matches('/').is_empty() {
+        return Ok(format!("{trimmed}/responses"));
+    }
+    Err(AgentError::Config(
+        "base_url must be an origin or an explicit /responses endpoint".to_string(),
+    ))
 }
 
 pub(crate) fn headers(config: &AgentConfig) -> Result<HeaderMap, AgentError> {
@@ -295,38 +207,6 @@ pub(crate) fn headers(config: &AgentConfig) -> Result<HeaderMap, AgentError> {
         })?,
     );
     Ok(headers)
-}
-
-fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatRequest, AgentError> {
-    let mut messages = Vec::new();
-    if let Some(system) = combined_system(config, &request) {
-        messages.push(json!({ "role": "system", "content": system }));
-    }
-    messages.extend(messages_to_chat(&request.messages)?);
-    // DeepSeek defaults an omitted toggle to enabled, so both modes must be explicit.
-    let thinking_enabled = matches!(config.speed_profile, SpeedProfile::FlashWithAutoThinking)
-        && config.thinking.enabled;
-    let thinking = thinking_body(thinking_enabled);
-    let tools = tools_to_chat(&request.tools);
-    // tool_choice=required is only valid when tools are offered.
-    let tool_choice = if tools.is_empty() {
-        None
-    } else {
-        request
-            .tool_choice
-            .or(config.tool_choice)
-            .map(tool_choice_value)
-    };
-    Ok(ChatRequest {
-        model: config.model.clone(),
-        messages,
-        stream: config.stream,
-        tools,
-        reasoning_effort: thinking_enabled.then(|| effort_value(config.thinking.reasoning_effort)),
-        thinking,
-        max_tokens: config.max_tokens,
-        tool_choice,
-    })
 }
 
 pub(crate) fn combined_system(config: &AgentConfig, request: &ModelRequest) -> Option<String> {
@@ -356,215 +236,11 @@ pub(crate) fn tool_choice_value(choice: ToolChoice) -> &'static str {
     }
 }
 
-fn thinking_body(enabled: bool) -> Value {
-    json!({ "type": if enabled { "enabled" } else { "disabled" } })
-}
-
 pub(crate) fn effort_value(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
         ReasoningEffort::High => "high",
-    }
-}
-
-fn messages_to_chat(messages: &[AgentMessage]) -> Result<Vec<Value>, AgentError> {
-    let mut out = Vec::new();
-    for message in messages {
-        match message {
-            AgentMessage::User { content } => append_user_messages(&mut out, content)?,
-            AgentMessage::Assistant { content } => out.push(assistant_message(content)?),
-        }
-    }
-    Ok(out)
-}
-
-fn append_user_messages(out: &mut Vec<Value>, content: &[ContentBlock]) -> Result<(), AgentError> {
-    let mut text = Vec::new();
-    for block in content {
-        match block {
-            ContentBlock::Text { text: value } => text.push(value.clone()),
-            ContentBlock::ConversationDigest(digest) => {
-                text.push(format!(
-                    "CONVERSATION_DIGEST_JSON:\n{}",
-                    serde_json::to_string(digest).map_err(|err| {
-                        AgentError::Model(format!("failed to encode conversation digest: {err}"))
-                    })?
-                ));
-            }
-            ContentBlock::ToolResult(result) => {
-                flush_user_text(out, &mut text);
-                out.push(tool_result_message(result)?);
-            }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolUse(_) => {
-                return Err(AgentError::Model(
-                    "user message contains assistant-only content block".to_string(),
-                ));
-            }
-        }
-    }
-    flush_user_text(out, &mut text);
-    Ok(())
-}
-
-fn flush_user_text(out: &mut Vec<Value>, text: &mut Vec<String>) {
-    if text.is_empty() {
-        return;
-    }
-    out.push(json!({ "role": "user", "content": text.join("\n") }));
-    text.clear();
-}
-
-fn assistant_message(content: &[ContentBlock]) -> Result<Value, AgentError> {
-    let mut text = Vec::new();
-    let mut reasoning = Vec::new();
-    let mut tool_calls = Vec::new();
-    for block in content {
-        match block {
-            ContentBlock::Text { text: value } => text.push(value.clone()),
-            ContentBlock::Thinking { text: value, .. } => reasoning.push(value.clone()),
-            ContentBlock::ToolUse(tool_use) => tool_calls.push(tool_call_to_chat(tool_use)?),
-            ContentBlock::ConversationDigest(_) | ContentBlock::ToolResult(_) => {
-                return Err(AgentError::Model(
-                    "assistant message contains non-assistant content block".to_string(),
-                ));
-            }
-        }
-    }
-    let mut value = Map::new();
-    value.insert("role".to_string(), Value::String("assistant".to_string()));
-    value.insert("content".to_string(), Value::String(text.join("")));
-    if !reasoning.is_empty() {
-        value.insert(
-            "reasoning_content".to_string(),
-            Value::String(reasoning.join("")),
-        );
-    }
-    if !tool_calls.is_empty() {
-        value.insert("tool_calls".to_string(), Value::Array(tool_calls));
-    }
-    Ok(Value::Object(value))
-}
-
-fn tool_call_to_chat(tool_use: &ToolUse) -> Result<Value, AgentError> {
-    if let Some(raw) = tool_use.raw.as_ref() {
-        return Ok(raw.clone());
-    }
-    Ok(json!({
-        "id": tool_use.id,
-        "type": "function",
-        "function": {
-            "name": tool_use.name,
-            "arguments": encode_arguments(&tool_use.input)?
-        }
-    }))
-}
-
-fn tool_result_message(result: &ToolResult) -> Result<Value, AgentError> {
-    Ok(json!({
-        "role": "tool",
-        "tool_call_id": result.tool_use_id,
-        "content": tool_result_content(&result.content)?
-    }))
-}
-
-fn tools_to_chat(tools: &[AgentToolSpec]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": if tool.input_schema.is_null() {
-                        json!({ "type": "object", "properties": {} })
-                    } else {
-                        tool.input_schema.clone()
-                    }
-                }
-            })
-        })
-        .collect()
-}
-
-fn decode_choice(
-    response_id: Option<String>,
-    choice: ChatChoice,
-    usage: Option<ChatUsage>,
-    raw: Value,
-) -> Result<ModelResponse, AgentError> {
-    let mut content = Vec::new();
-    if let Some(reasoning_content) = choice
-        .message
-        .reasoning_content
-        .filter(|value| !value.is_empty())
-    {
-        content.push(ContentBlock::Thinking {
-            text: reasoning_content,
-            signature: None,
-        });
-    }
-    if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
-        content.push(ContentBlock::Text { text });
-    }
-    for tool_call in choice.message.tool_calls {
-        content.push(ContentBlock::ToolUse(tool_use_from_tool_call(tool_call)?));
-    }
-    Ok(ModelResponse {
-        content,
-        stop_reason: choice.finish_reason.map(stop_reason),
-        response_id,
-        raw: Some(raw),
-        usage: usage.map(usage_from_chat),
-        ..ModelResponse::default()
-    })
-}
-
-async fn decode_response(response: reqwest::Response) -> Result<ModelResponse, AgentError> {
-    let raw: Value = response
-        .json()
-        .await
-        .map_err(|err| AgentError::Model(format!("model response was not JSON: {err}")))?;
-    let decoded: ChatResponse = serde_json::from_value(raw.clone())
-        .map_err(|err| AgentError::Model(format!("model response shape was invalid: {err}")))?;
-    let choice =
-        decoded.choices.into_iter().next().ok_or_else(|| {
-            AgentError::Model("model response did not include a choice".to_string())
-        })?;
-    decode_choice(decoded.id, choice, decoded.usage, raw)
-}
-
-fn tool_use_from_tool_call(tool_call: ChatToolCall) -> Result<ToolUse, AgentError> {
-    let raw = serde_json::to_value(&tool_call)
-        .map_err(|err| AgentError::Model(format!("failed to preserve tool call: {err}")))?;
-    Ok(ToolUse {
-        id: tool_call
-            .id
-            .ok_or_else(|| AgentError::Model("tool call missing id".to_string()))?,
-        name: tool_call
-            .function
-            .name
-            .ok_or_else(|| AgentError::Model("tool call missing function name".to_string()))?,
-        input: decode_arguments(tool_call.function.arguments.as_deref().unwrap_or("{}")),
-        raw: Some(raw),
-    })
-}
-
-pub(crate) fn usage_from_chat(usage: ChatUsage) -> Usage {
-    Usage {
-        input_tokens: usage.prompt_tokens.unwrap_or_default(),
-        output_tokens: usage.completion_tokens.unwrap_or_default(),
-    }
-}
-
-pub(crate) fn stop_reason(value: String) -> StopReason {
-    match value.as_str() {
-        "stop" => StopReason::EndTurn,
-        "tool_calls" => StopReason::ToolUse,
-        "length" => StopReason::MaxTokens,
-        "content_filter" => StopReason::Refusal,
-        other => StopReason::Other(other.to_string()),
     }
 }
 
@@ -592,7 +268,8 @@ pub(crate) fn tool_result_content(content: &Value) -> Result<String, AgentError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolAnnotations;
+    use crate::{AgentMessage, AgentToolSpec, ToolAnnotations};
+    use serde_json::json;
 
     #[test]
     fn retry_delay_backs_off_with_jitter_and_honors_retry_after() {
@@ -643,7 +320,7 @@ mod tests {
     fn tool_choice_required_is_sent_when_tools_are_offered() {
         let mut config = AgentConfig::new("k", "deepseek-v4-flash");
         config.tool_choice = Some(ToolChoice::Required);
-        let body = serde_json::to_value(chat_request(&config, request(vec![spec()])).unwrap())
+        let body = serde_json::to_value(responses_request(&config, request(vec![spec()])).unwrap())
             .expect("serialize");
         assert_eq!(body["tool_choice"], "required");
     }
@@ -655,24 +332,32 @@ mod tests {
         let mut request = request(vec![spec()]);
         request.tool_choice = Some(ToolChoice::Auto);
         let body =
-            serde_json::to_value(chat_request(&config, request).unwrap()).expect("serialize");
+            serde_json::to_value(responses_request(&config, request).unwrap()).expect("serialize");
         assert_eq!(body["tool_choice"], "auto");
     }
 
     #[test]
-    fn tool_choice_is_omitted_when_no_tools() {
+    fn tool_choice_none_is_sent_when_no_tools() {
         let mut config = AgentConfig::new("k", "deepseek-v4-flash");
         config.tool_choice = Some(ToolChoice::Required);
-        let body = serde_json::to_value(chat_request(&config, request(vec![])).unwrap())
-            .expect("serialize");
-        assert!(body.get("tool_choice").is_none());
+        let mut request = request(vec![]);
+        request.tool_choice = Some(ToolChoice::None);
+        let body =
+            serde_json::to_value(responses_request(&config, request).unwrap()).expect("serialize");
+        assert_eq!(body["tool_choice"], "none");
     }
 
     #[test]
     fn tool_choice_absent_by_default() {
         let config = AgentConfig::new("k", "deepseek-v4-flash");
-        let body = serde_json::to_value(chat_request(&config, request(vec![spec()])).unwrap())
+        let body = serde_json::to_value(responses_request(&config, request(vec![spec()])).unwrap())
             .expect("serialize");
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn stale_chat_endpoint_is_invalid() {
+        let err = endpoint("https://api.deepseek.com/chat/completions").expect_err("invalid");
+        assert!(err.to_string().contains("explicit /responses endpoint"));
     }
 }

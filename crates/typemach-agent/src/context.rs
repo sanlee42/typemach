@@ -93,9 +93,9 @@ fn build_compacted_window(
     keep_count: usize,
 ) -> Result<CompactedWindow, AgentError> {
     let mut omitted_count = messages.len().saturating_sub(keep_count);
-    // Chat completion APIs reject a `role:"tool"` message whose tool call
-    // lives in the omitted prefix, so widen the window until it no longer
-    // starts on a tool result. Pairing correctness wins over the byte budget.
+    // Provider protocols reject a tool result whose matching call lives in
+    // the omitted prefix, so widen the window until it no longer starts on a
+    // tool result. Pairing correctness wins over the byte budget.
     while omitted_count > 0 && unsafe_window_start(&messages[omitted_count]) {
         omitted_count -= 1;
     }

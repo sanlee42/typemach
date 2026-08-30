@@ -1,552 +1,377 @@
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use typemach_agent::{
-    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, ConfiguredModel, ContentBlock,
-    ModelRequest, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolAnnotations,
+    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, ConfiguredModel, ModelOutcome,
+    ModelRequest, ModelStream, StopReason, ToolAnnotations,
 };
 
-#[path = "deepseek/responses.rs"]
-mod responses;
-
 #[tokio::test]
-async fn flash_request_disables_thinking_and_decodes_tool_call() {
-    let response = json!({
-        "id": "chatcmpl-1",
-        "choices": [{
-            "message": {
-                "reasoning_content": "inspect metric",
-                "content": null,
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {
-                        "name": "metric_point",
-                        "arguments": "{\"metric_id\":\"paid_order_count\"}"
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }],
-        "usage": { "prompt_tokens": 10, "completion_tokens": 3 }
-    })
-    .to_string();
-    let (base_url, captured) = spawn_server(response, "application/json").await;
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
-    config.base_url = base_url;
-    config.stream = false;
-    let model = ConfiguredModel::new(config).expect("model");
+async fn origin_base_posts_to_responses_and_stale_chat_base_is_invalid() {
+    let (base_url, captured) = spawn_server(vec![MockTurn::ok(ok_message("Done."))]).await;
+    let model = ConfiguredModel::new(config(base_url, false)).expect("model");
     let (stream, _rx) = ModelStream::channel();
-    let response = model
-        .next_step(
-            ModelRequest {
-                messages: vec![AgentMessage::user_text("昨天订单量")],
-                tools: vec![tool_spec()],
-                context: Value::Null,
-                turn: 1,
-                system_suffix: None,
-                tool_choice: None,
-            },
-            stream,
-        )
-        .await
-        .expect("response");
 
-    let body = captured_json(&captured);
-    assert_eq!(body["model"], "deepseek-v4-flash");
-    assert_eq!(body["stream"], false);
-    assert_eq!(body["thinking"]["type"], "disabled");
-    assert!(body.get("reasoning_effort").is_none());
-    assert_eq!(body["tools"][0]["function"]["name"], "metric_point");
-    assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
-    assert_eq!(response.usage.expect("usage").input_tokens, 10);
-    assert!(matches!(
-        response.content.first(),
-        Some(ContentBlock::Thinking { text, .. }) if text == "inspect metric"
-    ));
-    assert!(response.content.iter().any(|block| matches!(
-        block,
-        ContentBlock::ToolUse(tool)
-            if tool.id == "call-1"
-                && tool.name == "metric_point"
-                && tool.input["metric_id"] == "paid_order_count"
-    )));
-}
-
-#[tokio::test]
-async fn auto_thinking_request_enables_thinking_with_effort() {
-    let response = json!({
-        "id": "chatcmpl-thinking",
-        "choices": [{
-            "message": {
-                "reasoning_content": "inspect evidence",
-                "content": "result"
-            },
-            "finish_reason": "stop"
-        }]
-    })
-    .to_string();
-    let (base_url, captured) = spawn_server(response, "application/json").await;
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-pro");
-    config.base_url = base_url;
-    config.stream = false;
-    config.speed_profile = SpeedProfile::FlashWithAutoThinking;
-    config.thinking.enabled = true;
-    config.thinking.reasoning_effort = ReasoningEffort::High;
-    let model = ConfiguredModel::new(config).expect("model");
-    let (stream, _rx) = ModelStream::channel();
     model
         .next_step(
-            ModelRequest {
-                messages: vec![AgentMessage::user_text("analyze deeply")],
-                tools: Vec::new(),
-                context: Value::Null,
-                turn: 1,
-                system_suffix: None,
-                tool_choice: None,
-            },
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
             stream,
         )
         .await
         .expect("response");
 
-    let body = captured_json(&captured);
-    assert_eq!(body["thinking"]["type"], "enabled");
-    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(captured.lock().expect("captured")[0].target, "/responses");
+    let err = match ConfiguredModel::new(config(
+        "http://127.0.0.1:9/chat/completions".to_string(),
+        false,
+    )) {
+        Ok(_) => panic!("stale chat endpoint must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("explicit /responses endpoint"));
 }
 
 #[tokio::test]
-async fn streaming_emits_text_and_assembles_tool_call() {
-    let response = sse([
+async fn streaming_final_text_has_one_live_sink() {
+    let (base_url, captured) = spawn_server(vec![MockTurn::ok(sse([
+        json!({ "type": "response.output_text.delta", "delta": "A" }),
+        json!({ "type": "response.output_text.delta", "delta": "B" }),
         json!({
-            "id": "chatcmpl-2",
-            "choices": [{
-                "delta": { "reasoning_content": "think " },
-                "finish_reason": null
-            }]
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "AB" }]
+                }],
+                "usage": { "input_tokens": 11, "output_tokens": 5 }
+            }
         }),
-        json!({
-            "id": "chatcmpl-2",
-            "choices": [{
-                "delta": { "content": "订单" },
-                "finish_reason": null
-            }]
-        }),
-        json!({
-            "id": "chatcmpl-2",
-            "choices": [{
-                "delta": { "content": "量" },
-                "finish_reason": null
-            }]
-        }),
-        json!({
-            "id": "chatcmpl-2",
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "call-2",
-                        "type": "function",
-                        "function": {
-                            "name": "metric_point",
-                            "arguments": "{\"metric_id\""
-                        }
-                    }]
-                },
-                "finish_reason": null
-            }]
-        }),
-        json!({
-            "id": "chatcmpl-2",
-            "choices": [{
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "function": { "arguments": ":\"paid_order_count\"}" }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }]
-        }),
-    ]);
-    let (base_url, _captured) = spawn_server(response, "text/event-stream").await;
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
-    config.base_url = base_url;
-    let model = ConfiguredModel::new(config).expect("model");
+    ]))])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
     let (stream, mut rx) = ModelStream::channel();
     let response = model
         .next_step(
-            ModelRequest {
-                messages: vec![AgentMessage::user_text("昨天订单量")],
-                tools: vec![tool_spec()],
-                context: Value::Null,
-                turn: 1,
-                system_suffix: None,
-                tool_choice: None,
-            },
+            request(vec![tool_spec()], Some(typemach_agent::ToolChoice::Auto)),
             stream,
         )
         .await
         .expect("response");
 
-    assert_eq!(rx.recv().await.as_deref(), Some("订单"));
-    assert_eq!(rx.recv().await.as_deref(), Some("量"));
-    assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
-    assert!(matches!(
-        response.content.first(),
-        Some(ContentBlock::Thinking { text, .. }) if text == "think "
-    ));
-    assert!(response.content.iter().any(|block| matches!(
-        block,
-        ContentBlock::ToolUse(tool)
-            if tool.id == "call-2"
-                && tool.input["metric_id"] == "paid_order_count"
-    )));
+    assert_eq!(rx.recv().await.expect("first").0, "A");
+    assert_eq!(rx.recv().await.expect("second").0, "B");
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        response.outcome,
+        Some(ModelOutcome::FinalAnswer {
+            text: String::new()
+        })
+    );
+    assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+    assert_eq!(response.usage.expect("usage").input_tokens, 11);
+    let body = &captured.lock().expect("captured")[0].body;
+    assert_eq!(body["tool_choice"], "auto");
+    assert_eq!(body["tools"][0]["name"], "metric_point");
 }
 
 #[tokio::test]
-async fn system_suffix_is_appended_to_system_message() {
-    let response = json!({
-        "id": "chatcmpl-3",
-        "choices": [{
-            "message": { "content": "好的" },
-            "finish_reason": "stop"
-        }]
-    })
-    .to_string();
-    let (base_url, captured) = spawn_server(response, "application/json").await;
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
-    config.base_url = base_url;
-    config.stream = false;
-    config.system = Some("你是经营分析助手。".to_string());
-    let model = ConfiguredModel::new(config).expect("model");
-    let (stream, _rx) = ModelStream::channel();
-    model
+async fn no_delta_completed_message_returns_text_once() {
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([json!({
+        "type": "response.completed",
+        "response": completed_message("No live delta.")
+    })]))])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    let response = model
         .next_step(
-            ModelRequest {
-                messages: vec![AgentMessage::user_text("订单量")],
-                tools: Vec::new(),
-                context: Value::Null,
-                turn: 1,
-                system_suffix: Some("当前店铺:demo。".to_string()),
-                tool_choice: None,
-            },
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
             stream,
         )
         .await
         .expect("response");
 
-    let body = captured_json(&captured);
-    assert_eq!(body["messages"][0]["role"], "system");
+    assert!(rx.try_recv().is_err());
     assert_eq!(
-        body["messages"][0]["content"],
-        "你是经营分析助手。\n\n当前店铺:demo。"
+        response.outcome,
+        Some(ModelOutcome::FinalAnswer {
+            text: "No live delta.".to_string()
+        })
     );
+}
 
-    // Without a static base prompt the suffix becomes the whole system message.
-    let response = json!({
-        "id": "chatcmpl-4",
-        "choices": [{
-            "message": { "content": "好的" },
-            "finish_reason": "stop"
-        }]
-    })
-    .to_string();
-    let (base_url, captured) = spawn_server(response, "application/json").await;
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
-    config.base_url = base_url;
-    config.stream = false;
-    let model = ConfiguredModel::new(config).expect("model");
-    let (stream, _rx) = ModelStream::channel();
+#[tokio::test]
+async fn stream_buffers_split_multibyte_utf8_until_line_boundary() {
+    let body = sse([
+        json!({ "type": "response.output_text.delta", "delta": "Orders" }),
+        json!({ "type": "response.output_text.delta", "delta": "订单" }),
+        json!({
+            "type": "response.completed",
+            "response": completed_message("Orders订单")
+        }),
+    ]);
+    let split_at = body.find("订单").expect("multibyte text") + 1;
+    let (base_url, _captured) = spawn_server(vec![MockTurn {
+        status: 200,
+        content_type: "text/event-stream",
+        body,
+        delivery: Delivery::SplitBodyAt(split_at),
+    }])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+
     model
         .next_step(
-            ModelRequest {
-                messages: vec![AgentMessage::user_text("订单量")],
-                tools: Vec::new(),
-                context: Value::Null,
-                turn: 1,
-                system_suffix: Some("当前店铺:demo。".to_string()),
-                tool_choice: None,
-            },
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
             stream,
         )
         .await
         .expect("response");
-    let body = captured_json(&captured);
-    assert_eq!(body["messages"][0]["role"], "system");
-    assert_eq!(body["messages"][0]["content"], "当前店铺:demo。");
+
+    assert_eq!(rx.recv().await.expect("first").0, "Orders");
+    assert_eq!(rx.recv().await.expect("second").0, "订单");
 }
 
-fn ok_chat_body(text: &str) -> String {
-    json!({
-        "id": "chatcmpl-ok",
-        "choices": [{
-            "message": { "content": text },
-            "finish_reason": "stop"
-        }]
-    })
-    .to_string()
+#[tokio::test]
+async fn function_call_arguments_are_private_and_decoded() {
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": "{\"metric_id\""
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": ":\"paid_order_count\"}"
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-2",
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "metric_point",
+                    "arguments": "{\"metric_id\":\"paid_order_count\"}"
+                }]
+            }
+        }),
+    ]))])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    let response = model
+        .next_step(
+            request(vec![tool_spec()], Some(typemach_agent::ToolChoice::Auto)),
+            stream,
+        )
+        .await
+        .expect("response");
+
+    assert!(rx.try_recv().is_err());
+    let Some(ModelOutcome::ToolCalls { calls }) = response.outcome else {
+        panic!("expected tool calls");
+    };
+    assert_eq!(calls[0].id, "call-1");
+    assert_eq!(calls[0].input["metric_id"], "paid_order_count");
 }
 
-fn flash_config(base_url: String, stream: bool) -> AgentConfig {
-    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
-    config.base_url = base_url;
-    config.stream = stream;
-    config
+#[tokio::test]
+async fn fallback_request_serializes_explicit_none_without_tools() {
+    let (base_url, captured) = spawn_server(vec![MockTurn::ok(ok_message("Done."))]).await;
+    let model = ConfiguredModel::new(config(base_url, false)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+
+    model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect("response");
+
+    let body = &captured.lock().expect("captured")[0].body;
+    assert!(body.get("tools").is_none());
+    assert_eq!(body["tool_choice"], "none");
 }
 
-fn plain_request() -> ModelRequest {
-    ModelRequest {
-        messages: vec![AgentMessage::user_text("订单量")],
-        tools: Vec::new(),
-        context: Value::Null,
-        turn: 1,
-        system_suffix: None,
-        tool_choice: None,
+#[tokio::test]
+async fn malformed_refusal_and_mixed_responses_fail_structurally() {
+    for response in [
+        completed_refusal(),
+        json!({
+            "id": "resp-mixed",
+            "status": "completed",
+            "output": [
+                message_item("Text"),
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "metric_point",
+                    "arguments": "{}"
+                }
+            ]
+        }),
+    ] {
+        let (base_url, _captured) = spawn_server(vec![MockTurn::ok(response.to_string())]).await;
+        let model = ConfiguredModel::new(config(base_url, false)).expect("model");
+        let (stream, _rx) = ModelStream::channel();
+        let err = model
+            .next_step(
+                request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+                stream,
+            )
+            .await
+            .expect_err("structural failure");
+        assert!(
+            err.to_string()
+                .contains("model request failed after 1 attempts")
+        );
     }
 }
 
 #[tokio::test]
-async fn retries_429_then_succeeds() {
-    let (base_url, captured) = spawn_script_server(vec![
-        MockTurn {
-            status: 429,
-            retry_after: Some(0),
-            content_type: "application/json",
-            body: json!({ "error": "rate limited" }).to_string(),
-            delivery: Delivery::Complete,
-        },
-        MockTurn {
-            status: 200,
-            retry_after: None,
-            content_type: "application/json",
-            body: ok_chat_body("好的"),
-            delivery: Delivery::Complete,
-        },
-    ])
-    .await;
-    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
-    let (stream, _rx) = ModelStream::channel();
-    let response = model.next_step(plain_request(), stream).await.expect("ok");
-    assert!(response.content.iter().any(|block| matches!(
-        block,
-        ContentBlock::Text { text } if text == "好的"
-    )));
-    assert_eq!(captured.lock().expect("captured").len(), 2);
-}
-
-#[tokio::test]
-async fn retries_500_then_succeeds() {
-    let (base_url, captured) = spawn_script_server(vec![
-        MockTurn {
-            status: 500,
-            retry_after: None,
-            content_type: "application/json",
-            body: json!({ "error": "boom" }).to_string(),
-            delivery: Delivery::Complete,
-        },
-        MockTurn {
-            status: 200,
-            retry_after: None,
-            content_type: "application/json",
-            body: ok_chat_body("好的"),
-            delivery: Delivery::Complete,
-        },
-    ])
-    .await;
-    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
-    let (stream, _rx) = ModelStream::channel();
-    model.next_step(plain_request(), stream).await.expect("ok");
-    assert_eq!(captured.lock().expect("captured").len(), 2);
-}
-
-#[tokio::test]
-async fn does_not_retry_400() {
-    let (base_url, captured) = spawn_script_server(vec![MockTurn {
-        status: 400,
-        retry_after: None,
-        content_type: "application/json",
-        body: json!({ "error": "bad tool schema" }).to_string(),
-        delivery: Delivery::Complete,
-    }])
-    .await;
-    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
-    let (stream, _rx) = ModelStream::channel();
-    let err = model
-        .next_step(plain_request(), stream)
-        .await
-        .expect_err("must fail fast");
-    let message = err.to_string();
-    assert!(message.contains("after 1 attempts"), "{message}");
-    assert!(message.contains("bad tool schema"), "{message}");
-    assert_eq!(captured.lock().expect("captured").len(), 1);
-}
-
-#[tokio::test]
-async fn retries_dead_stream_before_first_delta() {
-    let broken = sse_line(&json!({
-        "id": "chatcmpl-x",
-        "choices": [{
-            "delta": { "reasoning_content": "th" },
-            "finish_reason": null
-        }]
-    }));
-    let healthy = sse([
-        json!({
-            "id": "chatcmpl-y",
-            "choices": [{
-                "delta": { "content": "订单量 42。" },
-                "finish_reason": null
-            }]
-        }),
-        json!({
-            "id": "chatcmpl-y",
-            "choices": [{
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        }),
-    ]);
-    let cut = broken.len();
-    let (base_url, captured) = spawn_script_server(vec![
-        MockTurn {
-            status: 200,
-            retry_after: None,
-            content_type: "text/event-stream",
-            body: broken,
-            delivery: Delivery::TruncateAfter(cut),
-        },
-        MockTurn {
-            status: 200,
-            retry_after: None,
-            content_type: "text/event-stream",
-            body: healthy,
-            delivery: Delivery::Complete,
-        },
-    ])
-    .await;
-    let model = ConfiguredModel::new(flash_config(base_url, true)).expect("model");
-    let (stream, mut rx) = ModelStream::channel();
-    model.next_step(plain_request(), stream).await.expect("ok");
-    assert_eq!(rx.recv().await.as_deref(), Some("订单量 42。"));
-    assert_eq!(captured.lock().expect("captured").len(), 2);
-}
-
-#[tokio::test]
-async fn does_not_retry_after_first_delta() {
-    let body = sse_line(&json!({
-        "id": "chatcmpl-x",
-        "choices": [{
-            "delta": { "content": "订单" },
-            "finish_reason": null
-        }]
-    }));
-    let cut = body.len();
-    let (base_url, captured) = spawn_script_server(vec![MockTurn {
+async fn retry_stops_after_public_answer_delta() {
+    let first = sse([json!({ "type": "response.output_text.delta", "delta": "A" })]);
+    let (base_url, captured) = spawn_server(vec![MockTurn {
         status: 200,
-        retry_after: None,
         content_type: "text/event-stream",
-        body,
-        delivery: Delivery::TruncateAfter(cut),
+        body: first,
+        delivery: Delivery::Truncate,
     }])
     .await;
-    let model = ConfiguredModel::new(flash_config(base_url, true)).expect("model");
-    let (stream, mut rx) = ModelStream::channel();
-    let err = model
-        .next_step(plain_request(), stream)
-        .await
-        .expect_err("must not retry");
-    assert!(err.to_string().contains("after 1 attempts"), "{err}");
-    assert_eq!(rx.recv().await.as_deref(), Some("订单"));
-    assert_eq!(captured.lock().expect("captured").len(), 1);
-}
-
-#[tokio::test]
-async fn stream_idle_gap_aborts_with_small_timeout() {
-    let head = sse_line(&json!({
-        "id": "chatcmpl-x",
-        "choices": [{
-            "delta": { "content": "订单" },
-            "finish_reason": null
-        }]
-    }));
-    let cut = head.len();
-    let mut body = head;
-    body.push_str(&sse_line(&json!({
-        "id": "chatcmpl-x",
-        "choices": [{
-            "delta": { "content": "量" },
-            "finish_reason": "stop"
-        }]
-    })));
-    body.push_str("data: [DONE]\n\n");
-    let (base_url, captured) = spawn_script_server(vec![MockTurn {
-        status: 200,
-        retry_after: None,
-        content_type: "text/event-stream",
-        body,
-        delivery: Delivery::PauseAt(cut, Duration::from_millis(2500)),
-    }])
-    .await;
-    let mut config = flash_config(base_url, true);
-    config.request_timeout_secs = 1;
+    let mut config = config(base_url, true);
+    config.max_retries = 2;
     let model = ConfiguredModel::new(config).expect("model");
     let (stream, mut rx) = ModelStream::channel();
+
     let err = model
-        .next_step(plain_request(), stream)
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
         .await
-        .expect_err("idle gap must abort");
-    assert!(err.to_string().contains("after 1 attempts"), "{err}");
-    assert_eq!(rx.recv().await.as_deref(), Some("订单"));
+        .expect_err("must not retry");
+
+    assert!(err.to_string().contains("after 1 attempts"));
+    assert_eq!(rx.recv().await.expect("delta").0, "A");
     assert_eq!(captured.lock().expect("captured").len(), 1);
 }
 
-#[tokio::test]
-async fn exhausts_attempts_and_reports_count() {
-    let unavailable = || MockTurn {
-        status: 503,
-        retry_after: Some(0),
-        content_type: "application/json",
-        body: json!({ "error": "overloaded" }).to_string(),
-        delivery: Delivery::Complete,
-    };
-    let (base_url, captured) =
-        spawn_script_server(vec![unavailable(), unavailable(), unavailable()]).await;
-    let model = ConfiguredModel::new(flash_config(base_url, false)).expect("model");
-    let (stream, _rx) = ModelStream::channel();
-    let err = model
-        .next_step(plain_request(), stream)
-        .await
-        .expect_err("must exhaust");
-    assert!(err.to_string().contains("after 3 attempts"), "{err}");
-    assert_eq!(captured.lock().expect("captured").len(), 3);
+fn config(base_url: String, stream: bool) -> AgentConfig {
+    let mut config = AgentConfig::new("sk-test", "deepseek-v4-flash");
+    config.base_url = base_url;
+    config.stream = stream;
+    config.max_retries = 0;
+    config.request_timeout_secs = 1;
+    config
+}
+
+fn request(
+    tools: Vec<AgentToolSpec>,
+    tool_choice: Option<typemach_agent::ToolChoice>,
+) -> ModelRequest {
+    ModelRequest {
+        messages: vec![AgentMessage::user_text("Read the metric")],
+        tools,
+        context: Value::Null,
+        turn: 1,
+        system_suffix: None,
+        tool_choice,
+    }
+}
+
+fn tool_spec() -> AgentToolSpec {
+    AgentToolSpec {
+        name: "metric_point".to_string(),
+        description: "read metric point".to_string(),
+        input_schema: json!({ "type": "object" }),
+        output_schema: Value::Null,
+        metadata: Value::Null,
+        annotations: ToolAnnotations::default(),
+    }
+}
+
+fn ok_message(text: &str) -> String {
+    completed_message(text).to_string()
+}
+
+fn completed_message(text: &str) -> Value {
+    json!({
+        "id": "resp-ok",
+        "status": "completed",
+        "output": [message_item(text)]
+    })
+}
+
+fn message_item(text: &str) -> Value {
+    json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text }]
+    })
+}
+
+fn completed_refusal() -> Value {
+    json!({
+        "id": "resp-refusal",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "refusal", "refusal": "Cannot comply." }]
+        }]
+    })
 }
 
 enum Delivery {
     Complete,
-    /// Advertise more bytes than sent, then close: the client observes a
-    /// transport error mid-body.
-    TruncateAfter(usize),
-    /// Send the first N bytes, stall, then send the rest.
-    PauseAt(usize, Duration),
+    Truncate,
+    SplitBodyAt(usize),
 }
 
 struct MockTurn {
     status: u16,
-    retry_after: Option<u64>,
     content_type: &'static str,
     body: String,
     delivery: Delivery,
 }
 
-fn sse_line(chunk: &Value) -> String {
-    format!("data: {chunk}\n\n")
+impl MockTurn {
+    fn ok(body: String) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json",
+            body,
+            delivery: Delivery::Complete,
+        }
+    }
 }
 
-async fn spawn_script_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<String>>>) {
+#[derive(Debug)]
+struct CapturedRequest {
+    target: String,
+    body: Value,
+}
+
+async fn spawn_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -559,141 +384,98 @@ async fn spawn_script_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<Str
                 .lock()
                 .expect("captured lock")
                 .push(request);
-            let bytes = turn.body.as_bytes();
-            let advertised = match turn.delivery {
-                Delivery::TruncateAfter(_) => bytes.len() + 64,
-                _ => bytes.len(),
-            };
-            let mut header = format!(
-                "HTTP/1.1 {} X\r\ncontent-type: {}\r\ncontent-length: {advertised}\r\n",
-                turn.status, turn.content_type
-            );
-            if let Some(seconds) = turn.retry_after {
-                header.push_str(&format!("retry-after: {seconds}\r\n"));
-            }
-            header.push_str("connection: close\r\n\r\n");
-            socket.write_all(header.as_bytes()).await.expect("header");
-            match turn.delivery {
-                Delivery::Complete => socket.write_all(bytes).await.expect("body"),
-                Delivery::TruncateAfter(cut) => {
-                    let cut = cut.min(bytes.len());
-                    socket.write_all(&bytes[..cut]).await.expect("body head");
-                    socket.flush().await.expect("flush");
-                }
-                Delivery::PauseAt(cut, pause) => {
-                    let cut = cut.min(bytes.len());
-                    socket.write_all(&bytes[..cut]).await.expect("body head");
-                    socket.flush().await.expect("flush");
-                    tokio::time::sleep(pause).await;
-                    let _ = socket.write_all(&bytes[cut..]).await;
-                }
-            }
+            write_response(&mut socket, &turn).await;
         }
     });
-    (format!("http://{addr}/chat/completions"), captured)
+    (format!("http://{addr}"), captured)
 }
 
-fn tool_spec() -> AgentToolSpec {
-    AgentToolSpec {
-        name: "metric_point".to_string(),
-        description: "read metric point".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "metric_id": { "type": "string" }
-            },
-            "required": ["metric_id"]
-        }),
-        output_schema: Value::Null,
-        metadata: Value::Null,
-        annotations: ToolAnnotations::default(),
-    }
-}
-
-fn sse<const N: usize>(chunks: [Value; N]) -> String {
-    let mut body = String::new();
-    for chunk in chunks {
-        body.push_str("data: ");
-        body.push_str(&chunk.to_string());
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
-    body
-}
-
-async fn spawn_server(
-    response: String,
-    content_type: &'static str,
-) -> (String, Arc<Mutex<String>>) {
-    spawn_server_at(response, content_type, "/chat/completions").await
-}
-
-async fn spawn_responses_server(
-    response: String,
-    content_type: &'static str,
-) -> (String, Arc<Mutex<String>>) {
-    spawn_server_at(response, content_type, "").await
-}
-
-async fn spawn_server_at(
-    response: String,
-    content_type: &'static str,
-    path: &'static str,
-) -> (String, Arc<Mutex<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let captured_for_task = Arc::clone(&captured);
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.expect("accept");
-        let request = read_request(&mut socket).await;
-        *captured_for_task.lock().expect("captured lock") = request;
-        let bytes = response.as_bytes();
-        let header = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            bytes.len()
-        );
-        socket.write_all(header.as_bytes()).await.expect("header");
-        socket.write_all(bytes).await.expect("body");
-    });
-    (format!("http://{addr}{path}"), captured)
-}
-
-async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
-    let mut buf = Vec::new();
-    let mut tmp = [0_u8; 1024];
-    loop {
-        let read = socket.read(&mut tmp).await.expect("read");
-        if read == 0 {
-            break;
+async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let n = socket.read(&mut chunk).await.expect("read request");
+        assert_ne!(n, 0, "connection closed before headers");
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(index) = find_header_end(&buffer) {
+            break index;
         }
-        buf.extend_from_slice(&tmp[..read]);
-        if request_complete(&buf) {
-            break;
-        }
-    }
-    String::from_utf8(buf).expect("request utf8")
-}
-
-fn request_complete(buf: &[u8]) -> bool {
-    let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
     };
-    let headers = String::from_utf8_lossy(&buf[..header_end]);
-    let content_length = headers
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let target = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("request target")
+        .to_string();
+    let content_length = content_length(&headers);
+    while buffer.len() < header_end + 4 + content_length {
+        let n = socket.read(&mut chunk).await.expect("read body");
+        assert_ne!(n, 0, "connection closed before body");
+        buffer.extend_from_slice(&chunk[..n]);
+    }
+    let body = &buffer[header_end + 4..header_end + 4 + content_length];
+    CapturedRequest {
+        target,
+        body: serde_json::from_slice(body).expect("json body"),
+    }
+}
+
+async fn write_response(socket: &mut tokio::net::TcpStream, turn: &MockTurn) {
+    let advertised_len = match turn.delivery {
+        Delivery::Complete | Delivery::SplitBodyAt(_) => turn.body.len(),
+        Delivery::Truncate => turn.body.len() + 16,
+    };
+    let head = format!(
+        "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        turn.status, turn.content_type, advertised_len
+    );
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .expect("write response head");
+    match turn.delivery {
+        Delivery::Complete | Delivery::Truncate => {
+            socket
+                .write_all(turn.body.as_bytes())
+                .await
+                .expect("write response body");
+        }
+        Delivery::SplitBodyAt(index) => {
+            let (first, second) = turn.body.as_bytes().split_at(index);
+            socket.write_all(first).await.expect("write first body");
+            socket.flush().await.expect("flush first body");
+            tokio::task::yield_now().await;
+            socket.write_all(second).await.expect("write second body");
+        }
+    }
+    if !matches!(turn.delivery, Delivery::Truncate) {
+        socket.shutdown().await.expect("shutdown response");
+    }
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length(headers: &str) -> usize {
+    headers
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+                .then(|| value.trim().parse().expect("content length"))
         })
-        .unwrap_or_default();
-    buf.len() >= header_end + 4 + content_length
+        .expect("content-length")
 }
 
-fn captured_json(captured: &Arc<Mutex<String>>) -> Value {
-    let request = captured.lock().expect("captured lock");
-    let (_, body) = request.split_once("\r\n\r\n").expect("request body");
-    serde_json::from_str(body).expect("json body")
+fn sse(events: impl IntoIterator<Item = Value>) -> String {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&event.to_string());
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
 }
