@@ -443,7 +443,9 @@ where
                 })
                 .await?;
                 state.terminal = Some(action);
-                return Ok(Transition::Complete(state.output(FinishReason::Terminal)));
+                return Ok(Transition::Complete(
+                    state.output_with_answer(FinishReason::Terminal, state.answer.clone()),
+                ));
             }
             state.tool_calls += 1;
             ctx.emit(AgentSignal::ToolStarted {
