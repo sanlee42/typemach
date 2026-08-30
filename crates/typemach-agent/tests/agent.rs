@@ -322,7 +322,10 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -332,17 +335,10 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     let completed = completed(&events);
     assert_eq!(completed.answer, "The order count is 42.");
     assert!(!completed.answer.contains("private"));
-    assert!(model.requests()[1].messages.iter().any(|message| matches!(
-        message,
-        AgentMessage::Assistant { content }
-            if matches!(
-                content.as_slice(),
-                [
-                    ContentBlock::Thinking { text, .. },
-                    ContentBlock::ToolUse(call),
-                ] if text == "private tool reasoning" && call.id == "tool-1"
-            )
-    )));
+    let final_prompt =
+        serde_json::to_string(&model.requests()[1].messages).expect("serialize final prompt");
+    assert!(!final_prompt.contains("private tool reasoning"));
+    assert!(final_prompt.contains("tool-1"));
     assert_eq!(
         completed
             .messages
@@ -458,7 +454,10 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
                 AgentMessage::user_text("turn 5"),
             ],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 0,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -522,7 +521,10 @@ async fn large_tool_result_is_archived_before_next_prompt() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Load the large evidence")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -592,6 +594,12 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
                     input: json!({ "question": "Which date?" }),
                     raw: None,
                 }],
+            }),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Inventory evidence is ready.".to_string(),
             }),
             ..ModelResponse::default()
         },
@@ -710,7 +718,10 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: Some("Current shop: A".to_string()),
         }),
@@ -728,7 +739,10 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         input: AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: Some(HumanInputAnswer {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
@@ -751,11 +765,12 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         Some("Current shop: A"),
         "start carries the per-run suffix"
     );
-    assert_eq!(
-        requests[1].system_suffix.as_deref(),
-        Some("Current shop: B"),
-        "resume refreshes the suffix"
-    );
+    let resumed_suffix = requests[1]
+        .system_suffix
+        .as_deref()
+        .expect("resumed final suffix");
+    assert!(resumed_suffix.starts_with("Current shop: B\n\n"));
+    assert!(resumed_suffix.contains("[Final answer phase]"));
 }
 
 #[test]

@@ -5,8 +5,11 @@ use tokio::time::sleep;
 use typemach::CheckpointSaver;
 use typemach_agent::AgentState;
 
+#[path = "final_answer/checkpoint.rs"]
+mod checkpoint;
+
 #[tokio::test]
-async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
+async fn tool_free_planning_transitions_to_an_authoritative_final_step() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
@@ -19,6 +22,13 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
                 }],
             }),
             stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Evidence is ready.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
         ModelResponse {
@@ -60,7 +70,7 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
             signal: AgentSignal::ToolResult { tool_use_id, .. },
         } if tool_use_id == "tool-1"
     )));
-    assert_eq!(model.requests().len(), 2);
+    assert_eq!(model.requests().len(), 3);
     assert_eq!(completed(&events).answer, "Order count is 42.");
     let requests = model.requests();
     assert_eq!(
@@ -79,10 +89,33 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
         requests[1].tool_choice,
         Some(typemach_agent::ToolChoice::Auto)
     );
+    assert_eq!(
+        requests[2].tool_choice,
+        Some(typemach_agent::ToolChoice::None)
+    );
+    assert!(requests[2].tools.is_empty());
+    let final_prompt = serde_json::to_string(&requests[2].messages).expect("serialize prompt");
+    assert!(!final_prompt.contains("Evidence is ready."));
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDelta { delta, index, .. },
+            signal: AgentSignal::AssistantMessageDelta {
+                phase: AssistantMessagePhase::Commentary,
+                delta,
+                index,
+                ..
+            },
+        } if delta == "Evidence is ready." && *index == 0
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDelta {
+                phase: AssistantMessagePhase::FinalAnswer,
+                delta,
+                index,
+                ..
+            },
         } if delta == "Order count is 42." && *index == 0
     )));
     assert!(events.iter().any(|event| matches!(
@@ -347,79 +380,6 @@ async fn unsafe_batch_stays_sequential() {
     assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
 }
 
-#[derive(Clone, Default)]
-struct FailFirstFinalModel {
-    calls: Arc<AtomicUsize>,
-    requests: Arc<Mutex<Vec<ModelRequest>>>,
-}
-
-#[async_trait]
-impl AgentModel for FailFirstFinalModel {
-    async fn next_step(
-        &self,
-        request: ModelRequest,
-        _stream: ModelStream,
-    ) -> Result<ModelResponse, AgentError> {
-        self.requests.lock().expect("requests lock").push(request);
-        match self.calls.fetch_add(1, Ordering::Relaxed) {
-            0 => Err(AgentError::Model("final transport failed".to_string())),
-            _ => Ok(ModelResponse {
-                outcome: Some(ModelOutcome::FinalAnswer {
-                    text: "Recovered final answer.".to_string(),
-                }),
-                stop_reason: Some(StopReason::EndTurn),
-                ..ModelResponse::default()
-            }),
-        }
-    }
-}
-
-#[tokio::test]
-async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
-    let model = FailFirstFinalModel::default();
-    let runner = build_agent_runner(
-        MemorySaver::default(),
-        model.clone(),
-        FakeTools,
-        AllowAllTools,
-    );
-    let run = request(AgentRunInput {
-        messages: vec![AgentMessage::user_text("Answer directly")],
-        context: Value::Null,
-        budget: AgentBudget {
-            max_model_turns: 0,
-            max_tool_calls: 4,
-        },
-        human_input: None,
-        system_suffix: None,
-    });
-    let first = collect(runner.stream(run.clone(), StreamConfig::default())).await;
-    assert!(
-        first
-            .iter()
-            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
-    );
-    let checkpoint = runner
-        .checkpointer()
-        .load("thread-1")
-        .await
-        .expect("load checkpoint")
-        .expect("checkpoint");
-    assert_eq!(
-        checkpoint.next_step,
-        Some(serde_json::to_value(AgentStep::FinalAnswer).expect("serialize step"))
-    );
-
-    let second = collect(runner.stream(run, StreamConfig::default())).await;
-    assert_eq!(completed(&second).answer, "Recovered final answer.");
-    let requests = model.requests.lock().expect("requests lock");
-    assert_eq!(requests.len(), 2);
-    for request in requests.iter() {
-        assert_eq!(request.tool_choice, Some(typemach_agent::ToolChoice::None));
-        assert!(request.tools.is_empty());
-    }
-}
-
 #[tokio::test]
 async fn final_phase_rejects_refusal_and_tool_calls() {
     let responses = [
@@ -480,6 +440,19 @@ async fn final_phase_rejects_refusal_and_tool_calls() {
             !events
                 .iter()
                 .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
+        );
+        let checkpoint = runner
+            .checkpointer()
+            .load("thread-1")
+            .await
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+        assert!(state.answer.is_empty());
+        assert!(
+            !serde_json::to_string(&state.messages)
+                .expect("serialize messages")
+                .contains("Rejected text must stay private.")
         );
     }
 }
@@ -665,7 +638,10 @@ async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 0,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -735,7 +711,10 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Create a review")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),

@@ -33,7 +33,10 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -41,8 +44,14 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     ))
     .await;
 
-    let deltas = final_deltas(&events);
-    assert_eq!(deltas, vec!["Checking orders. ", "The answer ", "is 42."]);
+    assert_eq!(
+        message_deltas(&events, AssistantMessagePhase::Commentary),
+        ["Checking orders. "]
+    );
+    assert_eq!(
+        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
+        ["The answer ", "is 42."]
+    );
     let completed = completed(&events);
     assert_eq!(completed.answer, "The answer is 42.");
     assert!(!completed.answer.contains("privately"));
@@ -53,35 +62,18 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     let bodies = captured_bodies(&captured);
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0]["tool_choice"], "auto");
-    assert_eq!(bodies[1]["tool_choice"], "auto");
+    assert_eq!(bodies[1]["tool_choice"], "none");
+    assert!(bodies[1].get("tools").is_none());
     assert!(input_has_type(&bodies[1], "function_call"));
     assert!(input_has_type(&bodies[1], "function_call_output"));
-    assert_ordered_input_types(
-        &bodies[1],
-        &[
-            "reasoning",
-            "message",
-            "function_call",
-            "function_call_output",
-        ],
-    );
-    assert_eq!(
-        bodies[1]["input"]
+    assert_ordered_input_types(&bodies[1], &["function_call", "function_call_output"]);
+    assert!(!input_has_type(&bodies[1], "reasoning"));
+    assert!(
+        !bodies[1]["input"]
             .as_array()
             .expect("input array")
             .iter()
-            .find(|item| item["type"] == "message" && item["role"] == "assistant")
-            .expect("public message")["content"],
-        "Checking orders. "
-    );
-    assert_eq!(
-        bodies[1]["input"]
-            .as_array()
-            .expect("input array")
-            .iter()
-            .find(|item| item["type"] == "reasoning")
-            .expect("reasoning item")["content"][0]["text"],
-        "Inspect metric privately."
+            .any(|item| item["type"] == "message" && item["role"] == "assistant")
     );
     let checkpoint = runner
         .checkpointer()
@@ -137,7 +129,10 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -146,8 +141,12 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
     .await;
 
     assert_eq!(
-        final_deltas(&events),
-        vec!["Checking orders. ", "The answer is 42."]
+        message_deltas(&events, AssistantMessagePhase::Commentary),
+        ["Checking orders. "]
+    );
+    assert_eq!(
+        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
+        ["The answer is 42."]
     );
     assert_eq!(completed(&events).answer, "The answer is 42.");
     assert!(events.iter().any(|event| matches!(
@@ -283,7 +282,10 @@ async fn budget_fallback_serializes_tool_choice_none() {
     ))
     .await;
 
-    assert_eq!(final_deltas(&events), vec!["Fallback answer."]);
+    assert_eq!(
+        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
+        ["Fallback answer."]
+    );
     assert_eq!(completed(&events).answer, "Fallback answer.");
     let bodies = captured_bodies(&captured);
     assert!(bodies[0].get("tools").is_none());
@@ -319,7 +321,10 @@ async fn max_tokens_final_delta_returns_partial_once() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Write a long answer")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 0,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -328,10 +333,20 @@ async fn max_tokens_final_delta_returns_partial_once() {
     .await;
 
     let completed = completed(&events);
-    assert_eq!(final_deltas(&events), vec!["Partial answer"]);
+    assert_eq!(
+        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
+        ["Partial answer"]
+    );
     assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
     assert!(completed.answer.is_empty());
-    assert_eq!(assistant_texts(&completed.messages), vec!["Partial answer"]);
+    assert!(assistant_texts(&completed.messages).is_empty());
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDone { .. },
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -451,24 +466,17 @@ fn completed(
         .expect("completed")
 }
 
-fn final_deltas(
+fn message_deltas(
     events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
+    expected_phase: AssistantMessagePhase,
 ) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantMessageDelta { delta, .. },
+                signal: AgentSignal::AssistantMessageDelta { phase, delta, .. },
                 ..
-            } => Some(delta.clone()),
-            RunStreamEvent::Signal {
-                signal:
-                    AgentSignal::AssistantMessageDone {
-                        phase: AssistantMessagePhase::Commentary,
-                        ..
-                    },
-                ..
-            } => None,
+            } if *phase == expected_phase => Some(delta.clone()),
             _ => None,
         })
         .collect()

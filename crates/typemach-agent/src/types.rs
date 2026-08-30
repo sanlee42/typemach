@@ -484,6 +484,7 @@ pub enum AssistantMessagePhase {
 pub enum AgentSignal {
     AssistantMessageDelta {
         message_id: AssistantMessageId,
+        phase: AssistantMessagePhase,
         delta: String,
         index: usize,
     },
@@ -582,7 +583,7 @@ pub enum FinishReason {
     Terminal,
     MaxModelTurns,
     MaxToolCalls,
-    /// The model hit its output token limit; partial text remains in messages.
+    /// The model hit its output token limit; partial text is not committed.
     MaxTokens,
 }
 
@@ -666,8 +667,29 @@ pub enum AgentError {
 }
 
 #[cfg(test)]
-mod checkpoint_compatibility {
+mod type_contracts {
     use super::*;
+
+    #[test]
+    fn assistant_delta_serializes_its_phase() {
+        let signal = AgentSignal::AssistantMessageDelta {
+            message_id: AssistantMessageId::new("run-1:turn-1"),
+            phase: AssistantMessagePhase::Commentary,
+            delta: "Checking data.".to_string(),
+            index: 0,
+        };
+
+        assert_eq!(
+            serde_json::to_value(signal).expect("serialize signal"),
+            json!({
+                "type": "assistant_message_delta",
+                "message_id": "run-1:turn-1",
+                "phase": "commentary",
+                "delta": "Checking data.",
+                "index": 0
+            })
+        );
+    }
 
     #[test]
     fn old_state_defaults_pending_specs_and_step_remains_planning() {
