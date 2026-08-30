@@ -58,6 +58,19 @@ impl AgentModel for ScriptedModel {
     }
 }
 
+fn respond() -> ModelResponse {
+    ModelResponse {
+        tool_uses: vec![ToolUse {
+            id: "respond-1".to_string(),
+            name: "respond".to_string(),
+            input: json!({}),
+            raw: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        ..ModelResponse::default()
+    }
+}
+
 #[derive(Default)]
 struct FakeTools;
 
@@ -174,16 +187,22 @@ async fn collect(
 async fn model_tool_result_model_loop_completes() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "tool-1".to_string(),
-                name: "metric_point".to_string(),
-                input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
-                raw: None,
-            }],
+            content: vec![
+                ContentBlock::Text {
+                    text: "INTERNAL_PLANNING_PROSE".to_string(),
+                },
+                ContentBlock::ToolUse(ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
+                    raw: None,
+                }),
+            ],
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
-            deltas: vec!["订单量是 42。".to_string()],
+            deltas: vec!["The order count is 42.".to_string()],
             final_text: Some(String::new()),
             ..ModelResponse::default()
         },
@@ -196,7 +215,7 @@ async fn model_tool_result_model_loop_completes() {
     );
     let rx = runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("昨天订单量")],
+            messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -211,6 +230,12 @@ async fn model_tool_result_model_loop_completes() {
         signal: AgentSignal::ToolStarted { name, .. },
       } if name == "metric_point"
     )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantDelta { .. },
+        }
+    )));
     assert!(events.iter().any(|event| matches!(
       event,
       RunStreamEvent::Signal {
@@ -218,20 +243,160 @@ async fn model_tool_result_model_loop_completes() {
       } if name == "metric_point" && content["value"] == 42
     )));
     let completed = completed(&events);
-    assert_eq!(completed.answer, "订单量是 42。");
+    assert_eq!(completed.answer, "The order count is 42.");
     assert_eq!(completed.finish_reason, FinishReason::Stop);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::StepStarted {
+            step: AgentStep::FinalAnswer,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::FinalAnswerDelta { delta, index },
+        } if delta == "The order count is 42." && *index == 0
+    )));
+    let requests = model.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].tool_choice,
+        Some(typemach_agent::ToolChoice::Required)
+    );
+    assert!(requests[0].tools.iter().any(|tool| tool.name == "respond"));
+    assert_eq!(
+        requests[1].tool_choice,
+        Some(typemach_agent::ToolChoice::Required)
+    );
+    assert!(requests[1].tools.iter().any(|tool| tool.name == "respond"));
+    assert_eq!(
+        requests[2].tool_choice,
+        Some(typemach_agent::ToolChoice::None)
+    );
+    assert!(requests[2].tools.is_empty());
+    assert!(
+        !serde_json::to_string(&requests[2].messages)
+            .expect("serialize final messages")
+            .contains("INTERNAL_PLANNING_PROSE")
+    );
 }
 
 #[tokio::test]
-async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
+async fn respond_on_last_planning_turn_still_gets_one_final_call() {
+    let model = ScriptedModel::new([
+        respond(),
+        ModelResponse {
+            deltas: vec!["Final ".to_string(), "answer".to_string()],
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        FakeTools,
+        AllowAllTools,
+    );
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Answer directly")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 1,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(completed(&events).answer, "Final answer");
+    assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn bare_planning_prose_is_a_protocol_failure_not_an_answer() {
     let model = ScriptedModel::new([ModelResponse {
-        final_text: Some("订单量是 42。".to_string()),
+        deltas: vec!["INTERNAL_DRAFT".to_string()],
         ..ModelResponse::default()
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("昨天订单量")],
+            messages: vec![AgentMessage::user_text("Answer directly")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Failed { error }
+            if error.to_string().contains("planning step did not call a tool")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantDelta { .. } | AgentSignal::FinalAnswerDelta { .. },
+        }
+    )));
+}
+
+#[tokio::test]
+async fn respond_mixed_with_business_call_dispatches_nothing() {
+    let mut mixed = respond();
+    mixed.tool_uses.push(ToolUse {
+        id: "metric-1".to_string(),
+        name: "metric_point".to_string(),
+        input: json!({ "metric_id": "paid_order_count" }),
+        raw: None,
+    });
+    let model = ScriptedModel::new([mixed]);
+    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Read the metric")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Failed { error }
+            if error.to_string().contains("respond must be the sole tool call")
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::ToolStarted { .. },
+        }
+    )));
+}
+
+#[tokio::test]
+async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
+    let model = ScriptedModel::new([
+        respond(),
+        ModelResponse {
+            final_text: Some("The order count is 42.".to_string()),
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -243,16 +408,16 @@ async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
     assert!(events.iter().any(|event| matches!(
       event,
       RunStreamEvent::Signal {
-        signal: AgentSignal::AssistantDelta { delta, .. },
-      } if delta == "订单量是 42。"
+        signal: AgentSignal::FinalAnswerDelta { delta, .. },
+      } if delta == "The order count is 42."
     )));
     let completed = completed(&events);
-    assert_eq!(completed.answer, "订单量是 42。");
+    assert_eq!(completed.answer, "The order count is 42.");
     assert!(matches!(
         completed.messages.last(),
         Some(AgentMessage::Assistant { content })
             if content == &vec![ContentBlock::Text {
-                text: "订单量是 42。".to_string()
+                text: "The order count is 42.".to_string()
             }]
     ));
 }
@@ -264,13 +429,14 @@ async fn ask_user_interrupts_and_resume_continues() {
             tool_uses: vec![ToolUse {
                 id: "ask-1".to_string(),
                 name: "ask_user".to_string(),
-                input: json!({ "question": "看哪个日期？", "fields": { "type": "choice" } }),
+                input: json!({ "question": "Which date?", "fields": { "type": "choice" } }),
                 raw: None,
             }],
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
-            deltas: vec!["按 2026-06-08 查看，订单量是 42。".to_string()],
+            deltas: vec!["On 2026-06-08, the order count is 42.".to_string()],
             final_text: Some(String::new()),
             ..ModelResponse::default()
         },
@@ -283,7 +449,7 @@ async fn ask_user_interrupts_and_resume_continues() {
     );
     let mut first = runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("订单量")],
+            messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -298,7 +464,7 @@ async fn ask_user_interrupts_and_resume_continues() {
             _ => {}
         }
     };
-    assert_eq!(interrupted.question, "看哪个日期？");
+    assert_eq!(interrupted.question, "Which date?");
 
     let resume = RunRequest {
         command: RunCommand::Resume,
@@ -322,7 +488,7 @@ async fn ask_user_interrupts_and_resume_continues() {
     };
     let events = collect(runner.stream(resume, StreamConfig::default())).await;
     let completed = completed(&events);
-    assert_eq!(completed.answer, "按 2026-06-08 查看，订单量是 42。");
+    assert_eq!(completed.answer, "On 2026-06-08, the order count is 42.");
     let requests = model.requests();
     let second = requests.get(1).expect("second model request");
     assert!(second.messages.iter().any(|message| matches!(
@@ -339,18 +505,25 @@ async fn ask_user_interrupts_and_resume_continues() {
 
 #[tokio::test]
 async fn emit_artifact_is_signalled_and_not_required_in_answer() {
-    let model = ScriptedModel::new([ModelResponse {
-        tool_uses: vec![ToolUse {
-            id: "artifact-1".to_string(),
-            name: "emit_artifact".to_string(),
-            input: json!({
-              "title": "Review",
-              "content": "Review body"
-            }),
-            raw: None,
-        }],
-        ..ModelResponse::default()
-    }]);
+    let model = ScriptedModel::new([
+        ModelResponse {
+            tool_uses: vec![ToolUse {
+                id: "artifact-1".to_string(),
+                name: "emit_artifact".to_string(),
+                input: json!({
+                  "title": "Review",
+                  "content": "Review body"
+                }),
+                raw: None,
+            }],
+            ..ModelResponse::default()
+        },
+        respond(),
+        ModelResponse {
+            final_text: Some("The review is ready.".to_string()),
+            ..ModelResponse::default()
+        },
+    ]);
     let runner = build_agent_runner(
         MemorySaver::default(),
         model.clone(),
@@ -377,8 +550,9 @@ async fn emit_artifact_is_signalled_and_not_required_in_answer() {
     let completed = completed(&events);
     assert_eq!(
         (&completed.finish_reason, model.requests().len()),
-        (&FinishReason::Terminal, 1)
+        (&FinishReason::Stop, 3)
     );
+    assert_eq!(completed.answer, "The review is ready.");
 }
 
 #[tokio::test]
@@ -402,9 +576,10 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             raw: Some(json!({ "id": "msg-1" })),
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
             content: vec![ContentBlock::Text {
-                text: "订单量是 42。".to_string(),
+                text: "The order count is 42.".to_string(),
             }],
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
@@ -418,7 +593,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     );
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("昨天订单量")],
+            messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -428,18 +603,12 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     ))
     .await;
     let completed = completed(&events);
-    assert_eq!(completed.answer, "订单量是 42。");
-    assert!(matches!(
-        completed.messages.get(1),
-        Some(AgentMessage::Assistant { content })
-            if matches!(
-                content.first(),
-                Some(ContentBlock::Thinking {
-                    signature: Some(sig),
-                    ..
-                }) if sig == "sig-1"
-            )
-    ));
+    assert_eq!(completed.answer, "The order count is 42.");
+    assert!(!completed.messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::Assistant { content }
+            if content.iter().any(|block| matches!(block, ContentBlock::Thinking { .. }))
+    )));
 }
 
 #[tokio::test]
@@ -448,7 +617,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         tool_uses: vec![ToolUse {
             id: "term-1".to_string(),
             name: "report".to_string(),
-            input: json!({ "message": "当前没有足够证据继续。" }),
+            input: json!({ "message": "There is not enough evidence to continue." }),
             raw: None,
         }],
         stop_reason: Some(StopReason::ToolUse),
@@ -457,7 +626,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("生成报告")],
+            messages: vec![AgentMessage::user_text("Create a report")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -474,7 +643,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
     )));
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::Terminal);
-    assert_eq!(completed.answer, "当前没有足够证据继续。");
+    assert_eq!(completed.answer, "");
     assert!(matches!(
         completed.terminal.as_ref(),
         Some(TerminalAction { name, .. }) if name == "report"
@@ -483,10 +652,13 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
 
 #[tokio::test]
 async fn compacted_prompt_window_does_not_drop_persisted_messages() {
-    let model = ScriptedModel::new([ModelResponse {
-        final_text: Some("继续。".to_string()),
-        ..ModelResponse::default()
-    }]);
+    let model = ScriptedModel::new([
+        respond(),
+        ModelResponse {
+            final_text: Some("Continue.".to_string()),
+            ..ModelResponse::default()
+        },
+    ]);
     let context_policy = ContextPolicy {
         compact_at_tokens: 1,
         max_input_tokens: 128,
@@ -549,8 +721,9 @@ async fn large_tool_result_is_archived_before_next_prompt() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
-            final_text: Some("已读取。".to_string()),
+            final_text: Some("Evidence loaded.".to_string()),
             ..ModelResponse::default()
         },
     ]);
@@ -567,7 +740,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
     );
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("读取大证据")],
+            messages: vec![AgentMessage::user_text("Load the large evidence")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -634,13 +807,14 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             tool_uses: vec![ToolUse {
                 id: "ask-1".to_string(),
                 name: "ask_user".to_string(),
-                input: json!({ "question": "看哪个日期？" }),
+                input: json!({ "question": "Which date?" }),
                 raw: None,
             }],
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
-            deltas: vec!["库存还有 7 件。".to_string()],
+            deltas: vec!["There are 7 units in stock.".to_string()],
             final_text: Some(String::new()),
             ..ModelResponse::default()
         },
@@ -653,7 +827,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
     );
     let mut first = runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("订单量")],
+            messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -673,7 +847,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
     // same thread: a plain Start, not a Resume.
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("先看库存")],
+            messages: vec![AgentMessage::user_text("Check inventory first")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -683,7 +857,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
     ))
     .await;
     let completed = completed(&events);
-    assert_eq!(completed.answer, "库存还有 7 件。");
+    assert_eq!(completed.answer, "There are 7 units in stock.");
 
     let requests = model.requests();
     let second = requests.get(1).expect("second model request");
@@ -713,7 +887,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
                 AgentMessage::User { content }
                     if content.iter().any(|block| matches!(
                         block,
-                        ContentBlock::Text { text } if text == "先看库存"
+                        ContentBlock::Text { text } if text == "Check inventory first"
                     ))
             )
         })
@@ -728,13 +902,14 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             tool_uses: vec![ToolUse {
                 id: "ask-1".to_string(),
                 name: "ask_user".to_string(),
-                input: json!({ "question": "看哪个日期？" }),
+                input: json!({ "question": "Which date?" }),
                 raw: None,
             }],
             ..ModelResponse::default()
         },
+        respond(),
         ModelResponse {
-            final_text: Some("好的。".to_string()),
+            final_text: Some("Done.".to_string()),
             ..ModelResponse::default()
         },
     ]);
@@ -746,11 +921,11 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
     );
     let mut first = runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("订单量")],
+            messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
-            system_suffix: Some("当前店铺:A".to_string()),
+            system_suffix: Some("Current shop: A".to_string()),
         }),
         StreamConfig::default(),
     );
@@ -771,7 +946,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
             }),
-            system_suffix: Some("当前店铺:B".to_string()),
+            system_suffix: Some("Current shop: B".to_string()),
         },
         ..request(AgentRunInput {
             messages: Vec::new(),
@@ -786,12 +961,12 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
     let requests = model.requests();
     assert_eq!(
         requests[0].system_suffix.as_deref(),
-        Some("当前店铺:A"),
+        Some("Current shop: A"),
         "start carries the per-run suffix"
     );
     assert_eq!(
         requests[1].system_suffix.as_deref(),
-        Some("当前店铺:B"),
+        Some("Current shop: B"),
         "resume refreshes the suffix"
     );
 }
@@ -800,7 +975,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
 async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
     let model = ScriptedModel::new([ModelResponse {
         content: vec![ContentBlock::Text {
-            text: "部分回答".to_string(),
+            text: "Partial draft".to_string(),
         }],
         tool_uses: vec![ToolUse {
             id: "tool-1".to_string(),
@@ -814,7 +989,7 @@ async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("写个超长报告")],
+            messages: vec![AgentMessage::user_text("Write a long report")],
             context: Value::Null,
             budget: AgentBudget::default(),
             human_input: None,
@@ -834,12 +1009,12 @@ async fn max_tokens_stop_reason_completes_without_dispatching_tools() {
     );
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert_eq!(completed.answer, "部分回答");
-    assert!(matches!(
-        completed.messages.last(),
-        Some(AgentMessage::Assistant { content })
-            if !content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_)))
-    ));
+    assert_eq!(completed.answer, "");
+    assert!(!completed.messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::Assistant { content }
+            if content.iter().any(|block| matches!(block, ContentBlock::Text { .. }))
+    )));
 }
 
 #[test]

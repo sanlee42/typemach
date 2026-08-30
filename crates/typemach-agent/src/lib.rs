@@ -14,6 +14,8 @@ pub use context::estimate_messages;
 mod deepseek;
 mod deepseek_stream;
 pub use deepseek::ConfiguredModel;
+mod model_turn;
+mod phase;
 
 mod sandbox;
 pub use sandbox::{
@@ -52,6 +54,7 @@ impl AgentState {
             model_turns: 0,
             tool_calls: 0,
             next_delta_index: 0,
+            next_final_delta_index: 0,
             pending_tools: VecDeque::new(),
             pending_human: None,
             human_input: input.human_input.clone(),
@@ -302,8 +305,9 @@ where
     ) -> Result<Transition<Self::Step, Self::Interrupt, Self::Output>, MachineError> {
         match step {
             AgentStep::PrepareTurn => Ok(Transition::Next(AgentStep::ModelStep)),
-            AgentStep::ModelStep => self.model_step(state, ctx).await,
+            AgentStep::ModelStep => self.planning_step(state, ctx).await,
             AgentStep::DispatchTools => self.dispatch_tools(state, ctx).await,
+            AgentStep::FinalAnswer => self.final_answer_step(state, ctx).await,
         }
     }
 }
@@ -314,7 +318,7 @@ where
     T: ToolRegistry + 'static,
     P: ToolPermissionPolicy + 'static,
 {
-    async fn model_step(
+    async fn planning_step(
         &self,
         state: &mut AgentState,
         ctx: &AgentRunContext,
@@ -324,106 +328,120 @@ where
                 state.output(FinishReason::MaxModelTurns),
             ));
         }
-        state.model_turns += 1;
-        let tools = self
+        let mut tools = self
             .tools
             .list_tools(&state.context)
             .await
             .map_err(AgentError::machine)?;
-        let prompt_window = context::prompt_window(&state.messages, &state.context_policy)
-            .map_err(AgentError::machine)?;
-        if let Some(digest) = prompt_window.digest.clone()
-            && state.digest.as_ref() != Some(&digest)
-        {
-            state.digest = Some(digest.clone());
-            ctx.emit(AgentSignal::DigestUpdated { digest }).await?;
-        }
-        if let Some(compaction) = prompt_window.compaction.clone() {
-            ctx.emit(AgentSignal::ContextCompacted { compaction })
-                .await?;
-        }
-        let request = ModelRequest {
-            messages: prompt_window.messages,
+        phase::add_respond(&mut tools).map_err(AgentError::machine)?;
+        let messages = state.messages.clone();
+        let suffix = state.system_suffix.clone();
+        state.model_turns += 1;
+        let planning_turn = state.model_turns;
+        let request = model_turn::prepare(
+            state,
+            ctx,
+            messages,
             tools,
-            context: state.context.clone(),
-            turn: state.model_turns,
-            system_suffix: state.system_suffix.clone(),
-        };
-        let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
-        let response = self.model.next_step(request, ModelStream::new(delta_tx));
-        tokio::pin!(response);
-
-        let mut assistant_content = Vec::new();
-        let response = loop {
-            tokio::select! {
-                maybe_delta = delta_rx.recv() => {
-                    if let Some(delta) = maybe_delta {
-                        append_delta(state, ctx, &mut assistant_content, delta).await?;
-                    }
-                }
-                response = &mut response => {
-                    break response.map_err(AgentError::machine)?;
-                }
-            }
-        };
-        while let Ok(delta) = delta_rx.try_recv() {
-            append_delta(state, ctx, &mut assistant_content, delta).await?;
-        }
-        for delta in response.deltas {
-            append_delta(state, ctx, &mut assistant_content, delta).await?;
-        }
-        if let Some(usage) = response.usage {
-            state.usage.input_tokens += usage.input_tokens;
-            state.usage.output_tokens += usage.output_tokens;
-            ctx.emit(AgentSignal::Usage { usage }).await?;
-        }
-        for block in response.content {
-            record_assistant_block(state, ctx, &mut assistant_content, block).await?;
-        }
-        for tool_use in response.tool_uses {
-            assistant_content.push(ContentBlock::ToolUse(tool_use.clone()));
-            state.pending_tools.push_back(tool_use);
-        }
-        if response.stop_reason == Some(StopReason::MaxTokens) {
-            // A length-truncated response may carry half-written tool
-            // arguments; dispatching them would act on garbage. Drop them
-            // and surface the truncation to the caller instead.
-            assistant_content.retain(|block| !matches!(block, ContentBlock::ToolUse(_)));
+            suffix,
+            Some(ToolChoice::Required),
+            planning_turn,
+        )
+        .await?;
+        let turn = model_turn::invoke(
+            self.model.as_ref(),
+            state,
+            ctx,
+            request,
+            model_turn::TextKind::Planning,
+        )
+        .await?;
+        if turn.stop_reason == Some(StopReason::MaxTokens) {
             state.pending_tools.clear();
-            if !assistant_content.is_empty() {
-                state.messages.push(AgentMessage::Assistant {
-                    content: assistant_content,
-                });
-            }
             return Ok(Transition::Complete(state.output(FinishReason::MaxTokens)));
         }
-        if let Some(final_text) = response.final_text {
-            if !final_text.is_empty() && !assistant_content.iter().any(is_text_block) {
-                state.answer.push_str(&final_text);
-                ctx.emit(AgentSignal::AssistantDelta {
-                    delta: final_text.clone(),
-                    index: state.next_delta_index,
-                })
-                .await?;
-                state.next_delta_index += 1;
-                assistant_content.push(ContentBlock::Text { text: final_text });
-            }
-            if !assistant_content.is_empty() {
-                state.messages.push(AgentMessage::Assistant {
-                    content: assistant_content,
-                });
-            }
-            return Ok(Transition::Complete(state.output(FinishReason::Stop)));
+        let tool_uses = turn
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse(tool) => Some(tool.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if phase::requests_final_answer(&tool_uses).map_err(AgentError::machine)? {
+            state.answer.clear();
+            state.next_final_delta_index = 0;
+            state.pending_tools.clear();
+            return Ok(Transition::Next(AgentStep::FinalAnswer));
         }
-        if !assistant_content.is_empty() {
+        if tool_uses.is_empty() {
+            return Err(AgentError::Model(
+                "planning step did not call a tool; call respond to produce the final answer"
+                    .to_string(),
+            )
+            .machine());
+        }
+        state.pending_tools.extend(tool_uses);
+        if !turn.content.is_empty() {
             state.messages.push(AgentMessage::Assistant {
-                content: assistant_content,
+                content: turn.content,
             });
         }
-        if state.pending_tools.is_empty() {
-            return Ok(Transition::Complete(state.output(FinishReason::Stop)));
-        }
         Ok(Transition::Next(AgentStep::DispatchTools))
+    }
+
+    async fn final_answer_step(
+        &self,
+        state: &mut AgentState,
+        ctx: &AgentRunContext,
+    ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
+        let messages = phase::final_messages(&state.messages);
+        let suffix = phase::final_system_suffix(state.system_suffix.as_deref());
+        let final_turn = state.model_turns.saturating_add(1);
+        let request = model_turn::prepare(
+            state,
+            ctx,
+            messages.clone(),
+            Vec::new(),
+            Some(suffix),
+            Some(ToolChoice::None),
+            final_turn,
+        )
+        .await?;
+        let turn = model_turn::invoke(
+            self.model.as_ref(),
+            state,
+            ctx,
+            request,
+            model_turn::TextKind::FinalAnswer,
+        )
+        .await?;
+        if turn
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse(_)))
+        {
+            return Err(AgentError::Model(
+                "final answer step returned a tool call even though tools were disabled"
+                    .to_string(),
+            )
+            .machine());
+        }
+        state.messages = messages;
+        let content = turn
+            .content
+            .into_iter()
+            .filter(|block| matches!(block, ContentBlock::Text { .. }))
+            .collect::<Vec<_>>();
+        if !content.is_empty() {
+            state.messages.push(AgentMessage::Assistant { content });
+        }
+        let reason = if turn.stop_reason == Some(StopReason::MaxTokens) {
+            FinishReason::MaxTokens
+        } else {
+            FinishReason::Stop
+        };
+        Ok(Transition::Complete(state.output(reason)))
     }
 
     async fn dispatch_tools(
@@ -452,16 +470,9 @@ where
                 state.pending_human = Some(tool_use);
                 return Ok(Transition::Interrupt(question));
             }
-            let terminal = is_terminal_tool(&tool_use, spec);
-            // Registry terminal tools are actions themselves. The built-in
-            // artifact must first be materialized and emitted by this runner.
-            if terminal && tool_use.name != "emit_artifact" {
+            let terminal = is_terminal_tool(&tool_use, spec) && tool_use.name != "emit_artifact";
+            if terminal {
                 let action = terminal_action(&tool_use);
-                if state.answer.is_empty()
-                    && let Some(message) = terminal_message(&tool_use)
-                {
-                    append_delta(state, ctx, &mut Vec::new(), message).await?;
-                }
                 ctx.emit(AgentSignal::Terminal {
                     action: action.clone(),
                 })
@@ -514,15 +525,6 @@ where
             state
                 .messages
                 .push(AgentMessage::tool_result(prompt_result));
-            if terminal {
-                let action = terminal_action(&tool_use);
-                ctx.emit(AgentSignal::Terminal {
-                    action: action.clone(),
-                })
-                .await?;
-                state.terminal = Some(action);
-                return Ok(Transition::Complete(state.output(FinishReason::Terminal)));
-            }
         }
         Ok(Transition::Next(AgentStep::ModelStep))
     }
@@ -617,46 +619,6 @@ fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
     }
 }
 
-async fn append_delta(
-    state: &mut AgentState,
-    ctx: &AgentRunContext,
-    assistant_content: &mut Vec<ContentBlock>,
-    delta: String,
-) -> Result<(), MachineError> {
-    if delta.is_empty() {
-        return Ok(());
-    }
-    state.answer.push_str(&delta);
-    ctx.emit(AgentSignal::AssistantDelta {
-        delta: delta.clone(),
-        index: state.next_delta_index,
-    })
-    .await?;
-    state.next_delta_index += 1;
-    assistant_content.push(ContentBlock::Text { text: delta });
-    Ok(())
-}
-
-async fn record_assistant_block(
-    state: &mut AgentState,
-    ctx: &AgentRunContext,
-    assistant_content: &mut Vec<ContentBlock>,
-    block: ContentBlock,
-) -> Result<(), MachineError> {
-    match block {
-        ContentBlock::Text { text } => append_delta(state, ctx, assistant_content, text).await,
-        ContentBlock::ToolUse(tool_use) => {
-            assistant_content.push(ContentBlock::ToolUse(tool_use.clone()));
-            state.pending_tools.push_back(tool_use);
-            Ok(())
-        }
-        other => {
-            assistant_content.push(other);
-            Ok(())
-        }
-    }
-}
-
 fn ask_user_question(tool_use: &ToolUse) -> Result<AskUserQuestion, MachineError> {
     let question = tool_use
         .input
@@ -691,15 +653,6 @@ fn terminal_action(tool_use: &ToolUse) -> TerminalAction {
     }
 }
 
-fn terminal_message(tool_use: &ToolUse) -> Option<String> {
-    ["message", "reason", "answer"]
-        .iter()
-        .find_map(|key| tool_use.input.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
 fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, MachineError> {
     let title = required_string(&tool_use.input, "title")?;
     let content = required_string(&tool_use.input, "content")?;
@@ -719,10 +672,6 @@ fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, MachineError> {
         window: optional_string(&tool_use.input, "window"),
         updated_at: optional_string(&tool_use.input, "updated_at"),
     })
-}
-
-fn is_text_block(block: &ContentBlock) -> bool {
-    matches!(block, ContentBlock::Text { .. })
 }
 
 fn optional_string(input: &Value, name: &str) -> Option<String> {
