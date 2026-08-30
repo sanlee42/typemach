@@ -161,6 +161,8 @@ pub struct ModelRequest {
 pub struct ModelResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ModelOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -14,7 +14,10 @@ pub(super) struct Turn {
 
 pub(super) enum TurnOutcome {
     FinalAnswer(Vec<ContentBlock>),
-    ToolCalls(Vec<ToolUse>),
+    ToolCalls {
+        content: Vec<ContentBlock>,
+        calls: Vec<ToolUse>,
+    },
 }
 
 pub(super) async fn prepare(
@@ -76,19 +79,53 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
         state.usage.output_tokens += usage.output_tokens;
         ctx.emit(AgentSignal::Usage { usage }).await?;
     }
+    let reasoning = reasoning_blocks(response.reasoning);
     let outcome = match response.outcome {
         Some(ModelOutcome::FinalAnswer { text }) => {
-            append_text(state, ctx, &mut content, text).await?;
-            Some(TurnOutcome::FinalAnswer(content))
+            let mut final_content = reasoning;
+            final_content.extend(content);
+            if completed_text_allowed(response.stop_reason.as_ref()) {
+                append_text(state, ctx, &mut final_content, text).await?;
+            }
+            Some(TurnOutcome::FinalAnswer(final_content))
         }
-        Some(ModelOutcome::ToolCalls { calls }) => Some(TurnOutcome::ToolCalls(calls)),
+        Some(ModelOutcome::ToolCalls { calls }) => {
+            let mut call_content = reasoning;
+            call_content.extend(calls.iter().cloned().map(ContentBlock::ToolUse));
+            Some(TurnOutcome::ToolCalls {
+                content: call_content,
+                calls,
+            })
+        }
         None if content.is_empty() => None,
-        None => Some(TurnOutcome::FinalAnswer(content)),
+        None => {
+            let mut final_content = reasoning;
+            final_content.extend(content);
+            Some(TurnOutcome::FinalAnswer(final_content))
+        }
     };
     Ok(Turn {
         outcome,
         stop_reason: response.stop_reason,
     })
+}
+
+fn reasoning_blocks(reasoning: Vec<String>) -> Vec<ContentBlock> {
+    reasoning
+        .into_iter()
+        .filter(|text| !text.is_empty())
+        .map(|text| ContentBlock::Thinking {
+            text,
+            signature: None,
+        })
+        .collect()
+}
+
+fn completed_text_allowed(reason: Option<&StopReason>) -> bool {
+    matches!(
+        reason,
+        Some(StopReason::EndTurn | StopReason::StopSequence | StopReason::MaxTokens) | None
+    )
 }
 
 async fn append_delta(

@@ -239,6 +239,9 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
 #[tokio::test]
 async fn final_refusal_fails_without_a_completed_output() {
     let model = ScriptedModel::new([ModelResponse {
+        outcome: Some(ModelOutcome::FinalAnswer {
+            text: "Rejected text must stay private.".to_string(),
+        }),
         stop_reason: Some(StopReason::Refusal),
         ..ModelResponse::default()
     }]);
