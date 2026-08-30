@@ -9,10 +9,10 @@ use typemach::{
 };
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentModel, AgentRunInput,
-    AgentRunOutput, AgentSignal, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion,
-    ContentBlock, ContextPolicy, FinishReason, HumanInputAnswer, ModelRequest, ModelResponse,
-    ModelStream, StopReason, TerminalAction, ToolAnnotations, ToolCallRequest, ToolRegistry,
-    ToolResult, ToolUse, build_agent_runner, build_agent_runner_with_context_policy,
+    AgentRunOutput, AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools,
+    AskUserQuestion, ContentBlock, ContextPolicy, FinishReason, HumanInputAnswer, ModelRequest,
+    ModelResponse, ModelStream, StopReason, TerminalAction, ToolAnnotations, ToolCallRequest,
+    ToolRegistry, ToolResult, ToolUse, build_agent_runner, build_agent_runner_with_context_policy,
 };
 
 #[path = "agent/builtin_validation.rs"]
@@ -63,15 +63,9 @@ impl AgentModel for ScriptedModel {
     }
 }
 
-fn respond() -> ModelResponse {
+fn planning_done() -> ModelResponse {
     ModelResponse {
-        tool_uses: vec![ToolUse {
-            id: "respond-1".to_string(),
-            name: "respond".to_string(),
-            input: json!({}),
-            raw: None,
-        }],
-        stop_reason: Some(StopReason::ToolUse),
+        stop_reason: Some(StopReason::EndTurn),
         ..ModelResponse::default()
     }
 }
@@ -189,7 +183,7 @@ async fn collect(
 }
 
 #[tokio::test]
-async fn ask_user_interrupts_and_resume_continues() {
+async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
     let model = ScriptedModel::new([
         ModelResponse {
             tool_uses: vec![ToolUse {
@@ -200,7 +194,6 @@ async fn ask_user_interrupts_and_resume_continues() {
             }],
             ..ModelResponse::default()
         },
-        respond(),
         ModelResponse {
             deltas: vec!["On 2026-06-08, the order count is 42.".to_string()],
             final_text: Some(String::new()),
@@ -217,7 +210,10 @@ async fn ask_user_interrupts_and_resume_continues() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 1,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -237,7 +233,10 @@ async fn ask_user_interrupts_and_resume_continues() {
         input: AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 1,
+            },
             human_input: Some(HumanInputAnswer {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
@@ -247,7 +246,10 @@ async fn ask_user_interrupts_and_resume_continues() {
         ..request(AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 1,
+            },
             human_input: None,
             system_suffix: None,
         })
@@ -255,6 +257,29 @@ async fn ask_user_interrupts_and_resume_continues() {
     let events = collect(runner.stream(resume, StreamConfig::default())).await;
     let completed = completed(&events);
     assert_eq!(completed.answer, "On 2026-06-08, the order count is 42.");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                RunStreamEvent::Signal {
+                    signal: AgentSignal::ToolStarted { tool_use_id, .. },
+                } if tool_use_id == "ask-1"
+            ))
+            .count(),
+        1
+    );
+    let snapshot = events
+        .iter()
+        .find_map(|event| match event {
+            RunStreamEvent::Completed { snapshot, .. } => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("completed snapshot");
+    let state: AgentState = serde_json::from_value(snapshot).expect("agent state");
+    assert!(state.pending_tools.is_empty());
+    assert!(state.pending_human.is_none());
+    assert!(state.human_input.is_none());
     let requests = model.requests();
     let second = requests.get(1).expect("second model request");
     assert!(second.messages.iter().any(|message| matches!(
@@ -290,7 +315,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             raw: Some(json!({ "id": "msg-1" })),
             ..ModelResponse::default()
         },
-        respond(),
+        planning_done(),
         ModelResponse {
             content: vec![ContentBlock::Text {
                 text: "The order count is 42.".to_string(),
@@ -367,7 +392,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
 #[tokio::test]
 async fn compacted_prompt_window_does_not_drop_persisted_messages() {
     let model = ScriptedModel::new([
-        respond(),
+        planning_done(),
         ModelResponse {
             final_text: Some("Continue.".to_string()),
             ..ModelResponse::default()
@@ -435,7 +460,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
-        respond(),
+        planning_done(),
         ModelResponse {
             final_text: Some("Evidence loaded.".to_string()),
             ..ModelResponse::default()
@@ -526,7 +551,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             }],
             ..ModelResponse::default()
         },
-        respond(),
+        planning_done(),
         ModelResponse {
             deltas: vec!["There are 7 units in stock.".to_string()],
             final_text: Some(String::new()),
@@ -621,7 +646,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             }],
             ..ModelResponse::default()
         },
-        respond(),
+        planning_done(),
         ModelResponse {
             final_text: Some("Done.".to_string()),
             ..ModelResponse::default()

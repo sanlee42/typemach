@@ -493,8 +493,8 @@ pub enum AgentSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBudget {
-    /// Maximum planning model calls. A validated `respond` permits one
-    /// additional tool-free final-answer call.
+    /// Maximum planning model calls. The tool-free final-answer call is
+    /// always permitted after planning completes or reaches this limit.
     pub max_model_turns: u32,
     pub max_tool_calls: u32,
 }

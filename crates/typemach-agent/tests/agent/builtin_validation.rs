@@ -61,7 +61,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
-        ModelResponse { ..respond() },
+        ModelResponse { ..planning_done() },
         ModelResponse {
             final_text: Some("Order count is 42.".to_string()),
             stop_reason: Some(StopReason::EndTurn),
@@ -177,7 +177,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
-        ModelResponse { ..respond() },
+        ModelResponse { ..planning_done() },
         ModelResponse {
             final_text: Some("Review created.".to_string()),
             stop_reason: Some(StopReason::EndTurn),
