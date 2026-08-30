@@ -61,6 +61,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
+        ModelResponse { ..respond() },
         ModelResponse {
             final_text: Some("Order count is 42.".to_string()),
             stop_reason: Some(StopReason::EndTurn),
@@ -115,8 +116,9 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
     let second = collect(runner.stream(resume, StreamConfig::default())).await;
     let output = completed(&second);
     assert_eq!(output.answer, "Order count is 42.");
-    assert_eq!(paired_results(&output.messages, "ask-bad"), (1, 1));
-    assert_eq!(model.requests().len(), 3);
+    let requests = model.requests();
+    assert_eq!(paired_results(&requests[1].messages, "ask-bad"), (1, 1));
+    assert_eq!(requests.len(), 4);
 }
 
 #[tokio::test]
@@ -175,6 +177,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
+        ModelResponse { ..respond() },
         ModelResponse {
             final_text: Some("Review created.".to_string()),
             stop_reason: Some(StopReason::EndTurn),
@@ -214,14 +217,15 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     )));
     let output = completed(&events);
     assert_eq!(output.answer, "Review created.");
+    let requests = model.requests();
     for tool_use_id in [
         "artifact-missing-type",
         "artifact-invalid-type",
         "artifact-invalid-source",
     ] {
-        assert_eq!(paired_results(&output.messages, tool_use_id), (1, 1));
+        assert_eq!(paired_results(&requests[4].messages, tool_use_id), (1, 1));
     }
-    assert_eq!(model.requests().len(), 5);
+    assert_eq!(requests.len(), 6);
 }
 
 fn assert_error_lifecycle(events: &[Event], tool_use_id: &str) {

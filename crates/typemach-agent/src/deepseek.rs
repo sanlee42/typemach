@@ -271,7 +271,10 @@ fn chat_request(config: &AgentConfig, request: ModelRequest) -> Result<ChatReque
     let tool_choice = if tools.is_empty() {
         None
     } else {
-        config.tool_choice.map(tool_choice_value)
+        request
+            .tool_choice
+            .or(config.tool_choice)
+            .map(tool_choice_value)
     };
     Ok(ChatRequest {
         model: config.model.clone(),
@@ -591,6 +594,7 @@ mod tests {
             context: Value::Null,
             turn: 1,
             system_suffix: None,
+            tool_choice: None,
         }
     }
 
@@ -600,6 +604,17 @@ mod tests {
         config.tool_choice = Some(ToolChoice::Required);
         let body = serde_json::to_value(chat_request(&config, request(vec![spec()])).unwrap())
             .expect("serialize");
+        assert_eq!(body["tool_choice"], "required");
+    }
+
+    #[test]
+    fn request_tool_choice_overrides_transport_default() {
+        let mut config = AgentConfig::new("k", "deepseek-v4-flash");
+        config.tool_choice = Some(ToolChoice::Auto);
+        let mut request = request(vec![spec()]);
+        request.tool_choice = Some(ToolChoice::Required);
+        let body =
+            serde_json::to_value(chat_request(&config, request).unwrap()).expect("serialize");
         assert_eq!(body["tool_choice"], "required");
     }
 
