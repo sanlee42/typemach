@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 #[serde(rename_all = "snake_case")]
 pub enum AgentStep {
     PrepareTurn,
-    /// Tool-required planning and tool selection.
+    /// Automatic, tool-capable planning and tool selection.
     ModelStep,
     DispatchTools,
     /// Checkpointed, tool-free production of the authoritative answer.
