@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentError, AgentMessage, ContentBlock, ContextCompaction, ContextPolicy, ConversationDigest,
-    PromptEstimate, ToolResult, ToolResultArchive, TranscriptArchive,
+    PromptEstimate, ToolDisposition, ToolResult, ToolResultArchive, TranscriptArchive,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +55,7 @@ pub fn maybe_archive_tool_result(
         .map_err(|err| AgentError::Tool(format!("failed to encode tool result: {err}")))?;
     if bytes.len() <= policy.max_tool_result_bytes {
         let mut prompt_result = result.clone();
+        prompt_result.disposition = ToolDisposition::Continue;
         prompt_result.artifacts.clear();
         return Ok((prompt_result, None));
     }
@@ -70,6 +71,7 @@ pub fn maybe_archive_tool_result(
         name: result.name.clone(),
         content: archived_tool_content(&archive),
         is_error: result.is_error,
+        disposition: ToolDisposition::Continue,
         artifacts: Vec::new(),
         raw: None,
     };
@@ -126,6 +128,7 @@ fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
                 name: result.name.clone(),
                 content: result.content.clone(),
                 is_error: result.is_error,
+                disposition: ToolDisposition::Continue,
                 artifacts: Vec::new(),
                 raw: None,
             }),
@@ -232,6 +235,7 @@ mod tests {
             name: "metric_point".to_string(),
             content: json!({ "value": 42 }),
             is_error: false,
+            disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
         })
@@ -345,6 +349,7 @@ mod tests {
                     name: "metric_point".to_string(),
                     content: json!({}),
                     is_error: false,
+                    disposition: ToolDisposition::Continue,
                     artifacts: Vec::new(),
                     raw: None,
                 }),
@@ -376,6 +381,7 @@ mod tests {
                 name: "metric_point".to_string(),
                 content: json!({ "value": 42 }),
                 is_error: false,
+                disposition: ToolDisposition::Continue,
                 artifacts: vec![Artifact {
                     tool_use_id: "tool-1".to_string(),
                     title: "Audit".to_string(),

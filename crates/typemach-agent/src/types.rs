@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::presentation::ToolDisposition;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStep {
@@ -73,6 +75,8 @@ pub struct ToolResult {
     pub content: Value,
     #[serde(default)]
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "ToolDisposition::is_continue")]
+    pub disposition: ToolDisposition,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<Artifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,7 @@ impl ToolResult {
             name: tool_use.name.clone(),
             content,
             is_error: false,
+            disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
         }
@@ -97,18 +102,39 @@ impl ToolResult {
             name: tool_use.name.clone(),
             content: json!({ "error": message.into() }),
             is_error: true,
+            disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
         }
     }
 
-    pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Result<Self, AgentError> {
-        self.artifacts = artifacts;
-        self.validate_artifacts()?;
+    pub fn present(mut self, receipt: impl Into<String>) -> Result<Self, AgentError> {
+        self.disposition = ToolDisposition::Present {
+            receipt: receipt.into(),
+        };
+        self.validate()?;
         Ok(self)
     }
 
-    pub(crate) fn validate_artifacts(&self) -> Result<(), AgentError> {
+    pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Result<Self, AgentError> {
+        self.artifacts = artifacts;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), AgentError> {
+        if let ToolDisposition::Present { receipt } = &self.disposition {
+            if self.is_error {
+                return Err(AgentError::InvalidToolResult(
+                    "an error result cannot present the final answer".to_string(),
+                ));
+            }
+            if receipt.trim().is_empty() {
+                return Err(AgentError::InvalidToolResult(
+                    "present requires a non-empty receipt".to_string(),
+                ));
+            }
+        }
         for (index, artifact) in self.artifacts.iter().enumerate() {
             artifact.validate_for(&self.tool_use_id).map_err(|reason| {
                 AgentError::InvalidToolResult(format!("artifact {index}: {reason}"))

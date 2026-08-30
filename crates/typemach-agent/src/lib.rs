@@ -17,6 +17,8 @@ mod responses;
 mod responses_stream;
 pub use deepseek::ConfiguredModel;
 mod model_turn;
+mod presentation;
+pub use presentation::ToolDisposition;
 mod stream;
 pub use stream::{ModelStream, OutputTextDelta};
 
@@ -143,6 +145,12 @@ pub struct AgentMachine<M, T, P> {
     tools: Arc<T>,
     policy: Arc<P>,
     context_policy: ContextPolicy,
+}
+
+enum ToolDispatch {
+    Continue,
+    Present(presentation::Presentation),
+    Transition(Box<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>),
 }
 
 impl<M, T, P> AgentMachine<M, T, P> {
@@ -386,6 +394,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
+        let mut presentation = None;
         let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
         if state.pending_tools.len() > remaining {
             state.pending_tools.clear();
@@ -407,15 +416,19 @@ where
                 .all(|(_, permission)| *permission == PermissionDecision::Allow)
             {
                 let batch = checked.into_iter().map(|(pending, _)| pending).collect();
-                self.dispatch_concurrent_read_only(state, ctx, batch)
+                presentation = self
+                    .dispatch_concurrent_read_only(state, ctx, batch)
                     .await?;
             } else {
                 for (pending, permission) in checked {
-                    if let Some(transition) = self
+                    match self
                         .dispatch_checked_tool(state, ctx, pending, permission)
                         .await?
                     {
-                        return Ok(transition);
+                        ToolDispatch::Continue => {}
+                        ToolDispatch::Present(next) => presentation::merge(&mut presentation, next)
+                            .map_err(AgentError::machine)?,
+                        ToolDispatch::Transition(transition) => return Ok(*transition),
                     }
                 }
             }
@@ -424,13 +437,20 @@ where
                 let permission =
                     self.policy
                         .check(&pending.tool_use, pending.spec.as_ref(), &state.context);
-                if let Some(transition) = self
+                match self
                     .dispatch_checked_tool(state, ctx, pending, permission)
                     .await?
                 {
-                    return Ok(transition);
+                    ToolDispatch::Continue => {}
+                    ToolDispatch::Present(next) => {
+                        presentation::merge(&mut presentation, next).map_err(AgentError::machine)?
+                    }
+                    ToolDispatch::Transition(transition) => return Ok(*transition),
                 }
             }
+        }
+        if let Some(presentation) = presentation {
+            return presentation::complete(state, ctx, presentation).await;
         }
         if let Some(reason) = exhausted_reason(state) {
             Err(AgentError::Incomplete(reason).machine())
@@ -445,7 +465,7 @@ where
         ctx: &AgentRunContext,
         pending: PendingToolCall,
         permission: PermissionDecision,
-    ) -> Result<Option<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>, MachineError> {
+    ) -> Result<ToolDispatch, MachineError> {
         let tool_use = &pending.tool_use;
         if let PermissionDecision::Deny(reason) = permission {
             if tool_use.name == "ask_user" {
@@ -458,19 +478,21 @@ where
                 name: tool_use.name.clone(),
             })
             .await?;
-            record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
-            return Ok(None);
+            let _ = record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
+            return Ok(ToolDispatch::Continue);
         }
         let spec = pending.spec.as_ref();
         let built_in_error = if tool_use.name == "ask_user" {
             if let Some(result) = self.consume_human_answer(state, tool_use, ctx).await? {
                 state.messages.push(AgentMessage::tool_result(result));
-                return Ok(None);
+                return Ok(ToolDispatch::Continue);
             }
             match ask_user_question(tool_use) {
                 Ok(question) => {
                     state.pending_human = Some(pending);
-                    return Ok(Some(Transition::Interrupt(question)));
+                    return Ok(ToolDispatch::Transition(Box::new(Transition::Interrupt(
+                        question,
+                    ))));
                 }
                 Err(err) => Some(ToolResult::error(tool_use, err.to_string())),
             }
@@ -485,9 +507,8 @@ where
             })
             .await?;
             state.terminal = Some(action);
-            return Ok(Some(Transition::Complete(state.output_with_answer(
-                FinishReason::Terminal,
-                state.answer.clone(),
+            return Ok(ToolDispatch::Transition(Box::new(Transition::Complete(
+                state.output_with_answer(FinishReason::Terminal, state.answer.clone()),
             ))));
         }
         state.tool_calls += 1;
@@ -512,8 +533,10 @@ where
                 .await
                 .unwrap_or_else(|err| ToolResult::error(tool_use, err.to_string()))
         };
-        record_tool_result(state, ctx, result).await?;
-        Ok(None)
+        Ok(match record_tool_result(state, ctx, result).await? {
+            Some(presentation) => ToolDispatch::Present(presentation),
+            None => ToolDispatch::Continue,
+        })
     }
 
     async fn consume_human_answer(
@@ -576,7 +599,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
         batch: Vec<PendingToolCall>,
-    ) -> Result<(), MachineError> {
+    ) -> Result<Option<presentation::Presentation>, MachineError> {
         state.tool_calls += batch.len() as u32;
         for pending in &batch {
             ctx.emit(AgentSignal::ToolStarted {
@@ -600,10 +623,15 @@ where
                     .unwrap_or_else(|err| ToolResult::error(&tool_use, err.to_string()))
             }
         });
-        for result in join_all(calls).await {
-            record_tool_result(state, ctx, result).await?;
+        let results = join_all(calls).await;
+        presentation::validate_batch(&results).map_err(AgentError::machine)?;
+        let mut presentation = None;
+        for result in results {
+            if let Some(next) = record_tool_result(state, ctx, result).await? {
+                presentation = Some(next);
+            }
         }
-        Ok(())
+        Ok(presentation)
     }
 
     fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
@@ -705,8 +733,9 @@ async fn record_tool_result(
     state: &mut AgentState,
     ctx: &AgentRunContext,
     mut result: ToolResult,
-) -> Result<(), MachineError> {
-    result.validate_artifacts().map_err(AgentError::machine)?;
+) -> Result<Option<presentation::Presentation>, MachineError> {
+    result.validate().map_err(AgentError::machine)?;
+    let presentation = presentation::take(&mut result);
     let artifacts = std::mem::take(&mut result.artifacts);
     ctx.emit(AgentSignal::ToolResult {
         tool_use_id: result.tool_use_id.clone(),
@@ -736,5 +765,5 @@ async fn record_tool_result(
     state
         .messages
         .push(AgentMessage::tool_result(prompt_result));
-    Ok(())
+    Ok(presentation)
 }

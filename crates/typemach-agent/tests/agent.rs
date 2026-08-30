@@ -22,6 +22,8 @@ mod builtin_validation;
 mod final_answer;
 #[path = "agent/tool_artifacts.rs"]
 mod tool_artifacts;
+#[path = "agent/tool_presentation.rs"]
+mod tool_presentation;
 
 #[derive(Clone, Default)]
 struct ScriptedModel {
