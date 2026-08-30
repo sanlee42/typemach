@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::responses::{model_response_shape, tool_use_from_item, usage_from_value};
+use crate::responses::{DecodeFailure, model_response_shape, tool_use_from_item, usage_from_value};
 use crate::{AgentError, ModelOutcome, ModelResponse, ModelStream, StopReason, ToolUse, Usage};
 
 #[derive(Debug, Deserialize)]
@@ -52,13 +52,12 @@ enum OutputKind {
 pub(crate) async fn decode_stream(
     response: reqwest::Response,
     stream: ModelStream,
-) -> Result<ModelResponse, AgentError> {
+) -> Result<ModelResponse, DecodeFailure> {
     let mut bytes = response.bytes_stream();
     let mut pending = Vec::new();
     let mut acc = Accumulator::default();
     while let Some(chunk) = bytes.next().await {
-        let chunk =
-            chunk.map_err(|err| AgentError::Model(format!("model stream failed: {err}")))?;
+        let chunk = chunk.map_err(|err| DecodeFailure::body(err, "model stream failed"))?;
         pending.extend_from_slice(&chunk);
         while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=index).collect::<Vec<_>>();
@@ -70,7 +69,7 @@ pub(crate) async fn decode_stream(
     }
     let stop_reason = acc.stop_reason.clone().or_else(|| inferred_stop(&acc));
     if acc.status.is_none() {
-        return Err(AgentError::Model(
+        return Err(DecodeFailure::protocol_message(
             "responses stream ended without a terminal event".to_string(),
         ));
     }
@@ -102,7 +101,7 @@ fn handle_stream_line(
     line: String,
     stream: &ModelStream,
     acc: &mut Accumulator,
-) -> Result<(), AgentError> {
+) -> Result<(), DecodeFailure> {
     let Some(data) = line.strip_prefix("data:") else {
         return Ok(());
     };
@@ -110,12 +109,13 @@ fn handle_stream_line(
     if data.is_empty() || data == "[DONE]" {
         return Ok(());
     }
-    let event: Event = serde_json::from_str(data)
-        .map_err(|err| AgentError::Model(format!("responses stream event was invalid: {err}")))?;
+    let event: Event = serde_json::from_str(data).map_err(|err| {
+        DecodeFailure::protocol_message(format!("responses stream event was invalid: {err}"))
+    })?;
     match event.kind.as_str() {
         "response.output_text.delta" => {
             let Some(delta) = event.delta else {
-                return Err(AgentError::Model(
+                return Err(DecodeFailure::protocol_message(
                     "output_text delta missing text".to_string(),
                 ));
             };
@@ -149,10 +149,14 @@ fn handle_stream_line(
             merge_response(acc, response)?;
         }
         "response.failed" => {
-            return Err(AgentError::Model("responses request failed".to_string()));
+            return Err(DecodeFailure::protocol_message(
+                "responses request failed".to_string(),
+            ));
         }
         "response.refusal.delta" => {
-            return Err(AgentError::Model("model returned a refusal".to_string()));
+            return Err(DecodeFailure::protocol_message(
+                "model returned a refusal".to_string(),
+            ));
         }
         _ => {}
     }

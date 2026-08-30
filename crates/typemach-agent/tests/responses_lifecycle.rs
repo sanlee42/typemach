@@ -18,79 +18,8 @@ use typemach_agent::{
 #[tokio::test]
 async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     let (base_url, captured) = spawn_server(vec![
-        MockTurn::ok(sse([
-            json!({
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "call_id": "call-1",
-                    "name": "metric_point",
-                    "arguments": ""
-                }
-            }),
-            json!({
-                "type": "response.function_call_arguments.delta",
-                "output_index": 0,
-                "delta": "{\"metric_id\""
-            }),
-            json!({
-                "type": "response.function_call_arguments.delta",
-                "output_index": 0,
-                "delta": ":\"paid_order_count\"}"
-            }),
-            json!({
-                "type": "response.output_item.done",
-                "output_index": 0,
-                "item": {
-                    "type": "function_call",
-                    "call_id": "call-1",
-                    "name": "metric_point",
-                    "arguments": "{\"metric_id\":\"paid_order_count\"}"
-                }
-            }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp-tools",
-                    "status": "completed",
-                    "output": [
-                        {
-                            "type": "reasoning",
-                            "content": [{
-                                "type": "reasoning_text",
-                                "text": "Inspect metric privately."
-                            }]
-                        },
-                        {
-                            "type": "function_call",
-                            "call_id": "call-1",
-                            "name": "metric_point",
-                            "arguments": "{\"metric_id\":\"paid_order_count\"}"
-                        }
-                    ]
-                }
-            }),
-        ])),
-        MockTurn::ok(sse([
-            json!({ "type": "response.output_text.delta", "delta": "The answer " }),
-            json!({ "type": "response.output_text.delta", "delta": "is 42." }),
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": "resp-final",
-                    "status": "completed",
-                    "output": [{
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": "The answer is 42."
-                        }]
-                    }]
-                }
-            }),
-        ])),
+        MockTurn::ok(tool_reasoning_call_sse()),
+        MockTurn::ok(final_answer_sse()),
     ])
     .await;
     let runner = build_agent_runner(
@@ -139,6 +68,85 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
             .expect("reasoning item")["content"][0]["text"],
         "Inspect metric privately."
     );
+}
+
+fn tool_reasoning_call_sse() -> String {
+    sse([
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": ""
+            }
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": "{\"metric_id\""
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": ":\"paid_order_count\"}"
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": "{\"metric_id\":\"paid_order_count\"}"
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-tools",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "content": [{
+                            "type": "reasoning_text",
+                            "text": "Inspect metric privately."
+                        }]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "metric_point",
+                        "arguments": "{\"metric_id\":\"paid_order_count\"}"
+                    }
+                ]
+            }
+        }),
+    ])
+}
+
+fn final_answer_sse() -> String {
+    sse([
+        json!({ "type": "response.output_text.delta", "delta": "The answer " }),
+        json!({ "type": "response.output_text.delta", "delta": "is 42." }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-final",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "The answer is 42."
+                    }]
+                }]
+            }
+        }),
+    ])
 }
 
 #[tokio::test]
