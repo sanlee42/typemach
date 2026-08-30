@@ -86,7 +86,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
             messages: vec![AgentMessage::user_text("Show order count")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 2,
+                max_model_turns: 3,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -109,7 +109,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
             messages: Vec::new(),
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 2,
+                max_model_turns: 3,
                 max_tool_calls: 4,
             },
             human_input: Some(HumanInputAnswer {
@@ -209,13 +209,6 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Review created.".to_string(),
-            }),
-            stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
-        },
     ]);
     let runner = build_agent_runner(
         MemorySaver::default(),
@@ -258,16 +251,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     ] {
         assert_eq!(paired_results(&requests[4].messages, tool_use_id), (1, 1));
     }
-    assert_eq!(requests.len(), 6);
-    let final_prompt =
-        serde_json::to_string(&requests[5].messages).expect("serialize final prompt");
-    for tool_use_id in [
-        "artifact-missing-type",
-        "artifact-invalid-type",
-        "artifact-invalid-source",
-    ] {
-        assert!(!final_prompt.contains(tool_use_id));
-    }
+    assert_eq!(requests.len(), 5);
 }
 
 fn assert_error_lifecycle(events: &[Event], tool_use_id: &str) {

@@ -17,7 +17,6 @@ mod responses;
 mod responses_stream;
 pub use deepseek::ConfiguredModel;
 mod model_turn;
-mod phase;
 mod stream;
 pub use stream::{ModelStream, OutputTextDelta};
 
@@ -73,10 +72,6 @@ impl AgentState {
                 .map(|state| state.tool_result_archives.clone())
                 .unwrap_or_default(),
         }
-    }
-
-    fn output(&self, finish_reason: FinishReason) -> AgentRunOutput {
-        self.output_with_answer(finish_reason, String::new())
     }
 
     fn output_with_answer(&self, finish_reason: FinishReason, answer: String) -> AgentRunOutput {
@@ -280,9 +275,8 @@ where
     ) -> Result<Transition<Self::Step, Self::Interrupt, Self::Output>, MachineError> {
         match step {
             AgentStep::PrepareTurn => Ok(Transition::Next(AgentStep::ModelStep)),
-            AgentStep::ModelStep => self.planning_step(state, ctx).await,
+            AgentStep::ModelStep => self.model_step(state, ctx).await,
             AgentStep::DispatchTools => self.dispatch_tools(state, ctx).await,
-            AgentStep::FinalAnswer => self.final_answer_step(state, ctx).await,
         }
     }
 }
@@ -293,14 +287,13 @@ where
     T: ToolRegistry + 'static,
     P: ToolPermissionPolicy + 'static,
 {
-    async fn planning_step(
+    async fn model_step(
         &self,
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        if planning_budget_exhausted(state) {
-            enter_final_answer(state);
-            return Ok(Transition::Next(AgentStep::FinalAnswer));
+        if let Some(reason) = exhausted_reason(state) {
+            return Err(AgentError::Incomplete(reason).machine());
         }
         let tools = self
             .tools
@@ -310,7 +303,7 @@ where
         let messages = state.messages.clone();
         let suffix = state.system_suffix.clone();
         state.model_turns += 1;
-        let planning_turn = state.model_turns;
+        let turn_number = state.model_turns;
         let request = model_turn::prepare(
             state,
             ctx,
@@ -318,25 +311,37 @@ where
             tools.clone(),
             suffix,
             Some(ToolChoice::Auto),
-            planning_turn,
+            turn_number,
         )
         .await?;
-        let turn = model_turn::invoke(
-            self.model.as_ref(),
-            state,
-            ctx,
-            request,
-            AssistantMessagePhase::Commentary,
-        )
-        .await?;
+        let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
         match turn.outcome {
-            Some(model_turn::TurnOutcome::Message { .. }) => {
+            Some(model_turn::TurnOutcome::Message {
+                message_id,
+                content,
+                text,
+            }) => {
                 let reason = finish_reason(turn.stop_reason.as_ref())?;
                 if reason == FinishReason::MaxTokens {
-                    return Ok(Transition::Complete(state.output(reason)));
+                    return Err(AgentError::Incomplete(reason).machine());
                 }
-                enter_final_answer(state);
-                Ok(Transition::Next(AgentStep::FinalAnswer))
+                if text.trim().is_empty() {
+                    return Err(
+                        AgentError::Model("assistant message was empty".to_string()).machine()
+                    );
+                }
+                ctx.emit(AgentSignal::AssistantMessageDone {
+                    message_id,
+                    phase: AssistantMessagePhase::FinalAnswer,
+                })
+                .await?;
+                if !content.is_empty() {
+                    state.messages.push(AgentMessage::Assistant { content });
+                }
+                let answer = commit_answer(state, text);
+                Ok(Transition::Complete(
+                    state.output_with_answer(reason, answer),
+                ))
             }
             Some(model_turn::TurnOutcome::ToolCalls {
                 content,
@@ -344,7 +349,7 @@ where
             }) => {
                 if !matches!(turn.stop_reason, Some(StopReason::ToolUse) | None) {
                     return Err(AgentError::Model(
-                        "planning stopped before completing tool calls".to_string(),
+                        "model stopped before completing tool calls".to_string(),
                     )
                     .machine());
                 }
@@ -357,8 +362,7 @@ where
                 let remaining =
                     state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
                 if tool_uses.len() > remaining {
-                    enter_final_answer(state);
-                    return Ok(Transition::Next(AgentStep::FinalAnswer));
+                    return Err(AgentError::Incomplete(FinishReason::MaxToolCalls).machine());
                 }
                 state
                     .pending_tools
@@ -371,63 +375,10 @@ where
             }
             None if turn.stop_reason == Some(StopReason::MaxTokens) => {
                 state.pending_tools.clear();
-                Ok(Transition::Complete(state.output(FinishReason::MaxTokens)))
+                Err(AgentError::Incomplete(FinishReason::MaxTokens).machine())
             }
             None => Err(no_outcome_error(turn.stop_reason).machine()),
         }
-    }
-
-    async fn final_answer_step(
-        &self,
-        state: &mut AgentState,
-        ctx: &AgentRunContext,
-    ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        let messages = phase::final_messages(&state.messages);
-        let suffix = phase::final_system_suffix(state.system_suffix.as_deref());
-        let final_turn = state.model_turns.saturating_add(1);
-        let request = model_turn::prepare(
-            state,
-            ctx,
-            messages.clone(),
-            Vec::new(),
-            Some(suffix),
-            Some(ToolChoice::None),
-            final_turn,
-        )
-        .await?;
-        let turn = model_turn::invoke(
-            self.model.as_ref(),
-            state,
-            ctx,
-            request,
-            AssistantMessagePhase::FinalAnswer,
-        )
-        .await?;
-        let (content, text) = match turn.outcome {
-            Some(model_turn::TurnOutcome::Message { content, text }) => (content, text),
-            Some(model_turn::TurnOutcome::ToolCalls { .. }) => {
-                return Err(AgentError::Model(
-                    "final answer step returned a tool call even though tools were disabled"
-                        .to_string(),
-                )
-                .machine());
-            }
-            None if turn.stop_reason == Some(StopReason::MaxTokens) => {
-                return Ok(Transition::Complete(state.output(FinishReason::MaxTokens)));
-            }
-            None => return Err(no_outcome_error(turn.stop_reason).machine()),
-        };
-        let reason = finish_reason(turn.stop_reason.as_ref())?;
-        if reason == FinishReason::MaxTokens {
-            return Ok(Transition::Complete(state.output(reason)));
-        }
-        if !content.is_empty() {
-            state.messages.push(AgentMessage::Assistant { content });
-        }
-        let answer = commit_answer(state, text);
-        Ok(Transition::Complete(
-            state.output_with_answer(reason, answer),
-        ))
     }
 
     async fn dispatch_tools(
@@ -438,13 +389,11 @@ where
         let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
         if state.pending_tools.len() > remaining {
             state.pending_tools.clear();
-            enter_final_answer(state);
-            return Ok(Transition::Next(AgentStep::FinalAnswer));
+            return Err(AgentError::Incomplete(FinishReason::MaxToolCalls).machine());
         }
         if self.dispatch_concurrent_read_only(state, ctx).await? {
-            return if planning_budget_exhausted(state) {
-                enter_final_answer(state);
-                Ok(Transition::Next(AgentStep::FinalAnswer))
+            return if let Some(reason) = exhausted_reason(state) {
+                Err(AgentError::Incomplete(reason).machine())
             } else {
                 Ok(Transition::Next(AgentStep::ModelStep))
             };
@@ -517,9 +466,8 @@ where
             };
             record_tool_result(state, ctx, result).await?;
         }
-        if planning_budget_exhausted(state) {
-            enter_final_answer(state);
-            Ok(Transition::Next(AgentStep::FinalAnswer))
+        if let Some(reason) = exhausted_reason(state) {
+            Err(AgentError::Incomplete(reason).machine())
         } else {
             Ok(Transition::Next(AgentStep::ModelStep))
         }
@@ -671,20 +619,19 @@ fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
     }
 }
 
-fn enter_final_answer(state: &mut AgentState) {
-    state.pending_tools.clear();
-    state.pending_human = None;
-    state.human_input = None;
-}
-
 fn commit_answer(state: &mut AgentState, text: String) -> String {
     state.answer = text;
     state.answer.clone()
 }
 
-fn planning_budget_exhausted(state: &AgentState) -> bool {
-    state.model_turns >= state.budget.max_model_turns
-        || state.tool_calls >= state.budget.max_tool_calls
+fn exhausted_reason(state: &AgentState) -> Option<FinishReason> {
+    if state.model_turns >= state.budget.max_model_turns {
+        Some(FinishReason::MaxModelTurns)
+    } else if state.tool_calls >= state.budget.max_tool_calls {
+        Some(FinishReason::MaxToolCalls)
+    } else {
+        None
+    }
 }
 
 fn finish_reason(reason: Option<&StopReason>) -> Result<FinishReason, MachineError> {
@@ -707,13 +654,13 @@ fn finish_reason(reason: Option<&StopReason>) -> Result<FinishReason, MachineErr
 
 fn no_outcome_error(reason: Option<StopReason>) -> AgentError {
     match reason {
-        Some(StopReason::EndTurn) => AgentError::Model(
-            "planning ended without an assistant message or tool calls".to_string(),
-        ),
+        Some(StopReason::EndTurn) => {
+            AgentError::Model("model ended without an assistant message or tool calls".to_string())
+        }
         Some(reason) => AgentError::Model(format!(
-            "planning stopped without a tool or natural completion: {reason:?}"
+            "model stopped without a tool or natural completion: {reason:?}"
         )),
-        None => AgentError::Model("planning stopped without a tool or stop reason".to_string()),
+        None => AgentError::Model("model stopped without a tool or stop reason".to_string()),
     }
 }
 

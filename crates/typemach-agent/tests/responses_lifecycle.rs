@@ -11,8 +11,8 @@ use typemach::{
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentRunInput, AgentRunOutput,
     AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion,
-    AssistantMessagePhase, ConfiguredModel, ContentBlock, FinishReason, ToolAnnotations,
-    ToolCallRequest, ToolRegistry, ToolResult, build_agent_runner,
+    AssistantMessagePhase, ConfiguredModel, ContentBlock, ToolAnnotations, ToolCallRequest,
+    ToolRegistry, ToolResult, build_agent_runner,
 };
 
 #[tokio::test]
@@ -34,7 +34,7 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -46,11 +46,7 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
 
     assert_eq!(
         message_deltas(&events, AssistantMessagePhase::Commentary),
-        ["Checking orders. "]
-    );
-    assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
-        ["The answer ", "is 42."]
+        ["Checking orders. ", "The answer ", "is 42."]
     );
     let completed = completed(&events);
     assert_eq!(completed.answer, "The answer is 42.");
@@ -62,14 +58,18 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     let bodies = captured_bodies(&captured);
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0]["tool_choice"], "auto");
-    assert_eq!(bodies[1]["tool_choice"], "none");
-    assert!(bodies[1].get("tools").is_none());
+    assert_eq!(bodies[1]["tool_choice"], "auto");
+    assert!(
+        bodies[1]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
     assert!(input_has_type(&bodies[1], "function_call"));
     assert!(input_has_type(&bodies[1], "function_call_output"));
     assert_ordered_input_types(&bodies[1], &["function_call", "function_call_output"]);
-    assert!(!input_has_type(&bodies[1], "reasoning"));
+    assert!(input_has_type(&bodies[1], "reasoning"));
     assert!(
-        !bodies[1]["input"]
+        bodies[1]["input"]
             .as_array()
             .expect("input array")
             .iter()
@@ -130,7 +130,7 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -142,11 +142,7 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
 
     assert_eq!(
         message_deltas(&events, AssistantMessagePhase::Commentary),
-        ["Checking orders. "]
-    );
-    assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
-        ["The answer is 42."]
+        ["Checking orders. ", "The answer is 42."]
     );
     assert_eq!(completed(&events).answer, "The answer is 42.");
     assert!(events.iter().any(|event| matches!(
@@ -247,53 +243,7 @@ fn final_answer_sse() -> String {
 }
 
 #[tokio::test]
-async fn budget_fallback_serializes_tool_choice_none() {
-    let (base_url, captured) = spawn_server(vec![MockTurn::ok(sse([json!({
-        "type": "response.completed",
-        "response": {
-            "id": "resp-final",
-            "status": "completed",
-            "output": [{
-                "type": "message",
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": "Fallback answer." }]
-            }]
-        }
-    })]))])
-    .await;
-    let runner = build_agent_runner(
-        MemorySaver::default(),
-        model(base_url),
-        FakeTools,
-        AllowAllTools,
-    );
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Answer from context")],
-            context: Value::Null,
-            budget: AgentBudget {
-                max_model_turns: 0,
-                max_tool_calls: 8,
-            },
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
-        ["Fallback answer."]
-    );
-    assert_eq!(completed(&events).answer, "Fallback answer.");
-    let bodies = captured_bodies(&captured);
-    assert!(bodies[0].get("tools").is_none());
-    assert_eq!(bodies[0]["tool_choice"], "none");
-}
-
-#[tokio::test]
-async fn max_tokens_final_delta_returns_partial_once() {
+async fn max_tokens_candidate_is_streamed_but_not_committed() {
     let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([
         json!({ "type": "response.output_text.delta", "delta": "Partial answer" }),
         json!({
@@ -322,7 +272,7 @@ async fn max_tokens_final_delta_returns_partial_once() {
             messages: vec![AgentMessage::user_text("Write a long answer")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 0,
+                max_model_turns: 1,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -332,14 +282,20 @@ async fn max_tokens_final_delta_returns_partial_once() {
     ))
     .await;
 
-    let completed = completed(&events);
     assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::FinalAnswer),
+        message_deltas(&events, AssistantMessagePhase::Commentary),
         ["Partial answer"]
     );
-    assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert!(completed.answer.is_empty());
-    assert!(assistant_texts(&completed.messages).is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
+    );
     assert!(!events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
@@ -350,7 +306,7 @@ async fn max_tokens_final_delta_returns_partial_once() {
 }
 
 #[tokio::test]
-async fn max_tokens_without_message_returns_empty() {
+async fn max_tokens_without_message_fails_without_an_answer() {
     let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([json!({
         "type": "response.incomplete",
         "response": {
@@ -379,10 +335,18 @@ async fn max_tokens_without_message_returns_empty() {
     ))
     .await;
 
-    let completed = completed(&events);
-    assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert!(completed.answer.is_empty());
-    assert!(assistant_texts(&completed.messages).is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Completed { .. }
+            | RunStreamEvent::Signal {
+                signal: AgentSignal::AssistantMessageDone { .. },
+            }
+    )));
 }
 
 #[derive(Default)]

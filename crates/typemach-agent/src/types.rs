@@ -7,11 +7,9 @@ use serde_json::{Value, json};
 #[serde(rename_all = "snake_case")]
 pub enum AgentStep {
     PrepareTurn,
-    /// Automatic, tool-capable planning and tool selection.
+    /// Automatic tool selection or the final assistant answer.
     ModelStep,
     DispatchTools,
-    /// Checkpointed, tool-free production of the authoritative answer.
-    FinalAnswer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -529,8 +527,7 @@ pub enum AgentSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBudget {
-    /// Maximum planning model calls. The tool-free final-answer call is
-    /// always permitted after planning completes or reaches this limit.
+    /// Maximum model calls, including the terminal answer call.
     pub max_model_turns: u32,
     pub max_tool_calls: u32,
 }
@@ -664,6 +661,8 @@ pub enum AgentError {
     PermissionDenied(String),
     #[error("invalid built-in tool arguments: {0}")]
     InvalidBuiltInTool(String),
+    #[error("agent stopped before completing an answer: {0:?}")]
+    Incomplete(FinishReason),
 }
 
 #[cfg(test)]
@@ -719,9 +718,5 @@ mod type_contracts {
         assert!(state.pending_tools[0].spec.is_none());
         assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);
-        assert_eq!(
-            serde_json::to_value(AgentStep::FinalAnswer).expect("serialize final step"),
-            json!("final_answer")
-        );
     }
 }

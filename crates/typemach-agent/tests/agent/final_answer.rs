@@ -3,42 +3,39 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::time::sleep;
 use typemach::CheckpointSaver;
-use typemach_agent::AgentState;
 
-#[path = "final_answer/checkpoint.rs"]
-mod checkpoint;
+type Event = RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>;
+
+#[derive(Clone, Default)]
+struct StreamingFinal {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+#[async_trait]
+impl AgentModel for StreamingFinal {
+    async fn next_step(
+        &self,
+        request: ModelRequest,
+        stream: ModelStream,
+    ) -> Result<ModelResponse, AgentError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.requests.lock().expect("requests lock").push(request);
+        stream.output_text("The answer ")?;
+        stream.output_text("is 42.")?;
+        Ok(ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "The answer is 42.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        })
+    }
+}
 
 #[tokio::test]
-async fn tool_free_planning_transitions_to_an_authoritative_final_step() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
-                    raw: None,
-                }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Evidence is ready.".to_string(),
-            }),
-            stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Order count is 42.".to_string(),
-            }),
-            stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
-        },
-    ]);
+async fn terminal_output_is_generated_once_and_promoted_in_place() {
+    let model = StreamingFinal::default();
     let runner = build_agent_runner(
         MemorySaver::default(),
         model.clone(),
@@ -47,118 +44,12 @@ async fn tool_free_planning_transitions_to_an_authoritative_final_step() {
     );
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![
-                AgentMessage::user_text("Previous question"),
-                AgentMessage::assistant_text("Old answer must not enter the current answer."),
-                AgentMessage::user_text("Yesterday's order count"),
-            ],
+            messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 2,
+                max_model_turns: 1,
                 max_tool_calls: 4,
             },
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::ToolResult { tool_use_id, .. },
-        } if tool_use_id == "tool-1"
-    )));
-    assert_eq!(model.requests().len(), 3);
-    assert_eq!(completed(&events).answer, "Order count is 42.");
-    let requests = model.requests();
-    assert_eq!(
-        requests[0].tool_choice,
-        Some(typemach_agent::ToolChoice::Auto)
-    );
-    assert_eq!(
-        requests[0]
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>(),
-        ["metric_point", "ask_user", "emit_artifact", "report"]
-    );
-    assert_eq!(
-        requests[1].tool_choice,
-        Some(typemach_agent::ToolChoice::Auto)
-    );
-    assert_eq!(
-        requests[2].tool_choice,
-        Some(typemach_agent::ToolChoice::None)
-    );
-    assert!(requests[2].tools.is_empty());
-    let final_prompt = serde_json::to_string(&requests[2].messages).expect("serialize prompt");
-    assert!(!final_prompt.contains("Evidence is ready."));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDelta {
-                phase: AssistantMessagePhase::Commentary,
-                delta,
-                index,
-                ..
-            },
-        } if delta == "Evidence is ready." && *index == 0
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDelta {
-                phase: AssistantMessagePhase::FinalAnswer,
-                delta,
-                index,
-                ..
-            },
-        } if delta == "Order count is 42." && *index == 0
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDone {
-                phase: AssistantMessagePhase::Commentary,
-                ..
-            },
-        }
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDone {
-                phase: AssistantMessagePhase::FinalAnswer,
-                ..
-            },
-        }
-    )));
-}
-
-#[tokio::test]
-async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
-    let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: String::new(),
-            calls: vec![ToolUse {
-                id: "term-1".to_string(),
-                name: "report".to_string(),
-                input: json!({ "message": "Terminal message must not be appended." }),
-                raw: None,
-            }],
-        }),
-        stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
-    }]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Create a report")],
-            context: Value::Null,
-            budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
         }),
@@ -170,13 +61,52 @@ async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantMessageDelta { delta, .. },
-            } => Some(delta.as_str()),
+                signal:
+                    AgentSignal::AssistantMessageDelta {
+                        message_id,
+                        phase,
+                        delta,
+                        ..
+                    },
+            } => Some((message_id.as_str(), *phase, delta.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(deltas.is_empty());
-    assert!(completed(&events).answer.is_empty());
+    let done = events.iter().find_map(|event| match event {
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDone { message_id, phase },
+        } => Some((message_id.as_str(), *phase)),
+        _ => None,
+    });
+    let output = completed(&events);
+
+    assert_eq!(model.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        deltas
+            .iter()
+            .map(|(_, _, delta)| *delta)
+            .collect::<String>(),
+        output.answer
+    );
+    assert_eq!(output.answer, "The answer is 42.");
+    assert!(
+        deltas
+            .iter()
+            .all(|(_, phase, _)| *phase == AssistantMessagePhase::Commentary)
+    );
+    assert_eq!(
+        done,
+        Some((deltas[0].0, AssistantMessagePhase::FinalAnswer))
+    );
+    {
+        let requests = model.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].tool_choice,
+            Some(typemach_agent::ToolChoice::Auto)
+        );
+        assert!(!requests[0].tools.is_empty());
+    }
 
     let checkpoint = runner
         .checkpointer()
@@ -185,7 +115,7 @@ async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
         .expect("load checkpoint")
         .expect("checkpoint");
     let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
-    assert!(state.answer.is_empty());
+    assert_eq!(state.answer, output.answer);
 }
 
 #[derive(Clone, Default)]
@@ -212,10 +142,344 @@ impl ToolRegistry for CountingTools {
     }
 }
 
+fn metric_call() -> ModelResponse {
+    ModelResponse {
+        outcome: Some(ModelOutcome::ToolCalls {
+            text: "Checking. ".to_string(),
+            calls: vec![ToolUse {
+                id: "tool-1".to_string(),
+                name: "metric_point".to_string(),
+                input: json!({ "metric": "orders" }),
+                raw: None,
+            }],
+        }),
+        stop_reason: Some(StopReason::ToolUse),
+        ..ModelResponse::default()
+    }
+}
+
+#[tokio::test]
+async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
+    let model = ScriptedModel::new([
+        metric_call(),
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "There were 42 orders.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        },
+    ]);
+    let tools = CountingTools::default();
+    let calls = tools.calls.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("How many orders?")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 2,
+                max_tool_calls: 2,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(completed(&events).answer, "There were 42 orders.");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        request.tool_choice == Some(typemach_agent::ToolChoice::Auto)
+            && request.tools.iter().any(|tool| tool.name == "metric_point")
+    }));
+    assert!(requests[1].messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::User { content }
+            if content.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult(result) if result.tool_use_id == "tool-1"
+            ))
+    )));
+}
+
+#[derive(Clone, Copy)]
+enum AbortCase {
+    MaxTokens,
+    MaxTokensToolCalls,
+    Refusal,
+    Protocol,
+    Provider,
+}
+
+#[derive(Clone, Copy)]
+struct AbortModel(AbortCase);
+
+#[async_trait]
+impl AgentModel for AbortModel {
+    async fn next_step(
+        &self,
+        _request: ModelRequest,
+        stream: ModelStream,
+    ) -> Result<ModelResponse, AgentError> {
+        stream.output_text("uncommitted candidate")?;
+        match self.0 {
+            AbortCase::MaxTokens => Ok(ModelResponse {
+                outcome: Some(ModelOutcome::FinalAnswer {
+                    text: "uncommitted candidate".to_string(),
+                }),
+                stop_reason: Some(StopReason::MaxTokens),
+                ..ModelResponse::default()
+            }),
+            AbortCase::MaxTokensToolCalls => Ok(ModelResponse {
+                outcome: Some(ModelOutcome::ToolCalls {
+                    text: "uncommitted candidate".to_string(),
+                    calls: vec![ToolUse {
+                        id: "truncated-tool".to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    }],
+                }),
+                stop_reason: Some(StopReason::MaxTokens),
+                ..ModelResponse::default()
+            }),
+            AbortCase::Refusal => Ok(ModelResponse {
+                outcome: Some(ModelOutcome::FinalAnswer {
+                    text: "uncommitted candidate".to_string(),
+                }),
+                stop_reason: Some(StopReason::Refusal),
+                ..ModelResponse::default()
+            }),
+            AbortCase::Protocol => Ok(ModelResponse {
+                stop_reason: Some(StopReason::EndTurn),
+                ..ModelResponse::default()
+            }),
+            AbortCase::Provider => Err(AgentError::Model("provider failed".to_string())),
+        }
+    }
+}
+
+#[tokio::test]
+async fn aborted_candidates_never_complete_or_persist() {
+    for case in [
+        AbortCase::MaxTokens,
+        AbortCase::MaxTokensToolCalls,
+        AbortCase::Refusal,
+        AbortCase::Protocol,
+        AbortCase::Provider,
+    ] {
+        let runner = build_agent_runner(
+            MemorySaver::default(),
+            AbortModel(case),
+            FakeTools,
+            AllowAllTools,
+        );
+        let events = collect(runner.stream(
+            request(AgentRunInput {
+                messages: vec![AgentMessage::user_text("Answer")],
+                context: Value::Null,
+                budget: AgentBudget::default(),
+                human_input: None,
+                system_suffix: None,
+            }),
+            StreamConfig::default(),
+        ))
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RunStreamEvent::Completed { .. }
+                | RunStreamEvent::Signal {
+                    signal: AgentSignal::AssistantMessageDone {
+                        phase: AssistantMessagePhase::FinalAnswer,
+                        ..
+                    },
+                }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RunStreamEvent::Signal {
+                signal: AgentSignal::ToolStarted { .. },
+            }
+        )));
+        let checkpoint = runner
+            .checkpointer()
+            .load("thread-1")
+            .await
+            .expect("load checkpoint")
+            .expect("checkpoint");
+        let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+        assert!(state.answer.is_empty());
+    }
+
+    let model = ScriptedModel::new(Vec::<ModelResponse>::new());
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model.clone(),
+        FakeTools,
+        AllowAllTools,
+    );
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Answer")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 0,
+                max_tool_calls: 4,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+    assert!(model.requests().is_empty());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn empty_terminal_text_fails_without_finalizing() {
+    let model = ScriptedModel::new([ModelResponse {
+        outcome: Some(ModelOutcome::FinalAnswer {
+            text: " \n".to_string(),
+        }),
+        stop_reason: Some(StopReason::EndTurn),
+        ..ModelResponse::default()
+    }]);
+    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Answer")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Completed { .. }
+            | RunStreamEvent::Signal {
+                signal: AgentSignal::AssistantMessageDone {
+                    phase: AssistantMessagePhase::FinalAnswer,
+                    ..
+                },
+            }
+    )));
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert!(state.answer.is_empty());
+}
+
+#[derive(Clone, Default)]
+struct RecoveringModel {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
+}
+
+#[async_trait]
+impl AgentModel for RecoveringModel {
+    async fn next_step(
+        &self,
+        request: ModelRequest,
+        stream: ModelStream,
+    ) -> Result<ModelResponse, AgentError> {
+        self.requests.lock().expect("requests lock").push(request);
+        match self.calls.fetch_add(1, Ordering::Relaxed) {
+            0 => Ok(metric_call()),
+            1 => {
+                stream.output_text("discard this candidate")?;
+                Err(AgentError::Model("provider failed".to_string()))
+            }
+            _ => Ok(ModelResponse {
+                outcome: Some(ModelOutcome::FinalAnswer {
+                    text: "Recovered from saved evidence.".to_string(),
+                }),
+                stop_reason: Some(StopReason::EndTurn),
+                ..ModelResponse::default()
+            }),
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_resumes_after_tool_dispatch_without_replaying_the_tool() {
+    let model = RecoveringModel::default();
+    let tools = CountingTools::default();
+    let tool_calls = tools.calls.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+    let run = request(AgentRunInput {
+        messages: vec![AgentMessage::user_text("How many orders?")],
+        context: Value::Null,
+        budget: AgentBudget {
+            max_model_turns: 4,
+            max_tool_calls: 4,
+        },
+        human_input: None,
+        system_suffix: None,
+    });
+
+    let first = collect(runner.stream(run.clone(), StreamConfig::default())).await;
+    assert!(
+        first
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    assert_eq!(checkpoint.next_step, Some(json!("model_step")));
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert!(state.answer.is_empty());
+    assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+
+    let second = collect(runner.stream(run, StreamConfig::default())).await;
+    assert_eq!(completed(&second).answer, "Recovered from saved evidence.");
+    assert_eq!(tool_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.calls.load(Ordering::Relaxed), 3);
+    let requests = model.requests.lock().expect("requests lock");
+    assert!(requests[2].messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::User { content }
+            if content.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult(result) if result.tool_use_id == "tool-1"
+            ))
+    )));
+}
+
 #[derive(Clone)]
 struct BatchTools {
     annotations: ToolAnnotations,
-    list_calls: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
 }
@@ -224,7 +488,6 @@ impl BatchTools {
     fn new(annotations: ToolAnnotations) -> Self {
         Self {
             annotations,
-            list_calls: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
             max_active: Arc::new(AtomicUsize::new(0)),
         }
@@ -234,7 +497,6 @@ impl BatchTools {
 #[async_trait]
 impl ToolRegistry for BatchTools {
     async fn list_tools(&self, _context: &Value) -> Result<Vec<AgentToolSpec>, AgentError> {
-        self.list_calls.fetch_add(1, Ordering::Relaxed);
         Ok(vec![AgentToolSpec {
             name: "metric_point".to_string(),
             description: "read metric point".to_string(),
@@ -271,9 +533,8 @@ fn raise_max(max: &AtomicUsize, value: usize) {
     }
 }
 
-#[tokio::test]
-async fn eligible_read_only_batch_overlaps_and_preserves_result_order() {
-    let model = ScriptedModel::new([
+fn two_tool_model() -> ScriptedModel {
+    ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
                 text: String::new(),
@@ -297,18 +558,23 @@ async fn eligible_read_only_batch_overlaps_and_preserves_result_order() {
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
-    ]);
-    let tools = BatchTools::new(ToolAnnotations::default());
-    let list_calls = tools.list_calls.clone();
-    let max_active = tools.max_active.clone();
-    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
+    ])
+}
 
+async fn run_batch(tools: BatchTools) -> (Vec<Event>, usize) {
+    let max_active = tools.max_active.clone();
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        two_tool_model(),
+        tools,
+        AllowAllTools,
+    );
     let events = collect(runner.stream(
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Read both metrics")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -317,280 +583,45 @@ async fn eligible_read_only_batch_overlaps_and_preserves_result_order() {
         StreamConfig::default(),
     ))
     .await;
-
-    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(max_active.load(Ordering::SeqCst), 2);
-    assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
-    assert_eq!(completed(&events).answer, "Done.");
+    (events, max_active.load(Ordering::SeqCst))
 }
 
 #[tokio::test]
-async fn unsafe_batch_stays_sequential() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: ["tool-1", "tool-2"]
-                    .into_iter()
-                    .map(|id| ToolUse {
-                        id: id.to_string(),
-                        name: "metric_point".to_string(),
-                        input: json!({}),
-                        raw: None,
-                    })
-                    .collect(),
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Done.".to_string(),
-            }),
-            stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
-        },
-    ]);
-    let tools = BatchTools::new(ToolAnnotations {
+async fn read_only_batches_overlap_but_unsafe_batches_do_not() {
+    let (read_events, read_max) = run_batch(BatchTools::new(ToolAnnotations::default())).await;
+    let (write_events, write_max) = run_batch(BatchTools::new(ToolAnnotations {
         read_only: false,
         destructive: true,
         ..ToolAnnotations::default()
-    });
-    let list_calls = tools.list_calls.clone();
-    let max_active = tools.max_active.clone();
-    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
-
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Write both metrics")],
-            context: Value::Null,
-            budget: AgentBudget {
-                max_model_turns: 1,
-                max_tool_calls: 4,
-            },
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
+    }))
     .await;
 
-    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(max_active.load(Ordering::SeqCst), 1);
-    assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
-}
-
-#[tokio::test]
-async fn final_phase_rejects_refusal_and_tool_calls() {
-    let responses = [
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Rejected text must stay private.".to_string(),
-            }),
-            stop_reason: Some(StopReason::Refusal),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({}),
-                    raw: None,
-                }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-    ];
-    for response in responses {
-        let model = ScriptedModel::new([response]);
-        let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-        let events = collect(runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("Answer directly")],
-                context: Value::Null,
-                budget: AgentBudget {
-                    max_model_turns: 0,
-                    max_tool_calls: 4,
-                },
-                human_input: None,
-                system_suffix: None,
-            }),
-            StreamConfig::default(),
-        ))
-        .await;
-
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantMessageDone {
-                    phase: AssistantMessagePhase::FinalAnswer,
-                    ..
-                } | AgentSignal::ToolStarted { .. },
-            }
-        )));
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
-        );
-        let checkpoint = runner
-            .checkpointer()
-            .load("thread-1")
-            .await
-            .expect("load checkpoint")
-            .expect("checkpoint");
-        let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
-        assert!(state.answer.is_empty());
-        assert!(
-            !serde_json::to_string(&state.messages)
-                .expect("serialize messages")
-                .contains("Rejected text must stay private.")
-        );
+    assert_eq!(read_max, 2);
+    assert_eq!(write_max, 1);
+    for events in [&read_events, &write_events] {
+        assert_eq!(tool_result_ids(events), ["tool-1", "tool-2"]);
+        assert_eq!(completed(events).answer, "Done.");
     }
 }
 
 #[tokio::test]
-async fn max_tokens_does_not_dispatch_truncated_tool_calls() {
+async fn oversized_tool_batch_aborts_without_partial_dispatch() {
     let model = ScriptedModel::new([ModelResponse {
         outcome: Some(ModelOutcome::ToolCalls {
             text: String::new(),
-            calls: vec![ToolUse {
-                id: "tool-1".to_string(),
-                name: "metric_point".to_string(),
-                input: json!({ "metric_id": "paid_order_cou" }),
-                raw: None,
-            }],
+            calls: ["metric-1", "metric-2"]
+                .into_iter()
+                .map(|id| ToolUse {
+                    id: id.to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({}),
+                    raw: None,
+                })
+                .collect(),
         }),
-        stop_reason: Some(StopReason::MaxTokens),
+        stop_reason: Some(StopReason::ToolUse),
         ..ModelResponse::default()
     }]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Write a long report")],
-            context: Value::Null,
-            budget: AgentBudget::default(),
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::ToolStarted { .. },
-        }
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Failed { error }
-            if error.to_string().contains("planning stopped before completing tool calls")
-    )));
-}
-
-#[tokio::test]
-async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
-    for budget in [
-        AgentBudget {
-            max_model_turns: 1,
-            max_tool_calls: 2,
-        },
-        AgentBudget {
-            max_model_turns: 4,
-            max_tool_calls: 1,
-        },
-    ] {
-        let model = ScriptedModel::new([
-            ModelResponse {
-                outcome: Some(ModelOutcome::ToolCalls {
-                    text: "Checking. ".to_string(),
-                    calls: vec![ToolUse {
-                        id: "metric-1".to_string(),
-                        name: "metric_point".to_string(),
-                        input: json!({}),
-                        raw: None,
-                    }],
-                }),
-                stop_reason: Some(StopReason::ToolUse),
-                ..ModelResponse::default()
-            },
-            ModelResponse {
-                outcome: Some(ModelOutcome::FinalAnswer {
-                    text: "Budgeted answer.".to_string(),
-                }),
-                stop_reason: Some(StopReason::EndTurn),
-                ..ModelResponse::default()
-            },
-        ]);
-        let tools = CountingTools::default();
-        let calls = tools.calls.clone();
-        let runner =
-            build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
-        let events = collect(runner.stream(
-            request(AgentRunInput {
-                messages: vec![AgentMessage::user_text("Read the metric")],
-                context: Value::Null,
-                budget,
-                human_input: None,
-                system_suffix: None,
-            }),
-            StreamConfig::default(),
-        ))
-        .await;
-
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert_eq!(model.requests().len(), 2);
-        assert_eq!(completed(&events).answer, "Budgeted answer.");
-        let deltas = events
-            .iter()
-            .filter_map(|event| match event {
-                RunStreamEvent::Signal {
-                    signal: AgentSignal::AssistantMessageDelta { delta, index, .. },
-                } => Some((delta.as_str(), *index)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(deltas, [("Checking. ", 0), ("Budgeted answer.", 0)]);
-    }
-}
-
-#[tokio::test]
-async fn oversized_tool_batch_is_not_partially_dispatched() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: ["metric-1", "metric-2"]
-                    .into_iter()
-                    .map(|id| ToolUse {
-                        id: id.to_string(),
-                        name: "metric_point".to_string(),
-                        input: json!({}),
-                        raw: None,
-                    })
-                    .collect(),
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "No partial evidence.".to_string(),
-            }),
-            stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
-        },
-    ]);
     let tools = CountingTools::default();
     let calls = tools.calls.clone();
     let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
@@ -599,7 +630,7 @@ async fn oversized_tool_batch_is_not_partially_dispatched() {
             messages: vec![AgentMessage::user_text("Read both metrics")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 4,
+                max_model_turns: 2,
                 max_tool_calls: 1,
             },
             human_input: None,
@@ -610,132 +641,20 @@ async fn oversized_tool_batch_is_not_partially_dispatched() {
     .await;
 
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
     assert!(!events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
             signal: AgentSignal::ToolStarted { .. } | AgentSignal::ToolCompleted { .. },
         }
     )));
-    let output = completed(&events);
-    assert_eq!(output.answer, "No partial evidence.");
-    assert!(!output.messages.iter().any(|message| matches!(
-        message,
-        AgentMessage::Assistant { content }
-            if content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_)))
-    )));
 }
 
-#[tokio::test]
-async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
-    let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::FinalAnswer {
-            text: "The order count is 42.".to_string(),
-        }),
-        ..ModelResponse::default()
-    }]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
-            context: Value::Null,
-            budget: AgentBudget {
-                max_model_turns: 0,
-                max_tool_calls: 4,
-            },
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDelta { delta, .. },
-        } if delta == "The order count is 42."
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantMessageDone {
-                phase: AssistantMessagePhase::FinalAnswer,
-                ..
-            },
-        }
-    )));
-    let output = completed(&events);
-    assert_eq!(output.answer, "The order count is 42.");
-    assert!(matches!(
-        output.messages.last(),
-        Some(AgentMessage::Assistant { content })
-            if content == &vec![ContentBlock::Text {
-                text: "The order count is 42.".to_string()
-            }]
-    ));
-}
-
-#[tokio::test]
-async fn valid_artifact_is_nonterminal_before_final_answer() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "artifact-1".to_string(),
-                    name: "emit_artifact".to_string(),
-                    input: json!({
-                        "title": "Review",
-                        "type": "markdown",
-                        "content": "Review body"
-                    }),
-                    raw: None,
-                }],
-            }),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "The review is ready.".to_string(),
-            }),
-            ..ModelResponse::default()
-        },
-    ]);
-    let runner = build_agent_runner(
-        MemorySaver::default(),
-        model.clone(),
-        FakeTools,
-        AllowAllTools,
-    );
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Create a review")],
-            context: Value::Null,
-            budget: AgentBudget {
-                max_model_turns: 1,
-                max_tool_calls: 4,
-            },
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::Artifact { artifact },
-        } if artifact.tool_use_id == "artifact-1" && artifact.kind == "markdown"
-    )));
-    assert_eq!(completed(&events).finish_reason, FinishReason::Stop);
-    assert_eq!(completed(&events).answer, "The review is ready.");
-    assert_eq!(model.requests().len(), 2);
-}
-
-fn tool_result_ids(
-    events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
-) -> Vec<String> {
+fn tool_result_ids(events: &[Event]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {

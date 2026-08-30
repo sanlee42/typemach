@@ -169,7 +169,7 @@ async fn collect(
 }
 
 #[tokio::test]
-async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
+async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
@@ -201,8 +201,8 @@ async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
-                max_tool_calls: 1,
+                max_model_turns: 2,
+                max_tool_calls: 2,
             },
             human_input: None,
             system_suffix: None,
@@ -224,8 +224,8 @@ async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
             messages: Vec::new(),
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
-                max_tool_calls: 1,
+                max_model_turns: 2,
+                max_tool_calls: 2,
             },
             human_input: Some(HumanInputAnswer {
                 tool_use_id: "ask-1".to_string(),
@@ -237,8 +237,8 @@ async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
             messages: Vec::new(),
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
-                max_tool_calls: 1,
+                max_model_turns: 2,
+                max_tool_calls: 2,
             },
             human_input: None,
             system_suffix: None,
@@ -323,7 +323,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -337,7 +337,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     assert!(!completed.answer.contains("private"));
     let final_prompt =
         serde_json::to_string(&model.requests()[1].messages).expect("serialize final prompt");
-    assert!(!final_prompt.contains("private tool reasoning"));
+    assert!(final_prompt.contains("private tool reasoning"));
     assert!(final_prompt.contains("tool-1"));
     assert_eq!(
         completed
@@ -455,7 +455,7 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
             ],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 0,
+                max_model_turns: 1,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -522,7 +522,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
             messages: vec![AgentMessage::user_text("Load the large evidence")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -594,12 +594,6 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
                     input: json!({ "question": "Which date?" }),
                     raw: None,
                 }],
-            }),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Inventory evidence is ready.".to_string(),
             }),
             ..ModelResponse::default()
         },
@@ -719,7 +713,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: None,
@@ -740,7 +734,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             messages: Vec::new(),
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 2,
                 max_tool_calls: 4,
             },
             human_input: Some(HumanInputAnswer {
@@ -768,9 +762,8 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
     let resumed_suffix = requests[1]
         .system_suffix
         .as_deref()
-        .expect("resumed final suffix");
-    assert!(resumed_suffix.starts_with("Current shop: B\n\n"));
-    assert!(resumed_suffix.contains("[Final answer phase]"));
+        .expect("resumed suffix");
+    assert_eq!(resumed_suffix, "Current shop: B");
 }
 
 #[test]
