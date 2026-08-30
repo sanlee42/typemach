@@ -704,8 +704,10 @@ fn no_outcome_error(reason: Option<StopReason>) -> AgentError {
 async fn record_tool_result(
     state: &mut AgentState,
     ctx: &AgentRunContext,
-    result: ToolResult,
+    mut result: ToolResult,
 ) -> Result<(), MachineError> {
+    result.validate_artifacts().map_err(AgentError::machine)?;
+    let artifacts = std::mem::take(&mut result.artifacts);
     ctx.emit(AgentSignal::ToolResult {
         tool_use_id: result.tool_use_id.clone(),
         name: result.name.clone(),
@@ -720,6 +722,10 @@ async fn record_tool_result(
         state.tool_result_archives.push(archive.clone());
         ctx.emit(AgentSignal::ToolResultArchived { archive })
             .await?;
+    }
+    for artifact in artifacts {
+        state.artifacts.push(artifact.clone());
+        ctx.emit(AgentSignal::Artifact { artifact }).await?;
     }
     ctx.emit(AgentSignal::ToolCompleted {
         tool_use_id: result.tool_use_id.clone(),

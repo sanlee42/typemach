@@ -54,7 +54,9 @@ pub fn maybe_archive_tool_result(
     let bytes = serde_json::to_vec(&result.content)
         .map_err(|err| AgentError::Tool(format!("failed to encode tool result: {err}")))?;
     if bytes.len() <= policy.max_tool_result_bytes {
-        return Ok((result.clone(), None));
+        let mut prompt_result = result.clone();
+        prompt_result.artifacts.clear();
+        return Ok((prompt_result, None));
     }
 
     let archive = ToolResultArchive {
@@ -68,6 +70,7 @@ pub fn maybe_archive_tool_result(
         name: result.name.clone(),
         content: archived_tool_content(&archive),
         is_error: result.is_error,
+        artifacts: Vec::new(),
         raw: None,
     };
     Ok((archived, Some(archive)))
@@ -123,6 +126,7 @@ fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
                 name: result.name.clone(),
                 content: result.content.clone(),
                 is_error: result.is_error,
+                artifacts: Vec::new(),
                 raw: None,
             }),
         })
@@ -209,7 +213,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolUse;
+    use crate::{Artifact, ToolUse};
 
     fn tool_use_message(id: &str) -> AgentMessage {
         AgentMessage::Assistant {
@@ -228,6 +232,7 @@ mod tests {
             name: "metric_point".to_string(),
             content: json!({ "value": 42 }),
             is_error: false,
+            artifacts: Vec::new(),
             raw: None,
         })
     }
@@ -340,6 +345,7 @@ mod tests {
                     name: "metric_point".to_string(),
                     content: json!({}),
                     is_error: false,
+                    artifacts: Vec::new(),
                     raw: None,
                 }),
                 ContentBlock::Text {
@@ -353,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn estimate_ignores_raw_but_archive_retains_it() {
+    fn estimate_ignores_non_model_metadata_but_archive_retains_it() {
         let raw = json!({ "audit": "x".repeat(16_000) });
         let with_raw = vec![
             AgentMessage::user_text("q1"),
@@ -370,6 +376,15 @@ mod tests {
                 name: "metric_point".to_string(),
                 content: json!({ "value": 42 }),
                 is_error: false,
+                artifacts: vec![Artifact {
+                    tool_use_id: "tool-1".to_string(),
+                    title: "Audit".to_string(),
+                    kind: "markdown".to_string(),
+                    content: "artifact-only".repeat(1_000),
+                    source: None,
+                    window: None,
+                    updated_at: None,
+                }],
                 raw: Some(raw),
             }),
             AgentMessage::user_text("q2"),
@@ -420,7 +435,8 @@ mod tests {
             AgentMessage::User { content }
                 if matches!(
                     content.as_slice(),
-                    [ContentBlock::ToolResult(result)] if result.raw.is_some()
+                    [ContentBlock::ToolResult(result)]
+                        if result.raw.is_some() && !result.artifacts.is_empty()
                 )
         ));
     }

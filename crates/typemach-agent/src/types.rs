@@ -73,6 +73,8 @@ pub struct ToolResult {
     pub content: Value,
     #[serde(default)]
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Artifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
 }
@@ -84,6 +86,7 @@ impl ToolResult {
             name: tool_use.name.clone(),
             content,
             is_error: false,
+            artifacts: Vec::new(),
             raw: None,
         }
     }
@@ -94,8 +97,24 @@ impl ToolResult {
             name: tool_use.name.clone(),
             content: json!({ "error": message.into() }),
             is_error: true,
+            artifacts: Vec::new(),
             raw: None,
         }
+    }
+
+    pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Result<Self, AgentError> {
+        self.artifacts = artifacts;
+        self.validate_artifacts()?;
+        Ok(self)
+    }
+
+    pub(crate) fn validate_artifacts(&self) -> Result<(), AgentError> {
+        for (index, artifact) in self.artifacts.iter().enumerate() {
+            artifact.validate_for(&self.tool_use_id).map_err(|reason| {
+                AgentError::InvalidToolResult(format!("artifact {index}: {reason}"))
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -442,6 +461,27 @@ pub struct Artifact {
     pub updated_at: Option<String>,
 }
 
+impl Artifact {
+    fn validate_for(&self, tool_use_id: &str) -> Result<(), String> {
+        if self.tool_use_id != tool_use_id {
+            return Err(format!(
+                "tool_use_id {} does not match {tool_use_id}",
+                self.tool_use_id
+            ));
+        }
+        if self.title.trim().is_empty() {
+            return Err("missing non-empty title".to_string());
+        }
+        if self.content.trim().is_empty() {
+            return Err("missing non-empty content".to_string());
+        }
+        if !matches!(self.kind.as_str(), "markdown" | "table") {
+            return Err("type must be markdown or table".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TerminalAction {
     pub tool_use_id: String,
@@ -661,6 +701,8 @@ pub enum AgentError {
     PermissionDenied(String),
     #[error("invalid built-in tool arguments: {0}")]
     InvalidBuiltInTool(String),
+    #[error("invalid tool result: {0}")]
+    InvalidToolResult(String),
     #[error("agent stopped before completing an answer: {0:?}")]
     Incomplete(FinishReason),
 }

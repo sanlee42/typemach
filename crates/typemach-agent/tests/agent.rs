@@ -20,6 +20,8 @@ use typemach_agent::{
 mod builtin_validation;
 #[path = "agent/final_answer.rs"]
 mod final_answer;
+#[path = "agent/tool_artifacts.rs"]
+mod tool_artifacts;
 
 #[derive(Clone, Default)]
 struct ScriptedModel {

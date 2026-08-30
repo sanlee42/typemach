@@ -10,7 +10,7 @@ use typemach::{
 };
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentRunInput, AgentRunOutput,
-    AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion,
+    AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools, Artifact, AskUserQuestion,
     AssistantMessagePhase, ConfiguredModel, ContentBlock, ToolAnnotations, ToolCallRequest,
     ToolRegistry, ToolResult, build_agent_runner,
 };
@@ -67,6 +67,18 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     assert!(input_has_type(&bodies[1], "function_call"));
     assert!(input_has_type(&bodies[1], "function_call_output"));
     assert_ordered_input_types(&bodies[1], &["function_call", "function_call_output"]);
+    let function_output = bodies[1]["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .and_then(|item| item["output"].as_str())
+        .expect("function call output");
+    assert_eq!(
+        serde_json::from_str::<Value>(function_output).expect("tool result content"),
+        json!({ "value": 42, "unit": "orders" })
+    );
+    assert!(!bodies[1].to_string().contains("Artifact-only review"));
     assert!(input_has_type(&bodies[1], "reasoning"));
     assert!(
         bodies[1]["input"]
@@ -83,6 +95,14 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
         .expect("checkpoint");
     let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
     assert_eq!(state.answer, completed.answer);
+    assert_eq!(state.artifacts, completed.artifacts);
+    assert_eq!(completed.artifacts.len(), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::Artifact { artifact },
+        } if artifact.title == "Artifact-only review"
+    )));
 }
 
 #[tokio::test]
@@ -366,10 +386,17 @@ impl ToolRegistry for FakeTools {
     }
 
     async fn call_tool(&self, request: ToolCallRequest) -> Result<ToolResult, AgentError> {
-        Ok(ToolResult::ok(
-            &request.tool_use,
-            json!({ "value": 42, "unit": "orders" }),
-        ))
+        ToolResult::ok(&request.tool_use, json!({ "value": 42, "unit": "orders" })).with_artifacts(
+            vec![Artifact {
+                tool_use_id: request.tool_use.id,
+                title: "Artifact-only review".to_string(),
+                kind: "markdown".to_string(),
+                content: "This text must not reach the model input.".to_string(),
+                source: None,
+                window: None,
+                updated_at: None,
+            }],
+        )
     }
 }
 
