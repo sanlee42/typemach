@@ -159,16 +159,8 @@ pub struct ModelRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelResponse {
-    #[serde(default)]
-    pub content: Vec<ContentBlock>,
-    #[serde(default)]
-    pub deltas: Vec<String>,
-    #[serde(default)]
-    pub tool_uses: Vec<ToolUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_text: Option<String>,
-    #[serde(default)]
-    pub final_answer: bool,
+    pub outcome: Option<ModelOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +169,13 @@ pub struct ModelResponse {
     pub raw: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelOutcome {
+    FinalAnswer { text: String },
+    ToolCalls { calls: Vec<ToolUse> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

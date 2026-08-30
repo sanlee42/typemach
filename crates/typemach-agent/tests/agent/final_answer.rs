@@ -7,19 +7,21 @@ use typemach_agent::AgentState;
 async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
-            final_text: Some("I will inspect the metric first.".to_string()),
-            tool_uses: vec![ToolUse {
-                id: "tool-1".to_string(),
-                name: "metric_point".to_string(),
-                input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            deltas: vec!["Order count is 42.".to_string()],
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Order count is 42.".to_string(),
+            }),
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -91,13 +93,14 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
 #[tokio::test]
 async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
     let model = ScriptedModel::new([ModelResponse {
-        deltas: vec!["Draft before terminal action.".to_string()],
-        tool_uses: vec![ToolUse {
-            id: "term-1".to_string(),
-            name: "report".to_string(),
-            input: json!({ "message": "Terminal message must not be appended." }),
-            raw: None,
-        }],
+        outcome: Some(ModelOutcome::ToolCalls {
+            calls: vec![ToolUse {
+                id: "term-1".to_string(),
+                name: "report".to_string(),
+                input: json!({ "message": "Terminal message must not be appended." }),
+                raw: None,
+            }],
+        }),
         stop_reason: Some(StopReason::ToolUse),
         ..ModelResponse::default()
     }]);
@@ -177,7 +180,9 @@ impl AgentModel for FailFirstFinalModel {
         match self.calls.fetch_add(1, Ordering::Relaxed) {
             0 => Err(AgentError::Model("final transport failed".to_string())),
             _ => Ok(ModelResponse {
-                final_text: Some("Recovered final answer.".to_string()),
+                outcome: Some(ModelOutcome::FinalAnswer {
+                    text: "Recovered final answer.".to_string(),
+                }),
                 stop_reason: Some(StopReason::EndTurn),
                 ..ModelResponse::default()
             }),
@@ -234,7 +239,6 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
 #[tokio::test]
 async fn final_refusal_fails_without_a_completed_output() {
     let model = ScriptedModel::new([ModelResponse {
-        deltas: vec!["Uncommitted partial text.".to_string()],
         stop_reason: Some(StopReason::Refusal),
         ..ModelResponse::default()
     }]);
@@ -254,7 +258,7 @@ async fn final_refusal_fails_without_a_completed_output() {
     ))
     .await;
 
-    assert!(events.iter().any(|event| matches!(
+    assert!(!events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
             signal: AgentSignal::FinalAnswerDelta { .. },
@@ -286,17 +290,21 @@ async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
     ] {
         let model = ScriptedModel::new([
             ModelResponse {
-                tool_uses: vec![ToolUse {
-                    id: "metric-1".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({}),
-                    raw: None,
-                }],
+                outcome: Some(ModelOutcome::ToolCalls {
+                    calls: vec![ToolUse {
+                        id: "metric-1".to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    }],
+                }),
                 stop_reason: Some(StopReason::ToolUse),
                 ..ModelResponse::default()
             },
             ModelResponse {
-                final_text: Some("Budgeted answer.".to_string()),
+                outcome: Some(ModelOutcome::FinalAnswer {
+                    text: "Budgeted answer.".to_string(),
+                }),
                 stop_reason: Some(StopReason::EndTurn),
                 ..ModelResponse::default()
             },
@@ -327,20 +335,24 @@ async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
 async fn oversized_tool_batch_is_not_partially_dispatched() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: ["metric-1", "metric-2"]
-                .into_iter()
-                .map(|id| ToolUse {
-                    id: id.to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({}),
-                    raw: None,
-                })
-                .collect(),
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: ["metric-1", "metric-2"]
+                    .into_iter()
+                    .map(|id| ToolUse {
+                        id: id.to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    })
+                    .collect(),
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("No partial evidence.".to_string()),
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "No partial evidence.".to_string(),
+            }),
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -382,8 +394,9 @@ async fn oversized_tool_batch_is_not_partially_dispatched() {
 #[tokio::test]
 async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
     let model = ScriptedModel::new([ModelResponse {
-        final_text: Some("The order count is 42.".to_string()),
-        final_answer: true,
+        outcome: Some(ModelOutcome::FinalAnswer {
+            text: "The order count is 42.".to_string(),
+        }),
         ..ModelResponse::default()
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
@@ -420,21 +433,24 @@ async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
 async fn valid_artifact_is_nonterminal_before_final_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-1".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({
-                    "title": "Review",
-                    "type": "markdown",
-                    "content": "Review body"
-                }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "artifact-1".to_string(),
+                    name: "emit_artifact".to_string(),
+                    input: json!({
+                        "title": "Review",
+                        "type": "markdown",
+                        "content": "Review body"
+                    }),
+                    raw: None,
+                }],
+            }),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("The review is ready.".to_string()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "The review is ready.".to_string(),
+            }),
             ..ModelResponse::default()
         },
     ]);

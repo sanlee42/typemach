@@ -6,7 +6,7 @@ use crate::deepseek::{
     tool_result_content,
 };
 use crate::{
-    AgentConfig, AgentError, AgentMessage, AgentToolSpec, ContentBlock, ModelRequest,
+    AgentConfig, AgentError, AgentMessage, AgentToolSpec, ContentBlock, ModelOutcome, ModelRequest,
     ModelResponse, SpeedProfile, StopReason, ToolUse, Usage,
 };
 
@@ -42,7 +42,9 @@ pub(crate) fn responses_request(
     request: ModelRequest,
 ) -> Result<ResponseRequest, AgentError> {
     let tools = tools_to_responses(&request.tools);
-    let tool_choice = if tools.is_empty() {
+    let tool_choice = if request.tool_choice == Some(crate::ToolChoice::None) {
+        Some("none")
+    } else if tools.is_empty() {
         None
     } else {
         request
@@ -69,40 +71,17 @@ pub(crate) async fn decode_response(
         .json()
         .await
         .map_err(|err| AgentError::Model(format!("model response was not JSON: {err}")))?;
-    model_response_from_value(raw, true)
+    model_response_from_value(raw)
 }
 
-pub(crate) fn model_response_from_value(
-    raw: Value,
-    include_message_text: bool,
-) -> Result<ModelResponse, AgentError> {
+pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, AgentError> {
     fail_if_error(&raw)?;
-    let mut content = Vec::new();
-    let mut saw_message = false;
-    let mut saw_tool = false;
-    if let Some(output) = raw.get("output").and_then(Value::as_array) {
-        for item in output {
-            match item.get("type").and_then(Value::as_str) {
-                Some("reasoning") => extend_reasoning(&mut content, item),
-                Some("message") => {
-                    saw_message = true;
-                    if include_message_text {
-                        extend_message(&mut content, item);
-                    }
-                }
-                Some("function_call") => {
-                    saw_tool = true;
-                    content.push(ContentBlock::ToolUse(tool_use_from_item(item)?));
-                }
-                _ => {}
-            }
-        }
-    }
+    let decoded = decode_output(&raw, true)?;
     let usage = raw.get("usage").cloned().map(decode_usage).transpose()?;
+    let stop_reason = stop_reason(&raw, &decoded);
     Ok(ModelResponse {
-        content,
-        final_answer: saw_message,
-        stop_reason: stop_reason(&raw, saw_tool, saw_message),
+        outcome: decoded.outcome,
+        stop_reason,
         response_id: raw
             .get("id")
             .and_then(Value::as_str)
@@ -111,6 +90,14 @@ pub(crate) fn model_response_from_value(
         usage,
         ..ModelResponse::default()
     })
+}
+
+pub(crate) fn model_response_shape(
+    raw: &Value,
+    include_message_text: bool,
+) -> Result<DecodedOutput, AgentError> {
+    fail_if_error(raw)?;
+    decode_output(raw, include_message_text)
 }
 
 pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
@@ -133,6 +120,13 @@ pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
         input: decode_arguments(arguments),
         raw: Some(item.clone()),
     })
+}
+
+#[derive(Debug)]
+pub(crate) struct DecodedOutput {
+    pub(crate) outcome: Option<ModelOutcome>,
+    pub(crate) message_seen: bool,
+    pub(crate) tool_seen: bool,
 }
 
 pub(crate) fn usage_from_value(value: Value) -> Result<Usage, AgentError> {
@@ -254,35 +248,6 @@ fn tools_to_responses(tools: &[AgentToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn extend_reasoning(content: &mut Vec<ContentBlock>, item: &Value) {
-    let Some(parts) = item.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    let text = parts
-        .iter()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<String>();
-    if !text.is_empty() {
-        content.push(ContentBlock::Thinking {
-            text,
-            signature: None,
-        });
-    }
-}
-
-fn extend_message(content: &mut Vec<ContentBlock>, item: &Value) {
-    let Some(parts) = item.get("content").and_then(Value::as_array) else {
-        return;
-    };
-    let text = parts
-        .iter()
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .collect::<String>();
-    if !text.is_empty() {
-        content.push(ContentBlock::Text { text });
-    }
-}
-
 fn fail_if_error(raw: &Value) -> Result<(), AgentError> {
     let status = raw.get("status").and_then(Value::as_str);
     if !matches!(status, Some("failed" | "cancelled")) {
@@ -296,16 +261,138 @@ fn fail_if_error(raw: &Value) -> Result<(), AgentError> {
     Err(AgentError::Model(message.to_string()))
 }
 
-fn stop_reason(raw: &Value, saw_tool: bool, saw_message: bool) -> Option<StopReason> {
-    if saw_tool {
-        return Some(StopReason::ToolUse);
+fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutput, AgentError> {
+    let output = raw
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AgentError::Model("responses output must be an array".to_string()))?;
+    let mut kind = OutputKind::Undecided;
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {}
+            Some("message") => {
+                let text = message_text(item)?;
+                kind = kind.message(if include_message_text {
+                    text
+                } else {
+                    String::new()
+                })?;
+            }
+            Some("function_call") => {
+                let call = tool_use_from_item(item)?;
+                kind = kind.function_call(call)?;
+            }
+            Some(other) => {
+                return Err(AgentError::Model(format!(
+                    "unsupported responses output item: {other}"
+                )));
+            }
+            None => {
+                return Err(AgentError::Model(
+                    "responses output item missing type".to_string(),
+                ));
+            }
+        }
     }
+    Ok(kind.into_decoded())
+}
+
+fn message_text(item: &Value) -> Result<String, AgentError> {
+    let parts = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AgentError::Model("message output missing content".to_string()))?;
+    let mut text = String::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text") => {
+                let part_text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AgentError::Model("output_text missing text".to_string()))?;
+                text.push_str(part_text);
+            }
+            Some("refusal") => {
+                return Err(AgentError::Model("model returned a refusal".to_string()));
+            }
+            Some(other) => {
+                return Err(AgentError::Model(format!(
+                    "unsupported message content item: {other}"
+                )));
+            }
+            None => {
+                return Err(AgentError::Model(
+                    "message content item missing type".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(text)
+}
+
+enum OutputKind {
+    Undecided,
+    Message(String),
+    FunctionCalls(Vec<ToolUse>),
+}
+
+impl OutputKind {
+    fn message(self, text: String) -> Result<Self, AgentError> {
+        match self {
+            Self::Undecided => Ok(Self::Message(text)),
+            Self::Message(mut existing) => {
+                existing.push_str(&text);
+                Ok(Self::Message(existing))
+            }
+            Self::FunctionCalls(_) => Err(AgentError::Model(
+                "responses output mixed messages and function calls".to_string(),
+            )),
+        }
+    }
+
+    fn function_call(self, call: ToolUse) -> Result<Self, AgentError> {
+        match self {
+            Self::Undecided => Ok(Self::FunctionCalls(vec![call])),
+            Self::FunctionCalls(mut calls) => {
+                calls.push(call);
+                Ok(Self::FunctionCalls(calls))
+            }
+            Self::Message(_) => Err(AgentError::Model(
+                "responses output mixed messages and function calls".to_string(),
+            )),
+        }
+    }
+
+    fn into_decoded(self) -> DecodedOutput {
+        match self {
+            Self::Undecided => DecodedOutput {
+                outcome: None,
+                message_seen: false,
+                tool_seen: false,
+            },
+            Self::Message(text) => DecodedOutput {
+                outcome: Some(ModelOutcome::FinalAnswer { text }),
+                message_seen: true,
+                tool_seen: false,
+            },
+            Self::FunctionCalls(calls) => DecodedOutput {
+                outcome: Some(ModelOutcome::ToolCalls { calls }),
+                message_seen: false,
+                tool_seen: true,
+            },
+        }
+    }
+}
+
+fn stop_reason(raw: &Value, decoded: &DecodedOutput) -> Option<StopReason> {
     match raw.get("status").and_then(Value::as_str) {
-        Some("completed") if saw_message => Some(StopReason::EndTurn),
         Some("incomplete") => Some(incomplete_reason(raw)),
+        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
+        Some("completed") if decoded.tool_seen => Some(StopReason::ToolUse),
         Some("failed") | Some("cancelled") => Some(StopReason::Refusal),
         Some(other) => Some(StopReason::Other(other.to_string())),
-        None if saw_message => Some(StopReason::EndTurn),
+        None if decoded.message_seen => Some(StopReason::EndTurn),
+        None if decoded.tool_seen => Some(StopReason::ToolUse),
         None => None,
     }
 }

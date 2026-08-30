@@ -11,14 +11,13 @@ use typemach::{
 mod context;
 pub use context::estimate_messages;
 mod deepseek;
-mod deepseek_stream;
 mod responses;
 mod responses_stream;
 pub use deepseek::ConfiguredModel;
 mod model_turn;
 mod phase;
 mod stream;
-pub use stream::{ModelDelta, ModelStream};
+pub use stream::{ModelStream, OutputTextDelta};
 
 mod sandbox;
 pub use sandbox::{
@@ -318,94 +317,43 @@ where
             planning_turn,
         )
         .await?;
-        let turn = model_turn::invoke(
-            self.model.as_ref(),
-            state,
-            ctx,
-            request,
-            model_turn::TextKind::Planning,
-        )
-        .await?;
-        if turn.stop_reason == Some(StopReason::MaxTokens) {
-            state.pending_tools.clear();
-            return Ok(Transition::Complete(state.output(FinishReason::MaxTokens)));
-        }
-        let tool_uses = turn
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolUse(tool) => Some(tool.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if tool_uses.is_empty() {
-            if turn.final_answer {
-                let reason = match turn.stop_reason.as_ref() {
-                    Some(StopReason::EndTurn | StopReason::StopSequence) | None => {
-                        FinishReason::Stop
-                    }
-                    Some(StopReason::MaxTokens) => FinishReason::MaxTokens,
-                    Some(StopReason::Refusal) => {
-                        return Err(
-                            AgentError::Model("final answer was refused".to_string()).machine()
-                        );
-                    }
-                    Some(StopReason::ToolUse) => {
-                        return Err(AgentError::Model(
-                            "final answer stopped for a tool call without returning one"
-                                .to_string(),
-                        )
-                        .machine());
-                    }
-                    Some(StopReason::Other(reason)) => {
-                        return Err(AgentError::Model(format!(
-                            "final answer stopped unexpectedly: {reason}"
-                        ))
-                        .machine());
-                    }
-                };
-                let content = turn
-                    .content
-                    .into_iter()
-                    .filter(|block| matches!(block, ContentBlock::Text { .. }))
-                    .collect::<Vec<_>>();
+        let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
+        match turn.outcome {
+            Some(model_turn::TurnOutcome::FinalAnswer(content)) => {
+                let reason = finish_reason(turn.stop_reason.as_ref())?;
                 state.messages = phase::final_messages(&state.messages);
                 if !content.is_empty() {
                     state.messages.push(AgentMessage::Assistant { content });
                 }
-                return Ok(Transition::Complete(
+                Ok(Transition::Complete(
                     state.output_with_answer(reason, state.answer.clone()),
-                ));
-            }
-            return match turn.stop_reason {
-                Some(StopReason::EndTurn) => Err(AgentError::Model(
-                    "planning ended without a typed final answer or tool calls".to_string(),
-                )
-                .machine()),
-                Some(reason) => Err(AgentError::Model(format!(
-                    "planning stopped without a tool or natural completion: {reason:?}"
                 ))
-                .machine()),
-                None => Err(AgentError::Model(
-                    "planning stopped without a tool or stop reason".to_string(),
-                )
-                .machine()),
-            };
+            }
+            Some(model_turn::TurnOutcome::ToolCalls(tool_uses)) => {
+                if turn.stop_reason == Some(StopReason::MaxTokens) {
+                    return Err(AgentError::Model(
+                        "planning stopped mid tool call at the output token limit".to_string(),
+                    )
+                    .machine());
+                }
+                if tool_uses.is_empty() {
+                    return Err(AgentError::Model(
+                        "model returned an empty tool call set".to_string(),
+                    )
+                    .machine());
+                }
+                state.pending_tools.extend(tool_uses.clone());
+                state.messages.push(AgentMessage::Assistant {
+                    content: tool_uses.into_iter().map(ContentBlock::ToolUse).collect(),
+                });
+                Ok(Transition::Next(AgentStep::DispatchTools))
+            }
+            None if turn.stop_reason == Some(StopReason::MaxTokens) => {
+                state.pending_tools.clear();
+                Ok(Transition::Complete(state.output(FinishReason::MaxTokens)))
+            }
+            None => Err(no_outcome_error(turn.stop_reason).machine()),
         }
-        if turn.final_answer {
-            return Err(AgentError::Model(
-                "model returned a final answer and tool calls in the same planning turn"
-                    .to_string(),
-            )
-            .machine());
-        }
-        state.pending_tools.extend(tool_uses);
-        if !turn.content.is_empty() {
-            state.messages.push(AgentMessage::Assistant {
-                content: turn.content,
-            });
-        }
-        Ok(Transition::Next(AgentStep::DispatchTools))
     }
 
     async fn final_answer_step(
@@ -426,50 +374,21 @@ where
             final_turn,
         )
         .await?;
-        let turn = model_turn::invoke(
-            self.model.as_ref(),
-            state,
-            ctx,
-            request,
-            model_turn::TextKind::FinalAnswer,
-        )
-        .await?;
-        if turn
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse(_)))
-        {
-            return Err(AgentError::Model(
-                "final answer step returned a tool call even though tools were disabled"
-                    .to_string(),
-            )
-            .machine());
-        }
-        let reason = match turn.stop_reason.as_ref() {
-            Some(StopReason::EndTurn | StopReason::StopSequence) | None => FinishReason::Stop,
-            Some(StopReason::MaxTokens) => FinishReason::MaxTokens,
-            Some(StopReason::Refusal) => {
-                return Err(AgentError::Model("final answer was refused".to_string()).machine());
-            }
-            Some(StopReason::ToolUse) => {
+        let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
+        let content = match turn.outcome {
+            Some(model_turn::TurnOutcome::FinalAnswer(content)) => content,
+            Some(model_turn::TurnOutcome::ToolCalls(_)) => {
                 return Err(AgentError::Model(
-                    "final answer stopped for a tool call without returning one".to_string(),
+                    "final answer step returned a tool call even though tools were disabled"
+                        .to_string(),
                 )
                 .machine());
             }
-            Some(StopReason::Other(reason)) => {
-                return Err(AgentError::Model(format!(
-                    "final answer stopped unexpectedly: {reason}"
-                ))
-                .machine());
-            }
+            None if turn.stop_reason == Some(StopReason::MaxTokens) => Vec::new(),
+            None => return Err(no_outcome_error(turn.stop_reason).machine()),
         };
+        let reason = finish_reason(turn.stop_reason.as_ref())?;
         state.messages = messages;
-        let content = turn
-            .content
-            .into_iter()
-            .filter(|block| matches!(block, ContentBlock::Text { .. }))
-            .collect::<Vec<_>>();
         if !content.is_empty() {
             state.messages.push(AgentMessage::Assistant { content });
         }
@@ -615,8 +534,8 @@ where
 
 /// A run started over an inherited transcript may find tool calls whose
 /// results never arrived (abandoned ask_user, disconnect mid-dispatch).
-/// Chat completion providers reject such transcripts outright, so close
-/// every dangling call with a synthetic error result.
+/// Provider protocols reject such transcripts outright, so close every
+/// dangling call with a synthetic error result.
 fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
     let mut resulted = std::collections::HashSet::new();
     for message in messages.iter() {
@@ -658,6 +577,35 @@ fn enter_final_answer(state: &mut AgentState) {
 fn planning_budget_exhausted(state: &AgentState) -> bool {
     state.model_turns >= state.budget.max_model_turns
         || state.tool_calls >= state.budget.max_tool_calls
+}
+
+fn finish_reason(reason: Option<&StopReason>) -> Result<FinishReason, MachineError> {
+    match reason {
+        Some(StopReason::EndTurn | StopReason::StopSequence) | None => Ok(FinishReason::Stop),
+        Some(StopReason::MaxTokens) => Ok(FinishReason::MaxTokens),
+        Some(StopReason::Refusal) => {
+            Err(AgentError::Model("final answer was refused".to_string()).machine())
+        }
+        Some(StopReason::ToolUse) => Err(AgentError::Model(
+            "final answer stopped for a tool call without returning one".to_string(),
+        )
+        .machine()),
+        Some(StopReason::Other(reason)) => {
+            Err(AgentError::Model(format!("final answer stopped unexpectedly: {reason}")).machine())
+        }
+    }
+}
+
+fn no_outcome_error(reason: Option<StopReason>) -> AgentError {
+    match reason {
+        Some(StopReason::EndTurn) => AgentError::Model(
+            "planning ended without a typed final answer or tool calls".to_string(),
+        ),
+        Some(reason) => AgentError::Model(format!(
+            "planning stopped without a tool or natural completion: {reason:?}"
+        )),
+        None => AgentError::Model("planning stopped without a tool or stop reason".to_string()),
+    }
 }
 
 async fn record_tool_result(

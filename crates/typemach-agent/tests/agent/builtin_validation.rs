@@ -42,28 +42,33 @@ impl ToolRegistry for BuiltinTools {
 async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "ask-bad".to_string(),
-                name: "ask_user".to_string(),
-                input: json!({ "question": " " }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "ask-bad".to_string(),
+                    name: "ask_user".to_string(),
+                    input: json!({ "question": " " }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "ask-good".to_string(),
-                name: "ask_user".to_string(),
-                input: json!({ "question": "Which date?" }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "ask-good".to_string(),
+                    name: "ask_user".to_string(),
+                    input: json!({ "question": "Which date?" }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("Order count is 42.".to_string()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Order count is 42.".to_string(),
+            }),
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -125,61 +130,70 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
 async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-missing-type".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({ "title": "Review", "content": "Review body" }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "artifact-missing-type".to_string(),
+                    name: "emit_artifact".to_string(),
+                    input: json!({ "title": "Review", "content": "Review body" }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-invalid-type".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({
-                    "title": "Review",
-                    "type": "chart",
-                    "content": "Review body"
-                }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "artifact-invalid-type".to_string(),
+                    name: "emit_artifact".to_string(),
+                    input: json!({
+                        "title": "Review",
+                        "type": "chart",
+                        "content": "Review body"
+                    }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-invalid-source".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({
-                    "title": "Review",
-                    "type": "markdown",
-                    "content": "Review body",
-                    "source": 42
-                }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "artifact-invalid-source".to_string(),
+                    name: "emit_artifact".to_string(),
+                    input: json!({
+                        "title": "Review",
+                        "type": "markdown",
+                        "content": "Review body",
+                        "source": 42
+                    }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "artifact-good".to_string(),
-                name: "emit_artifact".to_string(),
-                input: json!({
-                    "title": "Review",
-                    "type": "table",
-                    "content": "Review body"
-                }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "artifact-good".to_string(),
+                    name: "emit_artifact".to_string(),
+                    input: json!({
+                        "title": "Review",
+                        "type": "table",
+                        "content": "Review body"
+                    }),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("Review created.".to_string()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Review created.".to_string(),
+            }),
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },

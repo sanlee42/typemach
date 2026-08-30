@@ -10,9 +10,10 @@ use typemach::{
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentModel, AgentRunInput,
     AgentRunOutput, AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools,
-    AskUserQuestion, ContentBlock, ContextPolicy, FinishReason, HumanInputAnswer, ModelRequest,
-    ModelResponse, ModelStream, StopReason, TerminalAction, ToolAnnotations, ToolCallRequest,
-    ToolRegistry, ToolResult, ToolUse, build_agent_runner, build_agent_runner_with_context_policy,
+    AskUserQuestion, ContentBlock, ContextPolicy, FinishReason, HumanInputAnswer, ModelOutcome,
+    ModelRequest, ModelResponse, ModelStream, StopReason, TerminalAction, ToolAnnotations,
+    ToolCallRequest, ToolRegistry, ToolResult, ToolUse, build_agent_runner,
+    build_agent_runner_with_context_policy,
 };
 
 #[path = "agent/builtin_validation.rs"]
@@ -44,26 +45,14 @@ impl AgentModel for ScriptedModel {
     async fn next_step(
         &self,
         request: ModelRequest,
-        stream: ModelStream,
+        _stream: ModelStream,
     ) -> Result<ModelResponse, AgentError> {
         self.requests.lock().expect("requests lock").push(request);
-        let response = self
-            .responses
+        self.responses
             .lock()
             .expect("responses lock")
             .pop_front()
-            .ok_or_else(|| AgentError::Model("script exhausted".to_string()))?;
-        for delta in &response.deltas {
-            if response.final_answer {
-                stream.final_delta(delta.clone())?;
-            } else {
-                stream.delta(delta.clone())?;
-            }
-        }
-        Ok(ModelResponse {
-            deltas: Vec::new(),
-            ..response
-        })
+            .ok_or_else(|| AgentError::Model("script exhausted".to_string()))
     }
 }
 
@@ -183,17 +172,20 @@ async fn collect(
 async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "ask-1".to_string(),
-                name: "ask_user".to_string(),
-                input: json!({ "question": "Which date?", "fields": { "type": "choice" } }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "ask-1".to_string(),
+                    name: "ask_user".to_string(),
+                    input: json!({ "question": "Which date?", "fields": { "type": "choice" } }),
+                    raw: None,
+                }],
+            }),
             ..ModelResponse::default()
         },
         ModelResponse {
-            deltas: vec!["On 2026-06-08, the order count is 42.".to_string()],
-            final_text: Some(String::new()),
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "On 2026-06-08, the order count is 42.".to_string(),
+            }),
             ..ModelResponse::default()
         },
     ]);
@@ -295,28 +287,23 @@ async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
 async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
-            content: vec![
-                ContentBlock::Thinking {
-                    text: "I should inspect the metric.".to_string(),
-                    signature: Some("sig-1".to_string()),
-                },
-                ContentBlock::ToolUse(ToolUse {
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
                     input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
                     raw: Some(json!({ "id": "tool-1", "index": 0 })),
-                }),
-            ],
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             response_id: Some("msg-1".to_string()),
             raw: Some(json!({ "id": "msg-1" })),
             ..ModelResponse::default()
         },
         ModelResponse {
-            content: vec![ContentBlock::Text {
+            outcome: Some(ModelOutcome::FinalAnswer {
                 text: "The order count is 42.".to_string(),
-            }],
-            final_answer: true,
+            }),
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -350,12 +337,14 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
 #[tokio::test]
 async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let model = ScriptedModel::new([ModelResponse {
-        tool_uses: vec![ToolUse {
-            id: "term-1".to_string(),
-            name: "report".to_string(),
-            input: json!({ "message": "Not enough evidence to continue." }),
-            raw: None,
-        }],
+        outcome: Some(ModelOutcome::ToolCalls {
+            calls: vec![ToolUse {
+                id: "term-1".to_string(),
+                name: "report".to_string(),
+                input: json!({ "message": "Not enough evidence to continue." }),
+                raw: None,
+            }],
+        }),
         stop_reason: Some(StopReason::ToolUse),
         ..ModelResponse::default()
     }]);
@@ -389,8 +378,9 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
 #[tokio::test]
 async fn compacted_prompt_window_does_not_drop_persisted_messages() {
     let model = ScriptedModel::new([ModelResponse {
-        final_text: Some("Continue.".to_string()),
-        final_answer: true,
+        outcome: Some(ModelOutcome::FinalAnswer {
+            text: "Continue.".to_string(),
+        }),
         ..ModelResponse::default()
     }]);
     let context_policy = ContextPolicy {
@@ -446,18 +436,21 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
 async fn large_tool_result_is_archived_before_next_prompt() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "tool-1".to_string(),
-                name: "large_evidence".to_string(),
-                input: json!({}),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "large_evidence".to_string(),
+                    input: json!({}),
+                    raw: None,
+                }],
+            }),
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("Evidence loaded.".to_string()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Evidence loaded.".to_string(),
+            }),
             ..ModelResponse::default()
         },
     ]);
@@ -538,18 +531,20 @@ fn content_block_serde_shape_is_flat_and_defaults_annotations() {
 async fn abandoned_ask_user_is_repaired_on_next_start() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "ask-1".to_string(),
-                name: "ask_user".to_string(),
-                input: json!({ "question": "Which date?" }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "ask-1".to_string(),
+                    name: "ask_user".to_string(),
+                    input: json!({ "question": "Which date?" }),
+                    raw: None,
+                }],
+            }),
             ..ModelResponse::default()
         },
         ModelResponse {
-            deltas: vec!["There are 7 units in stock.".to_string()],
-            final_text: Some(String::new()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "There are 7 units in stock.".to_string(),
+            }),
             ..ModelResponse::default()
         },
     ]);
@@ -633,17 +628,20 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
 async fn system_suffix_reaches_model_request_and_survives_resume() {
     let model = ScriptedModel::new([
         ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "ask-1".to_string(),
-                name: "ask_user".to_string(),
-                input: json!({ "question": "Which date?" }),
-                raw: None,
-            }],
+            outcome: Some(ModelOutcome::ToolCalls {
+                calls: vec![ToolUse {
+                    id: "ask-1".to_string(),
+                    name: "ask_user".to_string(),
+                    input: json!({ "question": "Which date?" }),
+                    raw: None,
+                }],
+            }),
             ..ModelResponse::default()
         },
         ModelResponse {
-            final_text: Some("Done.".to_string()),
-            final_answer: true,
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Done.".to_string(),
+            }),
             ..ModelResponse::default()
         },
     ]);
@@ -706,17 +704,16 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
 }
 
 #[tokio::test]
-async fn max_tokens_does_not_commit_a_partial_answer_or_dispatch_tools() {
+async fn max_tokens_does_not_dispatch_truncated_tool_calls() {
     let model = ScriptedModel::new([ModelResponse {
-        content: vec![ContentBlock::Text {
-            text: "Partial answer".to_string(),
-        }],
-        tool_uses: vec![ToolUse {
-            id: "tool-1".to_string(),
-            name: "metric_point".to_string(),
-            input: json!({ "metric_id": "paid_order_cou" }),
-            raw: None,
-        }],
+        outcome: Some(ModelOutcome::ToolCalls {
+            calls: vec![ToolUse {
+                id: "tool-1".to_string(),
+                name: "metric_point".to_string(),
+                input: json!({ "metric_id": "paid_order_cou" }),
+                raw: None,
+            }],
+        }),
         stop_reason: Some(StopReason::MaxTokens),
         ..ModelResponse::default()
     }]);
@@ -741,13 +738,10 @@ async fn max_tokens_does_not_commit_a_partial_answer_or_dispatch_tools() {
         )),
         "truncated tool calls must not dispatch"
     );
-    let completed = completed(&events);
-    assert_eq!(completed.finish_reason, FinishReason::MaxTokens);
-    assert_eq!(completed.answer, "");
-    assert!(!completed.messages.iter().any(|message| matches!(
-        message,
-        AgentMessage::Assistant { content }
-            if content.iter().any(|block| matches!(block, ContentBlock::Text { .. }))
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Failed { error }
+            if error.to_string().contains("planning stopped mid tool call at the output token limit")
     )));
 }
 

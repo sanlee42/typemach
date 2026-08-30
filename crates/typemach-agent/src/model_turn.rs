@@ -3,19 +3,18 @@ use typemach::MachineError;
 
 use crate::{
     AgentMessage, AgentModel, AgentRunContext, AgentSignal, AgentState, AgentToolSpec,
-    ContentBlock, ModelDelta, ModelRequest, ModelStream, StopReason, ToolChoice, context,
+    ContentBlock, ModelOutcome, ModelRequest, ModelStream, OutputTextDelta, StopReason, ToolChoice,
+    ToolUse, context,
 };
 
-#[derive(Clone, Copy)]
-pub(super) enum TextKind {
-    Planning,
-    FinalAnswer,
+pub(super) struct Turn {
+    pub(super) outcome: Option<TurnOutcome>,
+    pub(super) stop_reason: Option<StopReason>,
 }
 
-pub(super) struct Turn {
-    pub(super) content: Vec<ContentBlock>,
-    pub(super) stop_reason: Option<StopReason>,
-    pub(super) final_answer: bool,
+pub(super) enum TurnOutcome {
+    FinalAnswer(Vec<ContentBlock>),
+    ToolCalls(Vec<ToolUse>),
 }
 
 pub(super) async fn prepare(
@@ -54,7 +53,6 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
     state: &mut AgentState,
     ctx: &AgentRunContext,
     request: ModelRequest,
-    kind: TextKind,
 ) -> Result<Turn, MachineError> {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
     let response = model.next_step(request, ModelStream::new(delta_tx));
@@ -64,60 +62,32 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
         tokio::select! {
             maybe_delta = delta_rx.recv() => {
                 if let Some(delta) = maybe_delta {
-                    append_delta(state, ctx, &mut content, delta, kind).await?;
+                    append_delta(state, ctx, &mut content, delta).await?;
                 }
             }
             response = &mut response => break response.map_err(MachineError::transition)?,
         }
     };
     while let Ok(delta) = delta_rx.try_recv() {
-        append_delta(state, ctx, &mut content, delta, kind).await?;
-    }
-    for delta in response.deltas {
-        append_text(
-            state,
-            ctx,
-            &mut content,
-            delta,
-            text_kind(kind, response.final_answer),
-        )
-        .await?;
+        append_delta(state, ctx, &mut content, delta).await?;
     }
     if let Some(usage) = response.usage {
         state.usage.input_tokens += usage.input_tokens;
         state.usage.output_tokens += usage.output_tokens;
         ctx.emit(AgentSignal::Usage { usage }).await?;
     }
-    for block in response.content {
-        record_block(
-            state,
-            ctx,
-            &mut content,
-            block,
-            text_kind(kind, response.final_answer),
-        )
-        .await?;
-    }
-    content.extend(response.tool_uses.into_iter().map(ContentBlock::ToolUse));
-    if let Some(text) = response.final_text
-        && !text.is_empty()
-        && !content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text { .. }))
-    {
-        append_text(
-            state,
-            ctx,
-            &mut content,
-            text,
-            text_kind(kind, response.final_answer),
-        )
-        .await?;
-    }
+    let outcome = match response.outcome {
+        Some(ModelOutcome::FinalAnswer { text }) => {
+            append_text(state, ctx, &mut content, text).await?;
+            Some(TurnOutcome::FinalAnswer(content))
+        }
+        Some(ModelOutcome::ToolCalls { calls }) => Some(TurnOutcome::ToolCalls(calls)),
+        None if content.is_empty() => None,
+        None => Some(TurnOutcome::FinalAnswer(content)),
+    };
     Ok(Turn {
-        content,
+        outcome,
         stop_reason: response.stop_reason,
-        final_answer: response.final_answer,
     })
 }
 
@@ -125,25 +95,9 @@ async fn append_delta(
     state: &mut AgentState,
     ctx: &AgentRunContext,
     content: &mut Vec<ContentBlock>,
-    delta: ModelDelta,
-    kind: TextKind,
+    delta: OutputTextDelta,
 ) -> Result<(), MachineError> {
-    append_text(
-        state,
-        ctx,
-        content,
-        delta.text,
-        text_kind(kind, delta.final_answer),
-    )
-    .await
-}
-
-fn text_kind(kind: TextKind, final_answer: bool) -> TextKind {
-    if final_answer {
-        TextKind::FinalAnswer
-    } else {
-        kind
-    }
+    append_text(state, ctx, content, delta.0).await
 }
 
 async fn append_text(
@@ -151,39 +105,17 @@ async fn append_text(
     ctx: &AgentRunContext,
     content: &mut Vec<ContentBlock>,
     delta: String,
-    kind: TextKind,
 ) -> Result<(), MachineError> {
     if delta.is_empty() {
         return Ok(());
     }
-    match kind {
-        TextKind::Planning => {}
-        TextKind::FinalAnswer => {
-            state.answer.push_str(&delta);
-            ctx.emit(AgentSignal::FinalAnswerDelta {
-                delta: delta.clone(),
-                index: state.next_final_delta_index,
-            })
-            .await?;
-            state.next_final_delta_index += 1;
-        }
-    }
+    state.answer.push_str(&delta);
+    ctx.emit(AgentSignal::FinalAnswerDelta {
+        delta: delta.clone(),
+        index: state.next_final_delta_index,
+    })
+    .await?;
+    state.next_final_delta_index += 1;
     content.push(ContentBlock::Text { text: delta });
     Ok(())
-}
-
-async fn record_block(
-    state: &mut AgentState,
-    ctx: &AgentRunContext,
-    content: &mut Vec<ContentBlock>,
-    block: ContentBlock,
-    kind: TextKind,
-) -> Result<(), MachineError> {
-    match block {
-        ContentBlock::Text { text } => append_text(state, ctx, content, text, kind).await,
-        other => {
-            content.push(other);
-            Ok(())
-        }
-    }
 }
