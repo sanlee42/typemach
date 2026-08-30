@@ -3,8 +3,8 @@ use typemach::MachineError;
 
 use crate::{
     AgentMessage, AgentModel, AgentRunContext, AgentSignal, AgentState, AgentToolSpec,
-    ContentBlock, ModelOutcome, ModelRequest, ModelStream, OutputTextDelta, StopReason, ToolChoice,
-    ToolUse, context,
+    AssistantMessageId, AssistantMessagePhase, ContentBlock, ModelOutcome, ModelRequest,
+    ModelStream, OutputTextDelta, StopReason, ToolChoice, ToolUse, context,
 };
 
 pub(super) struct Turn {
@@ -13,7 +13,10 @@ pub(super) struct Turn {
 }
 
 pub(super) enum TurnOutcome {
-    FinalAnswer(Vec<ContentBlock>),
+    FinalAnswer {
+        content: Vec<ContentBlock>,
+        text: String,
+    },
     ToolCalls {
         content: Vec<ContentBlock>,
         calls: Vec<ToolUse>,
@@ -58,21 +61,40 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
     request: ModelRequest,
 ) -> Result<Turn, MachineError> {
     let (delta_tx, mut delta_rx) = mpsc::unbounded_channel();
+    let message_id = assistant_message_id(ctx, request.turn);
     let response = model.next_step(request, ModelStream::new(delta_tx));
     tokio::pin!(response);
     let mut content = Vec::new();
+    let mut message_text = String::new();
+    let mut next_index = 0;
     let response = loop {
         tokio::select! {
             maybe_delta = delta_rx.recv() => {
                 if let Some(delta) = maybe_delta {
-                    append_delta(state, ctx, &mut content, delta).await?;
+                    append_delta(
+                        ctx,
+                        &message_id,
+                        &mut content,
+                        &mut message_text,
+                        &mut next_index,
+                        delta,
+                    )
+                    .await?;
                 }
             }
             response = &mut response => break response.map_err(MachineError::transition)?,
         }
     };
     while let Ok(delta) = delta_rx.try_recv() {
-        append_delta(state, ctx, &mut content, delta).await?;
+        append_delta(
+            ctx,
+            &message_id,
+            &mut content,
+            &mut message_text,
+            &mut next_index,
+            delta,
+        )
+        .await?;
     }
     if let Some(usage) = response.usage {
         state.usage.input_tokens += usage.input_tokens;
@@ -81,18 +103,52 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
     }
     let reasoning = reasoning_blocks(response.reasoning);
     let outcome = match response.outcome {
-        Some(ModelOutcome::FinalAnswer { text }) => {
+        Some(ModelOutcome::FinalAnswer { text: completed }) => {
             let mut final_content = reasoning;
             final_content.extend(content);
-            if completed_text_allowed(response.stop_reason.as_ref()) {
-                append_text(state, ctx, &mut final_content, text).await?;
+            if terminal_text_allowed(response.stop_reason.as_ref()) {
+                append_completed_text(
+                    ctx,
+                    &message_id,
+                    &mut final_content,
+                    &mut message_text,
+                    &mut next_index,
+                    completed,
+                )
+                .await?;
+                ctx.emit(AgentSignal::AssistantMessageDone {
+                    message_id,
+                    phase: AssistantMessagePhase::FinalAnswer,
+                })
+                .await?;
             }
-            Some(TurnOutcome::FinalAnswer(final_content))
+            Some(TurnOutcome::FinalAnswer {
+                content: final_content,
+                text: message_text,
+            })
         }
-        Some(ModelOutcome::ToolCalls { text, calls }) => {
+        Some(ModelOutcome::ToolCalls {
+            text: completed,
+            calls,
+        }) => {
             let mut call_content = reasoning;
             call_content.extend(content);
-            append_text(state, ctx, &mut call_content, text).await?;
+            if completed_tool_calls(response.stop_reason.as_ref()) {
+                append_completed_text(
+                    ctx,
+                    &message_id,
+                    &mut call_content,
+                    &mut message_text,
+                    &mut next_index,
+                    completed,
+                )
+                .await?;
+                ctx.emit(AgentSignal::AssistantMessageDone {
+                    message_id,
+                    phase: AssistantMessagePhase::Commentary,
+                })
+                .await?;
+            }
             call_content.extend(calls.iter().cloned().map(ContentBlock::ToolUse));
             Some(TurnOutcome::ToolCalls {
                 content: call_content,
@@ -103,7 +159,17 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
         None => {
             let mut final_content = reasoning;
             final_content.extend(content);
-            Some(TurnOutcome::FinalAnswer(final_content))
+            if terminal_text_allowed(response.stop_reason.as_ref()) {
+                ctx.emit(AgentSignal::AssistantMessageDone {
+                    message_id,
+                    phase: AssistantMessagePhase::FinalAnswer,
+                })
+                .await?;
+            }
+            Some(TurnOutcome::FinalAnswer {
+                content: final_content,
+                text: message_text,
+            })
         }
     };
     Ok(Turn {
@@ -123,38 +189,65 @@ fn reasoning_blocks(reasoning: Vec<String>) -> Vec<ContentBlock> {
         .collect()
 }
 
-fn completed_text_allowed(reason: Option<&StopReason>) -> bool {
+fn terminal_text_allowed(reason: Option<&StopReason>) -> bool {
     matches!(
         reason,
-        Some(StopReason::EndTurn | StopReason::StopSequence | StopReason::MaxTokens) | None
+        Some(StopReason::EndTurn | StopReason::StopSequence) | None
     )
 }
 
+fn completed_tool_calls(reason: Option<&StopReason>) -> bool {
+    matches!(reason, Some(StopReason::ToolUse) | None)
+}
+
 async fn append_delta(
-    state: &mut AgentState,
     ctx: &AgentRunContext,
+    message_id: &AssistantMessageId,
     content: &mut Vec<ContentBlock>,
+    text: &mut String,
+    next_index: &mut usize,
     delta: OutputTextDelta,
 ) -> Result<(), MachineError> {
-    append_text(state, ctx, content, delta.0).await
+    append_text(ctx, message_id, content, text, next_index, delta.0).await
 }
 
 async fn append_text(
-    state: &mut AgentState,
     ctx: &AgentRunContext,
+    message_id: &AssistantMessageId,
     content: &mut Vec<ContentBlock>,
+    text: &mut String,
+    next_index: &mut usize,
     delta: String,
 ) -> Result<(), MachineError> {
     if delta.is_empty() {
         return Ok(());
     }
-    state.answer.push_str(&delta);
-    ctx.emit(AgentSignal::FinalAnswerDelta {
+    text.push_str(&delta);
+    ctx.emit(AgentSignal::AssistantMessageDelta {
+        message_id: message_id.clone(),
         delta: delta.clone(),
-        index: state.next_final_delta_index,
+        index: *next_index,
     })
     .await?;
-    state.next_final_delta_index += 1;
+    *next_index += 1;
     content.push(ContentBlock::Text { text: delta });
     Ok(())
+}
+
+async fn append_completed_text(
+    ctx: &AgentRunContext,
+    message_id: &AssistantMessageId,
+    content: &mut Vec<ContentBlock>,
+    text: &mut String,
+    next_index: &mut usize,
+    completed: String,
+) -> Result<(), MachineError> {
+    if text.is_empty() {
+        append_text(ctx, message_id, content, text, next_index, completed).await?;
+    }
+    Ok(())
+}
+
+fn assistant_message_id(ctx: &AgentRunContext, turn: u32) -> AssistantMessageId {
+    AssistantMessageId::new(format!("{}:turn-{turn}", ctx.run_id.as_str()))
 }

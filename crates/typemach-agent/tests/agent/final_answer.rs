@@ -1,5 +1,7 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::time::sleep;
 use typemach::CheckpointSaver;
 use typemach_agent::AgentState;
 
@@ -58,12 +60,6 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
             signal: AgentSignal::ToolResult { tool_use_id, .. },
         } if tool_use_id == "tool-1"
     )));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantDelta { .. },
-        }
-    )));
     assert_eq!(model.requests().len(), 2);
     assert_eq!(completed(&events).answer, "Order count is 42.");
     let requests = model.requests();
@@ -86,8 +82,26 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
-            signal: AgentSignal::FinalAnswerDelta { delta, index },
+            signal: AgentSignal::AssistantMessageDelta { delta, index, .. },
         } if delta == "Order count is 42." && *index == 0
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDone {
+                phase: AssistantMessagePhase::Commentary,
+                ..
+            },
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDone {
+                phase: AssistantMessagePhase::FinalAnswer,
+                ..
+            },
+        }
     )));
 }
 
@@ -123,7 +137,7 @@ async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantDelta { delta, .. },
+                signal: AgentSignal::AssistantMessageDelta { delta, .. },
             } => Some(delta.as_str()),
             _ => None,
         })
@@ -163,6 +177,174 @@ impl ToolRegistry for CountingTools {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(ToolResult::ok(&request.tool_use, json!({ "value": 42 })))
     }
+}
+
+#[derive(Clone)]
+struct BatchTools {
+    annotations: ToolAnnotations,
+    list_calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+impl BatchTools {
+    fn new(annotations: ToolAnnotations) -> Self {
+        Self {
+            annotations,
+            list_calls: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            max_active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolRegistry for BatchTools {
+    async fn list_tools(&self, _context: &Value) -> Result<Vec<AgentToolSpec>, AgentError> {
+        self.list_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(vec![AgentToolSpec {
+            name: "metric_point".to_string(),
+            description: "read metric point".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: Value::Null,
+            metadata: Value::Null,
+            annotations: self.annotations,
+        }])
+    }
+
+    async fn call_tool(&self, request: ToolCallRequest) -> Result<ToolResult, AgentError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        raise_max(&self.max_active, active);
+        if request.tool_use.id == "tool-1" {
+            sleep(Duration::from_millis(40)).await;
+        } else {
+            sleep(Duration::from_millis(10)).await;
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolResult::ok(
+            &request.tool_use,
+            json!({ "id": request.tool_use.id }),
+        ))
+    }
+}
+
+fn raise_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(next) => current = next,
+        }
+    }
+}
+
+#[tokio::test]
+async fn eligible_read_only_batch_overlaps_and_preserves_result_order() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
+                calls: ["tool-1", "tool-2"]
+                    .into_iter()
+                    .map(|id| ToolUse {
+                        id: id.to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    })
+                    .collect(),
+            }),
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Done.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        },
+    ]);
+    let tools = BatchTools::new(ToolAnnotations::default());
+    let list_calls = tools.list_calls.clone();
+    let max_active = tools.max_active.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
+
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Read both metrics")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
+    assert_eq!(completed(&events).answer, "Done.");
+}
+
+#[tokio::test]
+async fn unsafe_batch_stays_sequential() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
+                calls: ["tool-1", "tool-2"]
+                    .into_iter()
+                    .map(|id| ToolUse {
+                        id: id.to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    })
+                    .collect(),
+            }),
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Done.".to_string(),
+            }),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        },
+    ]);
+    let tools = BatchTools::new(ToolAnnotations {
+        read_only: false,
+        destructive: true,
+        ..ToolAnnotations::default()
+    });
+    let list_calls = tools.list_calls.clone();
+    let max_active = tools.max_active.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
+
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Write both metrics")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 1,
+                max_tool_calls: 4,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(list_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
 }
 
 #[derive(Clone, Default)]
@@ -283,7 +465,10 @@ async fn final_phase_rejects_refusal_and_tool_calls() {
         assert!(!events.iter().any(|event| matches!(
             event,
             RunStreamEvent::Signal {
-                signal: AgentSignal::FinalAnswerDelta { .. } | AgentSignal::ToolStarted { .. },
+                signal: AgentSignal::AssistantMessageDone {
+                    phase: AssistantMessagePhase::FinalAnswer,
+                    ..
+                } | AgentSignal::ToolStarted { .. },
             }
         )));
         assert!(
@@ -392,17 +577,17 @@ async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(model.requests().len(), 2);
-        assert_eq!(completed(&events).answer, "Checking. Budgeted answer.");
+        assert_eq!(completed(&events).answer, "Budgeted answer.");
         let deltas = events
             .iter()
             .filter_map(|event| match event {
                 RunStreamEvent::Signal {
-                    signal: AgentSignal::FinalAnswerDelta { delta, index },
+                    signal: AgentSignal::AssistantMessageDelta { delta, index, .. },
                 } => Some((delta.as_str(), *index)),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(deltas, [("Checking. ", 0), ("Budgeted answer.", 1)]);
+        assert_eq!(deltas, [("Checking. ", 0), ("Budgeted answer.", 0)]);
     }
 }
 
@@ -491,8 +676,17 @@ async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
-            signal: AgentSignal::FinalAnswerDelta { delta, .. },
+            signal: AgentSignal::AssistantMessageDelta { delta, .. },
         } if delta == "The order count is 42."
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::AssistantMessageDone {
+                phase: AssistantMessagePhase::FinalAnswer,
+                ..
+            },
+        }
     )));
     let output = completed(&events);
     assert_eq!(output.answer, "The order count is 42.");
@@ -558,4 +752,18 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
     assert_eq!(completed(&events).finish_reason, FinishReason::Stop);
     assert_eq!(completed(&events).answer, "The review is ready.");
     assert_eq!(model.requests().len(), 2);
+}
+
+fn tool_result_ids(
+    events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
+) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunStreamEvent::Signal {
+                signal: AgentSignal::ToolResult { tool_use_id, .. },
+            } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
