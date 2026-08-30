@@ -7,8 +7,11 @@ use serde_json::{Value, json};
 #[serde(rename_all = "snake_case")]
 pub enum AgentStep {
     PrepareTurn,
+    /// Tool-required planning and tool selection.
     ModelStep,
     DispatchTools,
+    /// Checkpointed, tool-free production of the authoritative answer.
+    FinalAnswer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +151,10 @@ pub struct ModelRequest {
     pub turn: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_suffix: Option<String>,
+    /// Per-call policy. Agent lifecycle phases override the configured
+    /// transport default without changing the provider/model settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -439,7 +446,13 @@ pub struct TerminalAction {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSignal {
+    /// Legacy serialized shape. Planning text is internal and no longer emits it.
     AssistantDelta {
+        delta: String,
+        index: usize,
+    },
+    /// A user-visible fragment of the authoritative final answer.
+    FinalAnswerDelta {
         delta: String,
         index: usize,
     },
@@ -480,6 +493,8 @@ pub enum AgentSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBudget {
+    /// Maximum planning model calls. A validated `respond` permits one
+    /// additional tool-free final-answer call.
     pub max_model_turns: u32,
     pub max_tool_calls: u32,
 }
@@ -548,6 +563,8 @@ pub struct AgentState {
     pub model_turns: u32,
     pub tool_calls: u32,
     pub next_delta_index: usize,
+    #[serde(default)]
+    pub next_final_delta_index: usize,
     pub pending_tools: VecDeque<ToolUse>,
     pub pending_human: Option<ToolUse>,
     pub human_input: Option<HumanInputAnswer>,
@@ -573,4 +590,38 @@ pub enum AgentError {
     PermissionDenied(String),
     #[error("invalid built-in tool arguments: {0}")]
     InvalidBuiltInTool(String),
+}
+
+#[cfg(test)]
+mod checkpoint_compatibility {
+    use super::*;
+
+    #[test]
+    fn old_state_defaults_final_delta_index_and_step_remains_planning() {
+        let state: AgentState = serde_json::from_value(json!({
+            "messages": [],
+            "context": null,
+            "budget": { "max_model_turns": 4, "max_tool_calls": 8 },
+            "model_turns": 1,
+            "tool_calls": 0,
+            "next_delta_index": 2,
+            "pending_tools": [],
+            "pending_human": null,
+            "human_input": null,
+            "answer": "",
+            "usage": { "input_tokens": 0, "output_tokens": 0 },
+            "artifacts": [],
+            "terminal": null
+        }))
+        .expect("deserialize legacy state");
+        let step: AgentStep =
+            serde_json::from_value(json!("model_step")).expect("deserialize legacy planning step");
+
+        assert_eq!(state.next_final_delta_index, 0);
+        assert_eq!(step, AgentStep::ModelStep);
+        assert_eq!(
+            serde_json::to_value(AgentStep::FinalAnswer).expect("serialize final step"),
+            json!("final_answer")
+        );
+    }
 }

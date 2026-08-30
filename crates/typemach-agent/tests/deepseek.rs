@@ -45,6 +45,7 @@ async fn flash_request_disables_thinking_and_decodes_tool_call() {
                 context: Value::Null,
                 turn: 1,
                 system_suffix: None,
+                tool_choice: None,
             },
             stream,
         )
@@ -102,6 +103,7 @@ async fn auto_thinking_request_enables_thinking_with_effort() {
                 context: Value::Null,
                 turn: 1,
                 system_suffix: None,
+                tool_choice: None,
             },
             stream,
         )
@@ -180,6 +182,7 @@ async fn streaming_emits_text_and_assembles_tool_call() {
                 context: Value::Null,
                 turn: 1,
                 system_suffix: None,
+                tool_choice: None,
             },
             stream,
         )
@@ -226,6 +229,7 @@ async fn system_suffix_is_appended_to_system_message() {
                 context: Value::Null,
                 turn: 1,
                 system_suffix: Some("当前店铺:demo。".to_string()),
+                tool_choice: None,
             },
             stream,
         )
@@ -262,6 +266,7 @@ async fn system_suffix_is_appended_to_system_message() {
                 context: Value::Null,
                 turn: 1,
                 system_suffix: Some("当前店铺:demo。".to_string()),
+                tool_choice: None,
             },
             stream,
         )
@@ -297,6 +302,7 @@ fn plain_request() -> ModelRequest {
         context: Value::Null,
         turn: 1,
         system_suffix: None,
+        tool_choice: None,
     }
 }
 
