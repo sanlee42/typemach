@@ -401,7 +401,7 @@ where
                         content: turn.content,
                     });
                 }
-                reject_batch(state, ctx, &tool_uses, &reason).await?;
+                record_protocol_errors(state, &tool_uses, &reason);
                 Ok(Transition::Next(AgentStep::ModelStep))
             }
         }
@@ -626,22 +626,14 @@ fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
     }
 }
 
-async fn reject_batch(
-    state: &mut AgentState,
-    ctx: &AgentRunContext,
-    tool_uses: &[ToolUse],
-    reason: &str,
-) -> Result<(), MachineError> {
+fn record_protocol_errors(state: &mut AgentState, tool_uses: &[ToolUse], reason: &str) {
     for tool_use in tool_uses {
-        state.tool_calls += 1;
-        ctx.emit(AgentSignal::ToolStarted {
-            tool_use_id: tool_use.id.clone(),
-            name: tool_use.name.clone(),
-        })
-        .await?;
-        record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
+        state
+            .messages
+            .push(AgentMessage::tool_result(ToolResult::error(
+                tool_use, reason,
+            )));
     }
-    Ok(())
 }
 
 async fn record_tool_result(
