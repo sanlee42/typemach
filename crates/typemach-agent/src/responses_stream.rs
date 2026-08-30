@@ -61,7 +61,6 @@ pub(crate) async fn decode_stream(
         pending.extend_from_slice(&chunk);
         while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=index).collect::<Vec<_>>();
-            pending.drain(..1);
             handle_stream_line(decode_line(line)?, &stream, &mut acc)?;
         }
     }
@@ -86,6 +85,9 @@ pub(crate) async fn decode_stream(
 }
 
 fn decode_line(mut line: Vec<u8>) -> Result<String, AgentError> {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
     if line.last() == Some(&b'\r') {
         line.pop();
     }

@@ -138,6 +138,39 @@ async fn stream_buffers_split_multibyte_utf8_until_line_boundary() {
 }
 
 #[tokio::test]
+async fn stream_handles_delivery_split_after_data_line_newline() {
+    let body = sse([
+        json!({ "type": "response.output_text.delta", "delta": "A" }),
+        json!({ "type": "response.output_text.delta", "delta": "B" }),
+        json!({
+            "type": "response.completed",
+            "response": completed_message("AB")
+        }),
+    ]);
+    let split_at = body.find('\n').expect("first line newline") + 1;
+    let (base_url, _captured) = spawn_server(vec![MockTurn {
+        status: 200,
+        content_type: "text/event-stream",
+        body,
+        delivery: Delivery::SplitBodyAt(split_at),
+    }])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+
+    model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(rx.recv().await.expect("first").0, "A");
+    assert_eq!(rx.recv().await.expect("second").0, "B");
+}
+
+#[tokio::test]
 async fn function_call_arguments_are_private_and_decoded() {
     let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([
         json!({
