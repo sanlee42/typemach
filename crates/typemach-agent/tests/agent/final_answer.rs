@@ -155,6 +155,23 @@ impl ToolRegistry for CountingTools {
     }
 }
 
+fn paired_errors(messages: &[AgentMessage], tool_use_id: &str) -> (usize, usize) {
+    messages
+        .iter()
+        .flat_map(|message| match message {
+            AgentMessage::User { content } | AgentMessage::Assistant { content } => content,
+        })
+        .fold((0, 0), |(calls, errors), block| match block {
+            ContentBlock::ToolUse(tool_use) if tool_use.id == tool_use_id => (calls + 1, errors),
+            ContentBlock::ToolResult(result)
+                if result.tool_use_id == tool_use_id && result.is_error =>
+            {
+                (calls, errors + 1)
+            }
+            _ => (calls, errors),
+        })
+}
+
 #[tokio::test]
 async fn rejected_respond_batches_are_paired_without_dispatch_and_recover() {
     let model = ScriptedModel::new([
@@ -208,24 +225,26 @@ async fn rejected_respond_batches_are_paired_without_dispatch_and_recover() {
     .await;
 
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let requests = model.requests();
     for tool_use_id in ["respond-args", "respond-bad", "metric-bad"] {
-        assert!(events.iter().any(|event| matches!(
+        assert_eq!(paired_errors(&requests[2].messages, tool_use_id), (1, 1));
+        assert!(!events.iter().any(|event| matches!(
             event,
             RunStreamEvent::Signal {
-                signal: AgentSignal::ToolResult {
-                    tool_use_id: id,
-                    is_error: true,
-                    ..
-                },
+                signal: AgentSignal::ToolStarted { tool_use_id: id, .. }
+                    | AgentSignal::ToolCompleted { tool_use_id: id, .. },
             } if id == tool_use_id
         )));
     }
-    let retry =
-        serde_json::to_string(&model.requests()[2].messages).expect("serialize retry messages");
-    assert!(retry.contains("respond-args"));
-    assert!(retry.contains("respond-bad"));
-    assert!(retry.contains("metric-bad"));
     assert_eq!(completed(&events).answer, "Recovered final answer.");
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert_eq!(state.tool_calls, 0);
 }
 
 #[tokio::test]
