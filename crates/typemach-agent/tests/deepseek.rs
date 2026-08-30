@@ -9,6 +9,9 @@ use typemach_agent::{
     ModelRequest, ModelStream, ReasoningEffort, SpeedProfile, StopReason, ToolAnnotations,
 };
 
+#[path = "deepseek/responses.rs"]
+mod responses;
+
 #[tokio::test]
 async fn flash_request_disables_thinking_and_decodes_tool_call() {
     let response = json!({
@@ -587,7 +590,7 @@ async fn spawn_script_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<Str
             }
         }
     });
-    (format!("http://{addr}"), captured)
+    (format!("http://{addr}/chat/completions"), captured)
 }
 
 fn tool_spec() -> AgentToolSpec {
@@ -622,6 +625,21 @@ async fn spawn_server(
     response: String,
     content_type: &'static str,
 ) -> (String, Arc<Mutex<String>>) {
+    spawn_server_at(response, content_type, "/chat/completions").await
+}
+
+async fn spawn_responses_server(
+    response: String,
+    content_type: &'static str,
+) -> (String, Arc<Mutex<String>>) {
+    spawn_server_at(response, content_type, "").await
+}
+
+async fn spawn_server_at(
+    response: String,
+    content_type: &'static str,
+    path: &'static str,
+) -> (String, Arc<Mutex<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let captured = Arc::new(Mutex::new(String::new()));
@@ -638,7 +656,7 @@ async fn spawn_server(
         socket.write_all(header.as_bytes()).await.expect("header");
         socket.write_all(bytes).await.expect("body");
     });
-    (format!("http://{addr}"), captured)
+    (format!("http://{addr}{path}"), captured)
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> String {

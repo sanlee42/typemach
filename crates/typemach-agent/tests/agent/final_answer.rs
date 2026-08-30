@@ -18,11 +18,8 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
             ..ModelResponse::default()
         },
         ModelResponse {
-            deltas: vec!["INTERNAL_COMPLETION_DRAFT".to_string()],
-            ..planning_done()
-        },
-        ModelResponse {
             deltas: vec!["Order count is 42.".to_string()],
+            final_answer: true,
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -64,7 +61,7 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
             signal: AgentSignal::AssistantDelta { .. },
         }
     )));
-    assert_eq!(model.requests().len(), 3);
+    assert_eq!(model.requests().len(), 2);
     assert_eq!(completed(&events).answer, "Order count is 42.");
     let requests = model.requests();
     assert_eq!(
@@ -82,16 +79,6 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
     assert_eq!(
         requests[1].tool_choice,
         Some(typemach_agent::ToolChoice::Auto)
-    );
-    assert_eq!(
-        requests[2].tool_choice,
-        Some(typemach_agent::ToolChoice::None)
-    );
-    assert!(requests[2].tools.is_empty());
-    assert!(
-        !serde_json::to_string(&requests[2].messages)
-            .expect("serialize final messages")
-            .contains("INTERNAL_COMPLETION_DRAFT")
     );
     assert!(events.iter().any(|event| matches!(
         event,
@@ -188,8 +175,7 @@ impl AgentModel for FailFirstFinalModel {
     ) -> Result<ModelResponse, AgentError> {
         self.requests.lock().expect("requests lock").push(request);
         match self.calls.fetch_add(1, Ordering::Relaxed) {
-            0 => Ok(planning_done()),
-            1 => Err(AgentError::Model("final transport failed".to_string())),
+            0 => Err(AgentError::Model("final transport failed".to_string())),
             _ => Ok(ModelResponse {
                 final_text: Some("Recovered final answer.".to_string()),
                 stop_reason: Some(StopReason::EndTurn),
@@ -211,7 +197,10 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
     let run = request(AgentRunInput {
         messages: vec![AgentMessage::user_text("Answer directly")],
         context: Value::Null,
-        budget: AgentBudget::default(),
+        budget: AgentBudget {
+            max_model_turns: 0,
+            max_tool_calls: 4,
+        },
         human_input: None,
         system_suffix: None,
     });
@@ -235,12 +224,8 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
     let second = collect(runner.stream(run, StreamConfig::default())).await;
     assert_eq!(completed(&second).answer, "Recovered final answer.");
     let requests = model.requests.lock().expect("requests lock");
-    assert_eq!(requests.len(), 3);
-    assert_eq!(
-        requests[0].tool_choice,
-        Some(typemach_agent::ToolChoice::Auto)
-    );
-    for request in &requests[1..] {
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
         assert_eq!(request.tool_choice, Some(typemach_agent::ToolChoice::None));
         assert!(request.tools.is_empty());
     }
@@ -248,20 +233,20 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
 
 #[tokio::test]
 async fn final_refusal_fails_without_a_completed_output() {
-    let model = ScriptedModel::new([
-        planning_done(),
-        ModelResponse {
-            deltas: vec!["Uncommitted partial text.".to_string()],
-            stop_reason: Some(StopReason::Refusal),
-            ..ModelResponse::default()
-        },
-    ]);
+    let model = ScriptedModel::new([ModelResponse {
+        deltas: vec!["Uncommitted partial text.".to_string()],
+        stop_reason: Some(StopReason::Refusal),
+        ..ModelResponse::default()
+    }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Answer directly")],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 0,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -396,13 +381,11 @@ async fn oversized_tool_batch_is_not_partially_dispatched() {
 
 #[tokio::test]
 async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
-    let model = ScriptedModel::new([
-        planning_done(),
-        ModelResponse {
-            final_text: Some("The order count is 42.".to_string()),
-            ..ModelResponse::default()
-        },
-    ]);
+    let model = ScriptedModel::new([ModelResponse {
+        final_text: Some("The order count is 42.".to_string()),
+        final_answer: true,
+        ..ModelResponse::default()
+    }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
@@ -449,9 +432,9 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
             }],
             ..ModelResponse::default()
         },
-        planning_done(),
         ModelResponse {
             final_text: Some("The review is ready.".to_string()),
+            final_answer: true,
             ..ModelResponse::default()
         },
     ]);
@@ -481,5 +464,5 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
     )));
     assert_eq!(completed(&events).finish_reason, FinishReason::Stop);
     assert_eq!(completed(&events).answer, "The review is ready.");
-    assert_eq!(model.requests().len(), 3);
+    assert_eq!(model.requests().len(), 2);
 }

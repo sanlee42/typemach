@@ -3,7 +3,7 @@ use typemach::MachineError;
 
 use crate::{
     AgentMessage, AgentModel, AgentRunContext, AgentSignal, AgentState, AgentToolSpec,
-    ContentBlock, ModelRequest, ModelStream, StopReason, ToolChoice, context,
+    ContentBlock, ModelDelta, ModelRequest, ModelStream, StopReason, ToolChoice, context,
 };
 
 #[derive(Clone, Copy)]
@@ -15,6 +15,7 @@ pub(super) enum TextKind {
 pub(super) struct Turn {
     pub(super) content: Vec<ContentBlock>,
     pub(super) stop_reason: Option<StopReason>,
+    pub(super) final_answer: bool,
 }
 
 pub(super) async fn prepare(
@@ -63,17 +64,24 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
         tokio::select! {
             maybe_delta = delta_rx.recv() => {
                 if let Some(delta) = maybe_delta {
-                    append_text(state, ctx, &mut content, delta, kind).await?;
+                    append_delta(state, ctx, &mut content, delta, kind).await?;
                 }
             }
             response = &mut response => break response.map_err(MachineError::transition)?,
         }
     };
     while let Ok(delta) = delta_rx.try_recv() {
-        append_text(state, ctx, &mut content, delta, kind).await?;
+        append_delta(state, ctx, &mut content, delta, kind).await?;
     }
     for delta in response.deltas {
-        append_text(state, ctx, &mut content, delta, kind).await?;
+        append_text(
+            state,
+            ctx,
+            &mut content,
+            delta,
+            text_kind(kind, response.final_answer),
+        )
+        .await?;
     }
     if let Some(usage) = response.usage {
         state.usage.input_tokens += usage.input_tokens;
@@ -81,7 +89,14 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
         ctx.emit(AgentSignal::Usage { usage }).await?;
     }
     for block in response.content {
-        record_block(state, ctx, &mut content, block, kind).await?;
+        record_block(
+            state,
+            ctx,
+            &mut content,
+            block,
+            text_kind(kind, response.final_answer),
+        )
+        .await?;
     }
     content.extend(response.tool_uses.into_iter().map(ContentBlock::ToolUse));
     if let Some(text) = response.final_text
@@ -90,12 +105,45 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
             .iter()
             .any(|block| matches!(block, ContentBlock::Text { .. }))
     {
-        append_text(state, ctx, &mut content, text, kind).await?;
+        append_text(
+            state,
+            ctx,
+            &mut content,
+            text,
+            text_kind(kind, response.final_answer),
+        )
+        .await?;
     }
     Ok(Turn {
         content,
         stop_reason: response.stop_reason,
+        final_answer: response.final_answer,
     })
+}
+
+async fn append_delta(
+    state: &mut AgentState,
+    ctx: &AgentRunContext,
+    content: &mut Vec<ContentBlock>,
+    delta: ModelDelta,
+    kind: TextKind,
+) -> Result<(), MachineError> {
+    append_text(
+        state,
+        ctx,
+        content,
+        delta.text,
+        text_kind(kind, delta.final_answer),
+    )
+    .await
+}
+
+fn text_kind(kind: TextKind, final_answer: bool) -> TextKind {
+    if final_answer {
+        TextKind::FinalAnswer
+    } else {
+        kind
+    }
 }
 
 async fn append_text(

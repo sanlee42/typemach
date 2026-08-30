@@ -54,19 +54,16 @@ impl AgentModel for ScriptedModel {
             .pop_front()
             .ok_or_else(|| AgentError::Model("script exhausted".to_string()))?;
         for delta in &response.deltas {
-            stream.delta(delta.clone())?;
+            if response.final_answer {
+                stream.final_delta(delta.clone())?;
+            } else {
+                stream.delta(delta.clone())?;
+            }
         }
         Ok(ModelResponse {
             deltas: Vec::new(),
             ..response
         })
-    }
-}
-
-fn planning_done() -> ModelResponse {
-    ModelResponse {
-        stop_reason: Some(StopReason::EndTurn),
-        ..ModelResponse::default()
     }
 }
 
@@ -315,11 +312,11 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
             raw: Some(json!({ "id": "msg-1" })),
             ..ModelResponse::default()
         },
-        planning_done(),
         ModelResponse {
             content: vec![ContentBlock::Text {
                 text: "The order count is 42.".to_string(),
             }],
+            final_answer: true,
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         },
@@ -391,13 +388,11 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
 
 #[tokio::test]
 async fn compacted_prompt_window_does_not_drop_persisted_messages() {
-    let model = ScriptedModel::new([
-        planning_done(),
-        ModelResponse {
-            final_text: Some("Continue.".to_string()),
-            ..ModelResponse::default()
-        },
-    ]);
+    let model = ScriptedModel::new([ModelResponse {
+        final_text: Some("Continue.".to_string()),
+        final_answer: true,
+        ..ModelResponse::default()
+    }]);
     let context_policy = ContextPolicy {
         compact_at_tokens: 1,
         max_input_tokens: 128,
@@ -460,9 +455,9 @@ async fn large_tool_result_is_archived_before_next_prompt() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
-        planning_done(),
         ModelResponse {
             final_text: Some("Evidence loaded.".to_string()),
+            final_answer: true,
             ..ModelResponse::default()
         },
     ]);
@@ -551,10 +546,10 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             }],
             ..ModelResponse::default()
         },
-        planning_done(),
         ModelResponse {
             deltas: vec!["There are 7 units in stock.".to_string()],
             final_text: Some(String::new()),
+            final_answer: true,
             ..ModelResponse::default()
         },
     ]);
@@ -646,9 +641,9 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             }],
             ..ModelResponse::default()
         },
-        planning_done(),
         ModelResponse {
             final_text: Some("Done.".to_string()),
+            final_answer: true,
             ..ModelResponse::default()
         },
     ]);

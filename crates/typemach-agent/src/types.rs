@@ -167,6 +167,8 @@ pub struct ModelResponse {
     pub tool_uses: Vec<ToolUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_text: Option<String>,
+    #[serde(default)]
+    pub final_answer: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
