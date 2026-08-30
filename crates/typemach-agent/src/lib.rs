@@ -327,17 +327,15 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        if state.model_turns >= state.budget.max_model_turns {
-            return Ok(Transition::Complete(
-                state.output(FinishReason::MaxModelTurns),
-            ));
+        if planning_budget_exhausted(state) {
+            enter_final_answer(state);
+            return Ok(Transition::Next(AgentStep::FinalAnswer));
         }
-        let mut tools = self
+        let tools = self
             .tools
             .list_tools(&state.context)
             .await
             .map_err(AgentError::machine)?;
-        phase::add_respond(&mut tools).map_err(AgentError::machine)?;
         let messages = state.messages.clone();
         let suffix = state.system_suffix.clone();
         state.model_turns += 1;
@@ -348,7 +346,7 @@ where
             messages,
             tools,
             suffix,
-            Some(ToolChoice::Required),
+            Some(ToolChoice::Auto),
             planning_turn,
         )
         .await?;
@@ -373,38 +371,28 @@ where
             })
             .collect::<Vec<_>>();
         if tool_uses.is_empty() {
-            return Err(AgentError::Model(
-                "planning step did not call a tool; call respond to produce the final answer"
-                    .to_string(),
-            )
-            .machine());
-        }
-        match phase::classify(&tool_uses) {
-            phase::PlanningBatch::Final => {
-                state.answer.clear();
-                state.next_final_delta_index = 0;
-                state.pending_tools.clear();
-                Ok(Transition::Next(AgentStep::FinalAnswer))
-            }
-            phase::PlanningBatch::Dispatch => {
-                state.pending_tools.extend(tool_uses);
-                if !turn.content.is_empty() {
-                    state.messages.push(AgentMessage::Assistant {
-                        content: turn.content,
-                    });
+            return match turn.stop_reason {
+                Some(StopReason::EndTurn) => {
+                    enter_final_answer(state);
+                    Ok(Transition::Next(AgentStep::FinalAnswer))
                 }
-                Ok(Transition::Next(AgentStep::DispatchTools))
-            }
-            phase::PlanningBatch::RejectBatch(reason) => {
-                if !turn.content.is_empty() {
-                    state.messages.push(AgentMessage::Assistant {
-                        content: turn.content,
-                    });
-                }
-                record_protocol_errors(state, &tool_uses, &reason);
-                Ok(Transition::Next(AgentStep::ModelStep))
-            }
+                Some(reason) => Err(AgentError::Model(format!(
+                    "planning stopped without a tool or natural completion: {reason:?}"
+                ))
+                .machine()),
+                None => Err(AgentError::Model(
+                    "planning stopped without a tool or stop reason".to_string(),
+                )
+                .machine()),
+            };
         }
+        state.pending_tools.extend(tool_uses);
+        if !turn.content.is_empty() {
+            state.messages.push(AgentMessage::Assistant {
+                content: turn.content,
+            });
+        }
+        Ok(Transition::Next(AgentStep::DispatchTools))
     }
 
     async fn final_answer_step(
@@ -468,17 +456,18 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
+        let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
+        if state.pending_tools.len() > remaining {
+            state.pending_tools.clear();
+            enter_final_answer(state);
+            return Ok(Transition::Next(AgentStep::FinalAnswer));
+        }
         let specs = self
             .tools
             .list_tools(&state.context)
             .await
             .map_err(AgentError::machine)?;
         while let Some(tool_use) = state.pending_tools.pop_front() {
-            if state.tool_calls >= state.budget.max_tool_calls {
-                return Ok(Transition::Complete(
-                    state.output(FinishReason::MaxToolCalls),
-                ));
-            }
             let spec = specs.iter().find(|spec| spec.name == tool_use.name);
             let built_in_error = if tool_use.name == "ask_user" {
                 if let Some(result) = self.consume_human_answer(state, &tool_use, ctx).await? {
@@ -533,7 +522,12 @@ where
             };
             record_tool_result(state, ctx, result).await?;
         }
-        Ok(Transition::Next(AgentStep::ModelStep))
+        if planning_budget_exhausted(state) {
+            enter_final_answer(state);
+            Ok(Transition::Next(AgentStep::FinalAnswer))
+        } else {
+            Ok(Transition::Next(AgentStep::ModelStep))
+        }
     }
 
     async fn consume_human_answer(
@@ -626,14 +620,17 @@ fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
     }
 }
 
-fn record_protocol_errors(state: &mut AgentState, tool_uses: &[ToolUse], reason: &str) {
-    for tool_use in tool_uses {
-        state
-            .messages
-            .push(AgentMessage::tool_result(ToolResult::error(
-                tool_use, reason,
-            )));
-    }
+fn enter_final_answer(state: &mut AgentState) {
+    state.answer.clear();
+    state.next_final_delta_index = 0;
+    state.pending_tools.clear();
+    state.pending_human = None;
+    state.human_input = None;
+}
+
+fn planning_budget_exhausted(state: &AgentState) -> bool {
+    state.model_turns >= state.budget.max_model_turns
+        || state.tool_calls >= state.budget.max_tool_calls
 }
 
 async fn record_tool_result(

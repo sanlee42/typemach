@@ -1,57 +1,8 @@
 use std::collections::HashSet;
 
-use serde_json::{Value, json};
-
-use crate::{AgentError, AgentMessage, AgentToolSpec, ContentBlock, ToolAnnotations, ToolUse};
-
-pub(super) const RESPOND_TOOL: &str = "respond";
-
-pub(super) enum PlanningBatch {
-    Final,
-    Dispatch,
-    RejectBatch(String),
-}
+use crate::{AgentMessage, ContentBlock};
 
 const FINAL_ANSWER_PROMPT: &str = "[Final answer phase]\nProvide the final answer now. Use only the canonical conversation and successful tool evidence below. Do not call tools or describe internal planning.";
-
-pub(super) fn respond_spec() -> AgentToolSpec {
-    AgentToolSpec {
-        name: RESPOND_TOOL.to_string(),
-        description: "Transition to the final answer after all required tool work is complete. Call this tool alone with an empty object. The next model step has no tools and produces the user-visible answer.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        }),
-        output_schema: Value::Null,
-        metadata: Value::Null,
-        annotations: ToolAnnotations::default(),
-    }
-}
-
-pub(super) fn add_respond(tools: &mut Vec<AgentToolSpec>) -> Result<(), AgentError> {
-    if tools.iter().any(|tool| tool.name == RESPOND_TOOL) {
-        return Err(AgentError::Tool(format!(
-            "{RESPOND_TOOL} is reserved by the agent lifecycle"
-        )));
-    }
-    tools.push(respond_spec());
-    Ok(())
-}
-
-pub(super) fn classify(tool_uses: &[ToolUse]) -> PlanningBatch {
-    let Some(respond) = tool_uses.iter().find(|tool| tool.name == RESPOND_TOOL) else {
-        return PlanningBatch::Dispatch;
-    };
-    if tool_uses.len() != 1 {
-        return PlanningBatch::RejectBatch("respond must be the sole tool call".to_string());
-    }
-    let empty = matches!(&respond.input, Value::Object(values) if values.is_empty());
-    if !empty {
-        return PlanningBatch::RejectBatch("respond requires an empty object".to_string());
-    }
-    PlanningBatch::Final
-}
 
 pub(super) fn final_system_suffix(suffix: Option<&str>) -> String {
     match suffix.map(str::trim).filter(|value| !value.is_empty()) {
@@ -203,7 +154,8 @@ fn keep_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolResult;
+    use crate::{ToolResult, ToolUse};
+    use serde_json::json;
 
     #[test]
     fn repeated_provider_id_is_paired_within_each_transcript_segment() {
@@ -260,45 +212,6 @@ mod tests {
                     content.as_slice(),
                     [ContentBlock::ToolResult(result)] if result.content["value"] == 42
                 )
-        ));
-    }
-
-    #[test]
-    fn respond_must_be_the_only_zero_input_call() {
-        let mut respond = ToolUse {
-            id: "respond-1".to_string(),
-            name: RESPOND_TOOL.to_string(),
-            input: json!({}),
-            raw: None,
-        };
-        assert!(matches!(classify(&[respond.clone()]), PlanningBatch::Final));
-
-        let business_call = ToolUse {
-            id: "metric-1".to_string(),
-            name: "metric_point".to_string(),
-            input: json!({}),
-            raw: None,
-        };
-        assert!(matches!(
-            classify(&[respond.clone(), business_call]),
-            PlanningBatch::RejectBatch(_)
-        ));
-
-        respond.input = json!({ "unexpected": true });
-        assert!(matches!(
-            classify(&[respond]),
-            PlanningBatch::RejectBatch(_)
-        ));
-
-        let null_input = ToolUse {
-            id: "respond-null".to_string(),
-            name: RESPOND_TOOL.to_string(),
-            input: Value::Null,
-            raw: None,
-        };
-        assert!(matches!(
-            classify(&[null_input]),
-            PlanningBatch::RejectBatch(_)
         ));
     }
 }

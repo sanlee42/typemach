@@ -4,7 +4,7 @@ use typemach::CheckpointSaver;
 use typemach_agent::AgentState;
 
 #[tokio::test]
-async fn answer_is_only_the_current_turn_final_model_step() {
+async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
             final_text: Some("I will inspect the metric first.".to_string()),
@@ -17,7 +17,10 @@ async fn answer_is_only_the_current_turn_final_model_step() {
             stop_reason: Some(StopReason::ToolUse),
             ..ModelResponse::default()
         },
-        ModelResponse { ..respond() },
+        ModelResponse {
+            deltas: vec!["INTERNAL_COMPLETION_DRAFT".to_string()],
+            ..planning_done()
+        },
         ModelResponse {
             deltas: vec!["Order count is 42.".to_string()],
             stop_reason: Some(StopReason::EndTurn),
@@ -38,7 +41,10 @@ async fn answer_is_only_the_current_turn_final_model_step() {
                 AgentMessage::user_text("Yesterday's order count"),
             ],
             context: Value::Null,
-            budget: AgentBudget::default(),
+            budget: AgentBudget {
+                max_model_turns: 2,
+                max_tool_calls: 4,
+            },
             human_input: None,
             system_suffix: None,
         }),
@@ -63,18 +69,30 @@ async fn answer_is_only_the_current_turn_final_model_step() {
     let requests = model.requests();
     assert_eq!(
         requests[0].tool_choice,
-        Some(typemach_agent::ToolChoice::Required)
+        Some(typemach_agent::ToolChoice::Auto)
     );
-    assert!(requests[0].tools.iter().any(|tool| tool.name == "respond"));
+    assert_eq!(
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        ["metric_point", "ask_user", "emit_artifact", "report"]
+    );
     assert_eq!(
         requests[1].tool_choice,
-        Some(typemach_agent::ToolChoice::Required)
+        Some(typemach_agent::ToolChoice::Auto)
     );
     assert_eq!(
         requests[2].tool_choice,
         Some(typemach_agent::ToolChoice::None)
     );
     assert!(requests[2].tools.is_empty());
+    assert!(
+        !serde_json::to_string(&requests[2].messages)
+            .expect("serialize final messages")
+            .contains("INTERNAL_COMPLETION_DRAFT")
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
@@ -155,119 +173,161 @@ impl ToolRegistry for CountingTools {
     }
 }
 
-fn paired_errors(messages: &[AgentMessage], tool_use_id: &str) -> (usize, usize) {
-    messages
-        .iter()
-        .flat_map(|message| match message {
-            AgentMessage::User { content } | AgentMessage::Assistant { content } => content,
-        })
-        .fold((0, 0), |(calls, errors), block| match block {
-            ContentBlock::ToolUse(tool_use) if tool_use.id == tool_use_id => (calls + 1, errors),
-            ContentBlock::ToolResult(result)
-                if result.tool_use_id == tool_use_id && result.is_error =>
-            {
-                (calls, errors + 1)
-            }
-            _ => (calls, errors),
-        })
+#[derive(Clone, Default)]
+struct FailFirstFinalModel {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<ModelRequest>>>,
 }
 
-#[tokio::test]
-async fn rejected_respond_batches_are_paired_without_dispatch_and_recover() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            tool_uses: vec![ToolUse {
-                id: "respond-args".to_string(),
-                name: "respond".to_string(),
-                input: json!({ "unexpected": true }),
-                raw: None,
-            }],
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            tool_uses: vec![
-                ToolUse {
-                    id: "respond-bad".to_string(),
-                    name: "respond".to_string(),
-                    input: json!({}),
-                    raw: None,
-                },
-                ToolUse {
-                    id: "metric-bad".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({ "metric_id": "paid_order_count" }),
-                    raw: None,
-                },
-            ],
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
-        },
-        respond(),
-        ModelResponse {
-            deltas: vec!["Recovered final answer.".to_string()],
-            ..ModelResponse::default()
-        },
-    ]);
-    let tools = CountingTools::default();
-    let calls = tools.calls.clone();
-    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Read the metric")],
-            context: Value::Null,
-            budget: AgentBudget::default(),
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert_eq!(calls.load(Ordering::Relaxed), 0);
-    let requests = model.requests();
-    for tool_use_id in ["respond-args", "respond-bad", "metric-bad"] {
-        assert_eq!(paired_errors(&requests[2].messages, tool_use_id), (1, 1));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            RunStreamEvent::Signal {
-                signal: AgentSignal::ToolStarted { tool_use_id: id, .. }
-                    | AgentSignal::ToolCompleted { tool_use_id: id, .. },
-            } if id == tool_use_id
-        )));
+#[async_trait]
+impl AgentModel for FailFirstFinalModel {
+    async fn next_step(
+        &self,
+        request: ModelRequest,
+        _stream: ModelStream,
+    ) -> Result<ModelResponse, AgentError> {
+        self.requests.lock().expect("requests lock").push(request);
+        match self.calls.fetch_add(1, Ordering::Relaxed) {
+            0 => Ok(planning_done()),
+            1 => Err(AgentError::Model("final transport failed".to_string())),
+            _ => Ok(ModelResponse {
+                final_text: Some("Recovered final answer.".to_string()),
+                stop_reason: Some(StopReason::EndTurn),
+                ..ModelResponse::default()
+            }),
+        }
     }
-    assert_eq!(completed(&events).answer, "Recovered final answer.");
-    let checkpoint = runner
-        .checkpointer()
-        .load("thread-1")
-        .await
-        .expect("load checkpoint")
-        .expect("checkpoint");
-    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
-    assert_eq!(state.tool_calls, 0);
 }
 
 #[tokio::test]
-async fn respond_on_last_planning_turn_still_gets_one_final_call() {
-    let model = ScriptedModel::new([
-        respond(),
-        ModelResponse {
-            deltas: vec!["Final ".to_string(), "answer".to_string()],
-            ..ModelResponse::default()
-        },
-    ]);
+async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
+    let model = FailFirstFinalModel::default();
     let runner = build_agent_runner(
         MemorySaver::default(),
         model.clone(),
         FakeTools,
         AllowAllTools,
     );
+    let run = request(AgentRunInput {
+        messages: vec![AgentMessage::user_text("Answer directly")],
+        context: Value::Null,
+        budget: AgentBudget::default(),
+        human_input: None,
+        system_suffix: None,
+    });
+    let first = collect(runner.stream(run.clone(), StreamConfig::default())).await;
+    assert!(
+        first
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    assert_eq!(
+        checkpoint.next_step,
+        Some(serde_json::to_value(AgentStep::FinalAnswer).expect("serialize step"))
+    );
+
+    let second = collect(runner.stream(run, StreamConfig::default())).await;
+    assert_eq!(completed(&second).answer, "Recovered final answer.");
+    let requests = model.requests.lock().expect("requests lock");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].tool_choice,
+        Some(typemach_agent::ToolChoice::Auto)
+    );
+    for request in &requests[1..] {
+        assert_eq!(request.tool_choice, Some(typemach_agent::ToolChoice::None));
+        assert!(request.tools.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
+    for budget in [
+        AgentBudget {
+            max_model_turns: 1,
+            max_tool_calls: 2,
+        },
+        AgentBudget {
+            max_model_turns: 4,
+            max_tool_calls: 1,
+        },
+    ] {
+        let model = ScriptedModel::new([
+            ModelResponse {
+                tool_uses: vec![ToolUse {
+                    id: "metric-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({}),
+                    raw: None,
+                }],
+                stop_reason: Some(StopReason::ToolUse),
+                ..ModelResponse::default()
+            },
+            ModelResponse {
+                final_text: Some("Budgeted answer.".to_string()),
+                stop_reason: Some(StopReason::EndTurn),
+                ..ModelResponse::default()
+            },
+        ]);
+        let tools = CountingTools::default();
+        let calls = tools.calls.clone();
+        let runner =
+            build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+        let events = collect(runner.stream(
+            request(AgentRunInput {
+                messages: vec![AgentMessage::user_text("Read the metric")],
+                context: Value::Null,
+                budget,
+                human_input: None,
+                system_suffix: None,
+            }),
+            StreamConfig::default(),
+        ))
+        .await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(model.requests().len(), 2);
+        assert_eq!(completed(&events).answer, "Budgeted answer.");
+    }
+}
+
+#[tokio::test]
+async fn oversized_tool_batch_is_not_partially_dispatched() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            tool_uses: ["metric-1", "metric-2"]
+                .into_iter()
+                .map(|id| ToolUse {
+                    id: id.to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({}),
+                    raw: None,
+                })
+                .collect(),
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            final_text: Some("No partial evidence.".to_string()),
+            stop_reason: Some(StopReason::EndTurn),
+            ..ModelResponse::default()
+        },
+    ]);
+    let tools = CountingTools::default();
+    let calls = tools.calls.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Answer directly")],
+            messages: vec![AgentMessage::user_text("Read both metrics")],
             context: Value::Null,
             budget: AgentBudget {
-                max_model_turns: 1,
+                max_model_turns: 4,
                 max_tool_calls: 1,
             },
             human_input: None,
@@ -277,46 +337,26 @@ async fn respond_on_last_planning_turn_still_gets_one_final_call() {
     ))
     .await;
 
-    assert_eq!(completed(&events).answer, "Final answer");
-    assert_eq!(model.requests().len(), 2);
-}
-
-#[tokio::test]
-async fn bare_planning_prose_is_a_protocol_failure_not_an_answer() {
-    let model = ScriptedModel::new([ModelResponse {
-        deltas: vec!["INTERNAL_DRAFT".to_string()],
-        ..ModelResponse::default()
-    }]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Answer directly")],
-            context: Value::Null,
-            budget: AgentBudget::default(),
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Failed { error }
-            if error.to_string().contains("planning step did not call a tool")
-    )));
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
     assert!(!events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
-            signal: AgentSignal::AssistantDelta { .. } | AgentSignal::FinalAnswerDelta { .. },
+            signal: AgentSignal::ToolStarted { .. } | AgentSignal::ToolCompleted { .. },
         }
+    )));
+    let output = completed(&events);
+    assert_eq!(output.answer, "No partial evidence.");
+    assert!(!output.messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::Assistant { content }
+            if content.iter().any(|block| matches!(block, ContentBlock::ToolUse(_)))
     )));
 }
 
 #[tokio::test]
 async fn final_text_without_stream_deltas_is_emitted_and_persisted() {
     let model = ScriptedModel::new([
-        respond(),
+        planning_done(),
         ModelResponse {
             final_text: Some("The order count is 42.".to_string()),
             ..ModelResponse::default()
@@ -368,7 +408,7 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
             }],
             ..ModelResponse::default()
         },
-        respond(),
+        planning_done(),
         ModelResponse {
             final_text: Some("The review is ready.".to_string()),
             ..ModelResponse::default()

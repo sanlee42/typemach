@@ -610,12 +610,12 @@ mod tests {
     #[test]
     fn request_tool_choice_overrides_transport_default() {
         let mut config = AgentConfig::new("k", "deepseek-v4-flash");
-        config.tool_choice = Some(ToolChoice::Auto);
+        config.tool_choice = Some(ToolChoice::Required);
         let mut request = request(vec![spec()]);
-        request.tool_choice = Some(ToolChoice::Required);
+        request.tool_choice = Some(ToolChoice::Auto);
         let body =
             serde_json::to_value(chat_request(&config, request).unwrap()).expect("serialize");
-        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tool_choice"], "auto");
     }
 
     #[test]
