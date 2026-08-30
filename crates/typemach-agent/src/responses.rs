@@ -66,12 +66,53 @@ pub(crate) fn responses_request(
 
 pub(crate) async fn decode_response(
     response: reqwest::Response,
-) -> Result<ModelResponse, AgentError> {
+) -> Result<ModelResponse, DecodeFailure> {
     let raw: Value = response
         .json()
         .await
-        .map_err(|err| AgentError::Model(format!("model response was not JSON: {err}")))?;
-    model_response_from_value(raw)
+        .map_err(|err| DecodeFailure::body(err, "model response was not JSON"))?;
+    model_response_from_value(raw).map_err(DecodeFailure::protocol)
+}
+
+#[derive(Debug)]
+pub(crate) enum DecodeFailure {
+    Transport(String),
+    Protocol(String),
+}
+
+impl DecodeFailure {
+    pub(crate) fn body(err: reqwest::Error, context: &str) -> Self {
+        let message = format!("{context}: {err}");
+        if err.is_decode() {
+            Self::Protocol(message)
+        } else {
+            Self::Transport(message)
+        }
+    }
+
+    pub(crate) fn protocol(err: AgentError) -> Self {
+        Self::Protocol(err.to_string())
+    }
+
+    pub(crate) fn protocol_message(message: impl Into<String>) -> Self {
+        Self::Protocol(message.into())
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Transport(message) | Self::Protocol(message) => message,
+        }
+    }
+
+    pub(crate) fn retryable(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl From<AgentError> for DecodeFailure {
+    fn from(err: AgentError) -> Self {
+        Self::protocol(err)
+    }
 }
 
 pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, AgentError> {
@@ -89,7 +130,6 @@ pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, Age
             .map(ToString::to_string),
         raw: Some(raw),
         usage,
-        ..ModelResponse::default()
     })
 }
 

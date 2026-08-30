@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 
-use crate::responses::{decode_response as decode_responses, responses_request};
+use crate::responses::{DecodeFailure, decode_response as decode_responses, responses_request};
 use crate::responses_stream::decode_stream as decode_responses_stream;
 use crate::{
     AgentConfig, AgentError, AgentModel, ModelRequest, ModelResponse, ModelStream, ReasoningEffort,
@@ -105,10 +105,13 @@ impl ConfiguredModel {
         if !self.config.stream {
             request = request.timeout(Duration::from_secs(self.config.request_timeout_secs));
         }
-        let response = request.send().await.map_err(|err| AttemptFailure {
-            message: format!("model request failed: {err}"),
-            retryable: true,
-            retry_after: None,
+        let response = request.send().await.map_err(|err| {
+            let retryable = retryable_request_error(&err);
+            AttemptFailure {
+                message: format!("model request failed: {err}"),
+                retryable,
+                retry_after: None,
+            }
         })?;
         let status = response.status();
         if !status.is_success() {
@@ -127,12 +130,22 @@ impl ConfiguredModel {
             true => decode_responses_stream(response, stream.clone()).await,
             false => decode_responses(response).await,
         };
-        decoded.map_err(|err| AttemptFailure {
-            message: err.to_string(),
-            retryable: true,
-            retry_after: None,
-        })
+        decoded.map_err(AttemptFailure::from)
     }
+}
+
+impl From<DecodeFailure> for AttemptFailure {
+    fn from(failure: DecodeFailure) -> Self {
+        Self {
+            message: failure.message().to_string(),
+            retryable: failure.retryable(),
+            retry_after: None,
+        }
+    }
+}
+
+fn retryable_request_error(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout()
 }
 
 /// Server-provided Retry-After (integer seconds form) wins, clamped to 30s;

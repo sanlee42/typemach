@@ -282,8 +282,15 @@ async fn malformed_refusal_and_mixed_responses_fail_structurally() {
             }]
         }),
     ] {
-        let (base_url, _captured) = spawn_server(vec![MockTurn::ok(response.to_string())]).await;
-        let model = ConfiguredModel::new(config(base_url, false)).expect("model");
+        let (base_url, captured) = spawn_server(vec![
+            MockTurn::ok(response.to_string()),
+            MockTurn::ok(response.to_string()),
+            MockTurn::ok(response.to_string()),
+        ])
+        .await;
+        let mut config = config(base_url, false);
+        config.max_retries = 2;
+        let model = ConfiguredModel::new(config).expect("model");
         let (stream, _rx) = ModelStream::channel();
         let err = model
             .next_step(
@@ -296,6 +303,7 @@ async fn malformed_refusal_and_mixed_responses_fail_structurally() {
             err.to_string()
                 .contains("model request failed after 1 attempts")
         );
+        assert_eq!(captured.lock().expect("captured").len(), 1);
     }
 }
 
