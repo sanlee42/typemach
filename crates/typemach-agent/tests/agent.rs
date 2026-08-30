@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use typemach::{
-    MemorySaver, RunCommand, RunId, RunRequest, RunStreamEvent, RuntimeLimits, SessionId,
-    StreamConfig, ThreadId,
+    CheckpointSaver, MemorySaver, RunCommand, RunId, RunRequest, RunStreamEvent, RuntimeLimits,
+    SessionId, StreamConfig, ThreadId,
 };
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentModel, AgentRunInput,
@@ -365,7 +365,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
 async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let model = ScriptedModel::new([ModelResponse {
         outcome: Some(ModelOutcome::ToolCalls {
-            text: String::new(),
+            text: "The report cannot continue. ".to_string(),
             calls: vec![ToolUse {
                 id: "term-1".to_string(),
                 name: "report".to_string(),
@@ -394,13 +394,37 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         signal: AgentSignal::Terminal { action },
       } if action.name == "report"
     )));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::ToolStarted { .. },
+        }
+    )));
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event {
+            RunStreamEvent::Signal {
+                signal: AgentSignal::FinalAnswerDelta { delta, .. },
+            } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let completed = completed(&events);
     assert_eq!(completed.finish_reason, FinishReason::Terminal);
-    assert!(completed.answer.is_empty());
+    assert_eq!(completed.answer, deltas.concat());
+    assert_eq!(completed.answer, "The report cannot continue. ");
     assert!(matches!(
         completed.terminal.as_ref(),
         Some(TerminalAction { name, .. }) if name == "report"
     ));
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert_eq!(state.answer, completed.answer);
 }
 
 #[tokio::test]
