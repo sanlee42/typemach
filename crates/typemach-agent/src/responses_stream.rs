@@ -33,20 +33,13 @@ struct ToolCallBuilder {
 struct Accumulator {
     response_id: Option<String>,
     status: Option<String>,
-    output: OutputKind,
+    message_seen: bool,
+    function_calls: BTreeMap<usize, ToolCallBuilder>,
     completed_text: String,
     reasoning: Vec<String>,
     streamed_text: bool,
     usage: Option<Usage>,
     stop_reason: Option<StopReason>,
-}
-
-#[derive(Debug, Default)]
-enum OutputKind {
-    #[default]
-    Undecided,
-    Message,
-    FunctionCalls(BTreeMap<usize, ToolCallBuilder>),
 }
 
 pub(crate) async fn decode_stream(
@@ -119,7 +112,7 @@ fn handle_stream_line(
                     "output_text delta missing text".to_string(),
                 ));
             };
-            acc.message()?;
+            acc.message_seen = true;
             acc.streamed_text = true;
             stream.output_text(delta)?;
         }
@@ -128,7 +121,7 @@ fn handle_stream_line(
             let index = event.output_index.ok_or_else(|| {
                 AgentError::Model("function_call delta missing output_index".to_string())
             })?;
-            let builder = acc.function_call(index)?;
+            let builder = acc.function_call(index);
             if let Some(delta) = event.delta {
                 builder.arguments.push_str(&delta);
             }
@@ -166,7 +159,7 @@ fn handle_stream_line(
 fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), AgentError> {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") => {
-            let builder = acc.function_call(index)?;
+            let builder = acc.function_call(index);
             let call_id = item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -189,7 +182,7 @@ fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), Ag
         Some("message") => {
             let raw = serde_json::json!({ "output": [item] });
             model_response_shape(&raw, false)?;
-            acc.message()?;
+            acc.message_seen = true;
         }
         Some("reasoning") => {
             let raw = serde_json::json!({ "output": [item] });
@@ -227,17 +220,16 @@ fn merge_response(acc: &mut Accumulator, response: Value) -> Result<(), AgentErr
     if let Some(reason) = response_stop(&response, &decoded) {
         acc.stop_reason = Some(reason);
     }
+    acc.message_seen |= decoded.message_seen;
     acc.reasoning = decoded.reasoning;
     match decoded.outcome {
         Some(ModelOutcome::FinalAnswer { text }) => {
-            acc.message()?;
-            if !acc.streamed_text {
-                acc.completed_text.push_str(&text);
-            }
+            append_snapshot_text(acc, &text);
         }
-        Some(ModelOutcome::ToolCalls { calls }) => {
+        Some(ModelOutcome::ToolCalls { text, calls }) => {
+            append_snapshot_text(acc, &text);
             for call in calls {
-                upsert_tool(acc, call)?;
+                upsert_tool(acc, call);
             }
         }
         None => {}
@@ -245,8 +237,14 @@ fn merge_response(acc: &mut Accumulator, response: Value) -> Result<(), AgentErr
     Ok(())
 }
 
-fn upsert_tool(acc: &mut Accumulator, tool: ToolUse) -> Result<(), AgentError> {
-    let builders = acc.function_calls()?;
+fn append_snapshot_text(acc: &mut Accumulator, text: &str) {
+    if !acc.streamed_text {
+        acc.completed_text.push_str(text);
+    }
+}
+
+fn upsert_tool(acc: &mut Accumulator, tool: ToolUse) {
+    let builders = &mut acc.function_calls;
     if let Some((_, builder)) = builders
         .iter_mut()
         .find(|(_, builder)| builder.call_id.as_deref() == Some(tool.id.as_str()))
@@ -255,7 +253,7 @@ fn upsert_tool(acc: &mut Accumulator, tool: ToolUse) -> Result<(), AgentError> {
         builder.call_id = Some(tool.id);
         builder.name = Some(tool.name);
         builder.raw = tool.raw;
-        return Ok(());
+        return;
     }
     let index = builders.keys().next_back().copied().unwrap_or(0) + 1;
     builders.insert(
@@ -267,7 +265,6 @@ fn upsert_tool(acc: &mut Accumulator, tool: ToolUse) -> Result<(), AgentError> {
             raw: tool.raw,
         },
     );
-    Ok(())
 }
 
 fn arguments_from_tool(tool: &ToolUse) -> String {
@@ -298,48 +295,28 @@ fn tool_use_from_builder(builder: ToolCallBuilder) -> Result<ToolUse, AgentError
 }
 
 impl Accumulator {
-    fn message(&mut self) -> Result<(), AgentError> {
-        match &self.output {
-            OutputKind::Undecided | OutputKind::Message => {
-                self.output = OutputKind::Message;
-                Ok(())
-            }
-            OutputKind::FunctionCalls(_) => Err(AgentError::Model(
-                "responses stream mixed messages and function calls".to_string(),
-            )),
-        }
-    }
-
-    fn function_call(&mut self, index: usize) -> Result<&mut ToolCallBuilder, AgentError> {
-        Ok(self.function_calls()?.entry(index).or_default())
-    }
-
-    fn function_calls(&mut self) -> Result<&mut BTreeMap<usize, ToolCallBuilder>, AgentError> {
-        if matches!(self.output, OutputKind::Undecided) {
-            self.output = OutputKind::FunctionCalls(BTreeMap::new());
-        }
-        if let OutputKind::FunctionCalls(builders) = &mut self.output {
-            Ok(builders)
-        } else {
-            Err(AgentError::Model(
-                "responses stream mixed messages and function calls".to_string(),
-            ))
-        }
+    fn function_call(&mut self, index: usize) -> &mut ToolCallBuilder {
+        self.function_calls.entry(index).or_default()
     }
 }
 
 fn outcome(acc: Accumulator) -> Result<Option<ModelOutcome>, AgentError> {
-    match acc.output {
-        OutputKind::Undecided => Ok(None),
-        OutputKind::Message => Ok(Some(ModelOutcome::FinalAnswer {
-            text: acc.completed_text,
-        })),
-        OutputKind::FunctionCalls(builders) => builders
+    if !acc.function_calls.is_empty() {
+        return acc
+            .function_calls
             .into_values()
             .map(tool_use_from_builder)
             .collect::<Result<Vec<_>, _>>()
-            .map(|calls| Some(ModelOutcome::ToolCalls { calls })),
+            .map(|calls| {
+                Some(ModelOutcome::ToolCalls {
+                    text: acc.completed_text,
+                    calls,
+                })
+            });
     }
+    Ok(acc.message_seen.then_some(ModelOutcome::FinalAnswer {
+        text: acc.completed_text,
+    }))
 }
 
 fn response_stop(
@@ -348,23 +325,24 @@ fn response_stop(
 ) -> Option<StopReason> {
     match response.get("status").and_then(Value::as_str) {
         Some("incomplete") => Some(incomplete_reason(response)),
-        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
         Some("completed") if decoded.tool_seen => Some(StopReason::ToolUse),
+        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
         Some(other) => Some(StopReason::Other(other.to_string())),
-        None if decoded.message_seen => Some(StopReason::EndTurn),
         None if decoded.tool_seen => Some(StopReason::ToolUse),
+        None if decoded.message_seen => Some(StopReason::EndTurn),
         None => None,
     }
 }
 
 fn inferred_stop(acc: &Accumulator) -> Option<StopReason> {
-    match acc.output {
-        OutputKind::FunctionCalls(_) => Some(StopReason::ToolUse),
-        OutputKind::Message => Some(StopReason::EndTurn),
-        OutputKind::Undecided => acc
-            .status
+    if !acc.function_calls.is_empty() {
+        Some(StopReason::ToolUse)
+    } else if acc.message_seen {
+        Some(StopReason::EndTurn)
+    } else {
+        acc.status
             .as_ref()
-            .map(|status| StopReason::Other(status.clone())),
+            .map(|status| StopReason::Other(status.clone()))
     }
 }
 

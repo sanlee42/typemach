@@ -303,26 +303,24 @@ fn fail_if_error(raw: &Value) -> Result<(), AgentError> {
 }
 
 fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutput, AgentError> {
-    let output = raw
+    let items = raw
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| AgentError::Model("responses output must be an array".to_string()))?;
-    let mut kind = OutputKind::Undecided;
+    let mut output = OutputItems::default();
     let mut reasoning = Vec::new();
-    for item in output {
+    for item in items {
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => extend_reasoning(&mut reasoning, item)?,
             Some("message") => {
                 let text = message_text(item)?;
-                kind = kind.message(if include_message_text {
-                    text
-                } else {
-                    String::new()
-                })?;
+                output.message_seen = true;
+                if include_message_text {
+                    output.text.push_str(&text);
+                }
             }
             Some("function_call") => {
-                let call = tool_use_from_item(item)?;
-                kind = kind.function_call(call)?;
+                output.calls.push(tool_use_from_item(item)?);
             }
             Some(other) => {
                 return Err(AgentError::Model(format!(
@@ -336,7 +334,7 @@ fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutpu
             }
         }
     }
-    Ok(kind.into_decoded(reasoning))
+    Ok(output.into_decoded(reasoning))
 }
 
 fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), AgentError> {
@@ -400,59 +398,31 @@ fn message_text(item: &Value) -> Result<String, AgentError> {
     Ok(text)
 }
 
-enum OutputKind {
-    Undecided,
-    Message(String),
-    FunctionCalls(Vec<ToolUse>),
+#[derive(Default)]
+struct OutputItems {
+    text: String,
+    message_seen: bool,
+    calls: Vec<ToolUse>,
 }
 
-impl OutputKind {
-    fn message(self, text: String) -> Result<Self, AgentError> {
-        match self {
-            Self::Undecided => Ok(Self::Message(text)),
-            Self::Message(mut existing) => {
-                existing.push_str(&text);
-                Ok(Self::Message(existing))
-            }
-            Self::FunctionCalls(_) => Err(AgentError::Model(
-                "responses output mixed messages and function calls".to_string(),
-            )),
-        }
-    }
-
-    fn function_call(self, call: ToolUse) -> Result<Self, AgentError> {
-        match self {
-            Self::Undecided => Ok(Self::FunctionCalls(vec![call])),
-            Self::FunctionCalls(mut calls) => {
-                calls.push(call);
-                Ok(Self::FunctionCalls(calls))
-            }
-            Self::Message(_) => Err(AgentError::Model(
-                "responses output mixed messages and function calls".to_string(),
-            )),
-        }
-    }
-
+impl OutputItems {
     fn into_decoded(self, reasoning: Vec<String>) -> DecodedOutput {
-        match self {
-            Self::Undecided => DecodedOutput {
-                outcome: None,
-                reasoning,
-                message_seen: false,
-                tool_seen: false,
-            },
-            Self::Message(text) => DecodedOutput {
-                outcome: Some(ModelOutcome::FinalAnswer { text }),
-                reasoning,
-                message_seen: true,
-                tool_seen: false,
-            },
-            Self::FunctionCalls(calls) => DecodedOutput {
-                outcome: Some(ModelOutcome::ToolCalls { calls }),
-                reasoning,
-                message_seen: false,
-                tool_seen: true,
-            },
+        let tool_seen = !self.calls.is_empty();
+        let outcome = if tool_seen {
+            Some(ModelOutcome::ToolCalls {
+                text: self.text,
+                calls: self.calls,
+            })
+        } else if self.message_seen {
+            Some(ModelOutcome::FinalAnswer { text: self.text })
+        } else {
+            None
+        };
+        DecodedOutput {
+            outcome,
+            reasoning,
+            message_seen: self.message_seen,
+            tool_seen,
         }
     }
 }
@@ -460,12 +430,12 @@ impl OutputKind {
 fn stop_reason(raw: &Value, decoded: &DecodedOutput) -> Option<StopReason> {
     match raw.get("status").and_then(Value::as_str) {
         Some("incomplete") => Some(incomplete_reason(raw)),
-        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
         Some("completed") if decoded.tool_seen => Some(StopReason::ToolUse),
+        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
         Some("failed") | Some("cancelled") => Some(StopReason::Refusal),
         Some(other) => Some(StopReason::Other(other.to_string())),
-        None if decoded.message_seen => Some(StopReason::EndTurn),
         None if decoded.tool_seen => Some(StopReason::ToolUse),
+        None if decoded.message_seen => Some(StopReason::EndTurn),
         None => None,
     }
 }

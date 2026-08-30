@@ -43,6 +43,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "ask-bad".to_string(),
                     name: "ask_user".to_string(),
@@ -55,6 +56,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
         },
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "ask-good".to_string(),
                     name: "ask_user".to_string(),
@@ -131,6 +133,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "artifact-missing-type".to_string(),
                     name: "emit_artifact".to_string(),
@@ -143,6 +146,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
         },
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "artifact-invalid-type".to_string(),
                     name: "emit_artifact".to_string(),
@@ -159,6 +163,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
         },
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "artifact-invalid-source".to_string(),
                     name: "emit_artifact".to_string(),
@@ -176,6 +181,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
         },
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "artifact-good".to_string(),
                     name: "emit_artifact".to_string(),

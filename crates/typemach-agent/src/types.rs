@@ -176,8 +176,14 @@ pub struct ModelResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelOutcome {
-    FinalAnswer { text: String },
-    ToolCalls { calls: Vec<ToolUse> },
+    FinalAnswer {
+        text: String,
+    },
+    ToolCalls {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
+        calls: Vec<ToolUse>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

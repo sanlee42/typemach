@@ -8,6 +8,7 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
@@ -94,6 +95,7 @@ async fn planning_tools_and_natural_completion_emit_only_the_final_answer() {
 async fn terminal_tool_does_not_expose_or_commit_planning_draft() {
     let model = ScriptedModel::new([ModelResponse {
         outcome: Some(ModelOutcome::ToolCalls {
+            text: String::new(),
             calls: vec![ToolUse {
                 id: "term-1".to_string(),
                 name: "report".to_string(),
@@ -237,23 +239,87 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
 }
 
 #[tokio::test]
-async fn final_refusal_fails_without_a_completed_output() {
+async fn final_phase_rejects_refusal_and_tool_calls() {
+    let responses = [
+        ModelResponse {
+            outcome: Some(ModelOutcome::FinalAnswer {
+                text: "Rejected text must stay private.".to_string(),
+            }),
+            stop_reason: Some(StopReason::Refusal),
+            ..ModelResponse::default()
+        },
+        ModelResponse {
+            outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
+                calls: vec![ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({}),
+                    raw: None,
+                }],
+            }),
+            stop_reason: Some(StopReason::ToolUse),
+            ..ModelResponse::default()
+        },
+    ];
+    for response in responses {
+        let model = ScriptedModel::new([response]);
+        let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+        let events = collect(runner.stream(
+            request(AgentRunInput {
+                messages: vec![AgentMessage::user_text("Answer directly")],
+                context: Value::Null,
+                budget: AgentBudget {
+                    max_model_turns: 0,
+                    max_tool_calls: 4,
+                },
+                human_input: None,
+                system_suffix: None,
+            }),
+            StreamConfig::default(),
+        ))
+        .await;
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            RunStreamEvent::Signal {
+                signal: AgentSignal::FinalAnswerDelta { .. } | AgentSignal::ToolStarted { .. },
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn max_tokens_does_not_dispatch_truncated_tool_calls() {
     let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::FinalAnswer {
-            text: "Rejected text must stay private.".to_string(),
+        outcome: Some(ModelOutcome::ToolCalls {
+            text: String::new(),
+            calls: vec![ToolUse {
+                id: "tool-1".to_string(),
+                name: "metric_point".to_string(),
+                input: json!({ "metric_id": "paid_order_cou" }),
+                raw: None,
+            }],
         }),
-        stop_reason: Some(StopReason::Refusal),
+        stop_reason: Some(StopReason::MaxTokens),
         ..ModelResponse::default()
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Answer directly")],
+            messages: vec![AgentMessage::user_text("Write a long report")],
             context: Value::Null,
-            budget: AgentBudget {
-                max_model_turns: 0,
-                max_tool_calls: 4,
-            },
+            budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
         }),
@@ -264,19 +330,14 @@ async fn final_refusal_fails_without_a_completed_output() {
     assert!(!events.iter().any(|event| matches!(
         event,
         RunStreamEvent::Signal {
-            signal: AgentSignal::FinalAnswerDelta { .. },
+            signal: AgentSignal::ToolStarted { .. },
         }
     )));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
-    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Failed { error }
+            if error.to_string().contains("planning stopped before completing tool calls")
+    )));
 }
 
 #[tokio::test]
@@ -294,6 +355,7 @@ async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
         let model = ScriptedModel::new([
             ModelResponse {
                 outcome: Some(ModelOutcome::ToolCalls {
+                    text: "Checking. ".to_string(),
                     calls: vec![ToolUse {
                         id: "metric-1".to_string(),
                         name: "metric_point".to_string(),
@@ -330,7 +392,17 @@ async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(model.requests().len(), 2);
-        assert_eq!(completed(&events).answer, "Budgeted answer.");
+        assert_eq!(completed(&events).answer, "Checking. Budgeted answer.");
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                RunStreamEvent::Signal {
+                    signal: AgentSignal::FinalAnswerDelta { delta, index },
+                } => Some((delta.as_str(), *index)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, [("Checking. ", 0), ("Budgeted answer.", 1)]);
     }
 }
 
@@ -339,6 +411,7 @@ async fn oversized_tool_batch_is_not_partially_dispatched() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: ["metric-1", "metric-2"]
                     .into_iter()
                     .map(|id| ToolUse {
@@ -437,6 +510,7 @@ async fn valid_artifact_is_nonterminal_before_final_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "artifact-1".to_string(),
                     name: "emit_artifact".to_string(),

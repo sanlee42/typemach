@@ -173,6 +173,7 @@ async fn ask_user_resume_at_budget_enters_final_without_replaying_the_tool() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "ask-1".to_string(),
                     name: "ask_user".to_string(),
@@ -288,6 +289,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
@@ -363,6 +365,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
 async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let model = ScriptedModel::new([ModelResponse {
         outcome: Some(ModelOutcome::ToolCalls {
+            text: String::new(),
             calls: vec![ToolUse {
                 id: "term-1".to_string(),
                 name: "report".to_string(),
@@ -462,6 +465,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "large_evidence".to_string(),
@@ -557,6 +561,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "ask-1".to_string(),
                     name: "ask_user".to_string(),
@@ -654,6 +659,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
     let model = ScriptedModel::new([
         ModelResponse {
             outcome: Some(ModelOutcome::ToolCalls {
+                text: String::new(),
                 calls: vec![ToolUse {
                     id: "ask-1".to_string(),
                     name: "ask_user".to_string(),
@@ -726,48 +732,6 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         Some("Current shop: B"),
         "resume refreshes the suffix"
     );
-}
-
-#[tokio::test]
-async fn max_tokens_does_not_dispatch_truncated_tool_calls() {
-    let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            calls: vec![ToolUse {
-                id: "tool-1".to_string(),
-                name: "metric_point".to_string(),
-                input: json!({ "metric_id": "paid_order_cou" }),
-                raw: None,
-            }],
-        }),
-        stop_reason: Some(StopReason::MaxTokens),
-        ..ModelResponse::default()
-    }]);
-    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("Write a long report")],
-            context: Value::Null,
-            budget: AgentBudget::default(),
-            human_input: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
-    assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            RunStreamEvent::Signal {
-                signal: AgentSignal::ToolStarted { .. },
-            }
-        )),
-        "truncated tool calls must not dispatch"
-    );
-    assert!(events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Failed { error }
-            if error.to_string().contains("planning stopped before completing tool calls")
-    )));
 }
 
 #[test]

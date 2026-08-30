@@ -1,7 +1,9 @@
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use typemach_agent::{
     AgentConfig, AgentMessage, AgentModel, AgentToolSpec, ConfiguredModel, ModelOutcome,
     ModelRequest, ModelStream, StopReason, ToolAnnotations,
@@ -76,6 +78,62 @@ async fn streaming_final_text_has_one_live_sink() {
     let body = &captured.lock().expect("captured")[0].body;
     assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["tools"][0]["name"], "metric_point");
+}
+
+#[tokio::test]
+async fn streamed_text_remains_live_when_the_response_also_calls_a_tool() {
+    let body = sse([
+        json!({ "type": "response.output_text.delta", "delta": "Checking orders. " }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": "{\"metric_id\":\"paid_order_count\"}"
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": mixed_response("Checking orders. ")
+        }),
+    ]);
+    let split_at = body.find("\n\n").expect("first event boundary") + 2;
+    let release = Arc::new(Notify::new());
+    let (base_url, _captured) = spawn_server(vec![MockTurn {
+        status: 200,
+        content_type: "text/event-stream",
+        body,
+        delivery: Delivery::HoldAfter(split_at, Arc::clone(&release)),
+    }])
+    .await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+    let response = tokio::spawn(async move {
+        model
+            .next_step(
+                request(vec![tool_spec()], Some(typemach_agent::ToolChoice::Auto)),
+                stream,
+            )
+            .await
+    });
+
+    let delta = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("delta before terminal response")
+        .expect("text delta");
+    assert_eq!(delta.0, "Checking orders. ");
+    assert!(!response.is_finished());
+    release.notify_one();
+
+    let response = response.await.expect("model task").expect("response");
+    let Some(ModelOutcome::ToolCalls { text, calls }) = response.outcome else {
+        panic!("expected tool calls");
+    };
+    assert!(text.is_empty(), "streamed text must not be replayed");
+    assert_eq!(calls[0].id, "call-1");
+    assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
 }
 
 #[tokio::test]
@@ -219,7 +277,7 @@ async fn function_call_arguments_are_private_and_decoded() {
         .expect("response");
 
     assert!(rx.try_recv().is_err());
-    let Some(ModelOutcome::ToolCalls { calls }) = response.outcome else {
+    let Some(ModelOutcome::ToolCalls { calls, .. }) = response.outcome else {
         panic!("expected tool calls");
     };
     assert_eq!(calls[0].id, "call-1");
@@ -246,22 +304,9 @@ async fn fallback_request_serializes_explicit_none_without_tools() {
 }
 
 #[tokio::test]
-async fn malformed_refusal_and_mixed_responses_fail_structurally() {
+async fn malformed_responses_fail_structurally() {
     for response in [
         completed_refusal(),
-        json!({
-            "id": "resp-mixed",
-            "status": "completed",
-            "output": [
-                message_item("Text"),
-                {
-                    "type": "function_call",
-                    "call_id": "call-1",
-                    "name": "metric_point",
-                    "arguments": "{}"
-                }
-            ]
-        }),
         json!({
             "id": "resp-missing-call-id",
             "status": "completed",
@@ -389,6 +434,22 @@ fn message_item(text: &str) -> Value {
     })
 }
 
+fn mixed_response(text: &str) -> Value {
+    json!({
+        "id": "resp-mixed",
+        "status": "completed",
+        "output": [
+            message_item(text),
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": "{\"metric_id\":\"paid_order_count\"}"
+            }
+        ]
+    })
+}
+
 fn completed_refusal() -> Value {
     json!({
         "id": "resp-refusal",
@@ -405,6 +466,7 @@ enum Delivery {
     Complete,
     Truncate,
     SplitBodyAt(usize),
+    HoldAfter(usize, Arc<Notify>),
 }
 
 struct MockTurn {
@@ -483,7 +545,9 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
 
 async fn write_response(socket: &mut tokio::net::TcpStream, turn: &MockTurn) {
     let advertised_len = match turn.delivery {
-        Delivery::Complete | Delivery::SplitBodyAt(_) => turn.body.len(),
+        Delivery::Complete | Delivery::SplitBodyAt(_) | Delivery::HoldAfter(_, _) => {
+            turn.body.len()
+        }
         Delivery::Truncate => turn.body.len() + 16,
     };
     let head = format!(
@@ -506,6 +570,13 @@ async fn write_response(socket: &mut tokio::net::TcpStream, turn: &MockTurn) {
             socket.write_all(first).await.expect("write first body");
             socket.flush().await.expect("flush first body");
             tokio::task::yield_now().await;
+            socket.write_all(second).await.expect("write second body");
+        }
+        Delivery::HoldAfter(index, ref release) => {
+            let (first, second) = turn.body.as_bytes().split_at(index);
+            socket.write_all(first).await.expect("write first body");
+            socket.flush().await.expect("flush first body");
+            release.notified().await;
             socket.write_all(second).await.expect("write second body");
         }
     }

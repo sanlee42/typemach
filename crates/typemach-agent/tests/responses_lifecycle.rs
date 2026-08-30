@@ -5,14 +5,14 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use typemach::{
-    MemorySaver, RunCommand, RunId, RunRequest, RunStreamEvent, RuntimeLimits, SessionId,
-    StreamConfig, ThreadId,
+    CheckpointSaver, MemorySaver, RunCommand, RunId, RunRequest, RunStreamEvent, RuntimeLimits,
+    SessionId, StreamConfig, ThreadId,
 };
 use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentRunInput, AgentRunOutput,
-    AgentSignal, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion, ConfiguredModel,
-    ContentBlock, FinishReason, ToolAnnotations, ToolCallRequest, ToolRegistry, ToolResult,
-    build_agent_runner,
+    AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools, AskUserQuestion,
+    ConfiguredModel, ContentBlock, FinishReason, ToolAnnotations, ToolCallRequest, ToolRegistry,
+    ToolResult, build_agent_runner,
 };
 
 #[tokio::test]
@@ -41,13 +41,15 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     ))
     .await;
 
-    assert_eq!(final_deltas(&events), vec!["The answer ", "is 42."]);
+    let deltas = final_deltas(&events);
+    assert_eq!(deltas, vec!["Checking orders. ", "The answer ", "is 42."]);
     let completed = completed(&events);
-    assert_eq!(completed.answer, "The answer is 42.");
+    assert_eq!(completed.answer, deltas.concat());
+    assert_eq!(completed.answer, "Checking orders. The answer is 42.");
     assert!(!completed.answer.contains("privately"));
     assert_eq!(
         assistant_texts(&completed.messages),
-        vec!["The answer is 42."]
+        vec!["Checking orders. ", "The answer is 42."]
     );
     let bodies = captured_bodies(&captured);
     assert_eq!(bodies.len(), 2);
@@ -57,7 +59,21 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     assert!(input_has_type(&bodies[1], "function_call_output"));
     assert_ordered_input_types(
         &bodies[1],
-        &["reasoning", "function_call", "function_call_output"],
+        &[
+            "reasoning",
+            "message",
+            "function_call",
+            "function_call_output",
+        ],
+    );
+    assert_eq!(
+        bodies[1]["input"]
+            .as_array()
+            .expect("input array")
+            .iter()
+            .find(|item| item["type"] == "message" && item["role"] == "assistant")
+            .expect("public message")["content"],
+        "Checking orders. "
     );
     assert_eq!(
         bodies[1]["input"]
@@ -68,10 +84,88 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
             .expect("reasoning item")["content"][0]["text"],
         "Inspect metric privately."
     );
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert_eq!(state.answer, completed.answer);
+}
+
+#[tokio::test]
+async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
+    let mixed = json!({
+        "id": "resp-tools",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Checking orders. " }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "metric_point",
+                "arguments": "{\"metric_id\":\"paid_order_count\"}"
+            }
+        ]
+    });
+    let final_answer = json!({
+        "id": "resp-final",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "The answer is 42." }]
+        }]
+    });
+    let (base_url, captured) = spawn_server(vec![
+        MockTurn::ok(mixed.to_string()),
+        MockTurn::ok(final_answer.to_string()),
+    ])
+    .await;
+    let runner = build_agent_runner(
+        MemorySaver::default(),
+        model_with_stream(base_url, false),
+        FakeTools,
+        AllowAllTools,
+    );
+
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("What was the order count?")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(
+        final_deltas(&events),
+        vec!["Checking orders. ", "The answer is 42."]
+    );
+    assert_eq!(
+        completed(&events).answer,
+        "Checking orders. The answer is 42."
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::ToolResult { tool_use_id, .. },
+        } if tool_use_id == "call-1"
+    )));
+    assert_eq!(captured.lock().expect("captured").len(), 2);
 }
 
 fn tool_reasoning_call_sse() -> String {
     sse([
+        json!({ "type": "response.output_text.delta", "delta": "Checking orders. " }),
         json!({
             "type": "response.output_item.added",
             "output_index": 0,
@@ -113,6 +207,14 @@ fn tool_reasoning_call_sse() -> String {
                         "content": [{
                             "type": "reasoning_text",
                             "text": "Inspect metric privately."
+                        }]
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Checking orders. "
                         }]
                     },
                     {
@@ -297,9 +399,14 @@ impl ToolRegistry for FakeTools {
 }
 
 fn model(base_url: String) -> ConfiguredModel {
+    model_with_stream(base_url, true)
+}
+
+fn model_with_stream(base_url: String, stream: bool) -> ConfiguredModel {
     let mut config = typemach_agent::AgentConfig::new("sk-test", "deepseek-v4-flash");
     config.base_url = base_url;
     config.max_retries = 0;
+    config.stream = stream;
     ConfiguredModel::new(config).expect("model")
 }
 

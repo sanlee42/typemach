@@ -572,8 +572,6 @@ fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
 }
 
 fn enter_final_answer(state: &mut AgentState) {
-    state.answer.clear();
-    state.next_final_delta_index = 0;
     state.pending_tools.clear();
     state.pending_human = None;
     state.human_input = None;
