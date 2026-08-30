@@ -432,6 +432,25 @@ where
             )
             .machine());
         }
+        let reason = match turn.stop_reason.as_ref() {
+            Some(StopReason::EndTurn | StopReason::StopSequence) | None => FinishReason::Stop,
+            Some(StopReason::MaxTokens) => FinishReason::MaxTokens,
+            Some(StopReason::Refusal) => {
+                return Err(AgentError::Model("final answer was refused".to_string()).machine());
+            }
+            Some(StopReason::ToolUse) => {
+                return Err(AgentError::Model(
+                    "final answer stopped for a tool call without returning one".to_string(),
+                )
+                .machine());
+            }
+            Some(StopReason::Other(reason)) => {
+                return Err(AgentError::Model(format!(
+                    "final answer stopped unexpectedly: {reason}"
+                ))
+                .machine());
+            }
+        };
         state.messages = messages;
         let content = turn
             .content
@@ -441,11 +460,6 @@ where
         if !content.is_empty() {
             state.messages.push(AgentMessage::Assistant { content });
         }
-        let reason = if turn.stop_reason == Some(StopReason::MaxTokens) {
-            FinishReason::MaxTokens
-        } else {
-            FinishReason::Stop
-        };
         Ok(Transition::Complete(
             state.output_with_answer(reason, state.answer.clone()),
         ))

@@ -247,6 +247,47 @@ async fn retrying_the_same_run_resumes_final_without_replaying_planning() {
 }
 
 #[tokio::test]
+async fn final_refusal_fails_without_a_completed_output() {
+    let model = ScriptedModel::new([
+        planning_done(),
+        ModelResponse {
+            deltas: vec!["Uncommitted partial text.".to_string()],
+            stop_reason: Some(StopReason::Refusal),
+            ..ModelResponse::default()
+        },
+    ]);
+    let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("Answer directly")],
+            context: Value::Null,
+            budget: AgentBudget::default(),
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunStreamEvent::Signal {
+            signal: AgentSignal::FinalAnswerDelta { .. },
+        }
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
+    );
+}
+
+#[tokio::test]
 async fn reached_model_or_tool_budget_after_evidence_still_finalizes() {
     for budget in [
         AgentBudget {
