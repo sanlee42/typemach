@@ -103,10 +103,6 @@ fn project_message(
         AgentMessage::User { content } => (content, false),
         AgentMessage::Assistant { content } => (content, true),
     };
-    let planned = assistant
-        && content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::ToolUse(_)));
     let content = content
         .iter()
         .enumerate()
@@ -117,8 +113,6 @@ fn project_message(
                     block: *block_index,
                 },
                 block,
-                assistant,
-                planned,
                 pairs,
             )
         })
@@ -135,15 +129,9 @@ fn project_message(
     })
 }
 
-fn keep_block(
-    position: Position,
-    block: &ContentBlock,
-    assistant: bool,
-    planned: bool,
-    pairs: &SuccessfulPairs,
-) -> bool {
+fn keep_block(position: Position, block: &ContentBlock, pairs: &SuccessfulPairs) -> bool {
     match block {
-        ContentBlock::Text { .. } => !assistant || !planned,
+        ContentBlock::Text { .. } => true,
         ContentBlock::ConversationDigest(_) => true,
         ContentBlock::Thinking { .. } => false,
         ContentBlock::ToolUse(_) => pairs.calls.contains(&position),
@@ -176,7 +164,7 @@ mod tests {
             AgentMessage::Assistant {
                 content: vec![
                     ContentBlock::Text {
-                        text: "SECRET_FIRST_PLAN".to_string(),
+                        text: "First public update. ".to_string(),
                     },
                     ContentBlock::ToolUse(first.clone()),
                 ],
@@ -185,7 +173,7 @@ mod tests {
             AgentMessage::Assistant {
                 content: vec![
                     ContentBlock::Text {
-                        text: "SECRET_LATER_PLAN".to_string(),
+                        text: "Later public update. ".to_string(),
                     },
                     ContentBlock::ToolUse(second.clone()),
                 ],
@@ -195,14 +183,18 @@ mod tests {
 
         let projected = final_messages(&messages);
         let encoded = serde_json::to_string(&projected).expect("serialize projection");
-        assert!(!encoded.contains("SECRET_"));
-        assert_eq!(projected.len(), 3);
+        assert!(encoded.contains("First public update."));
+        assert!(encoded.contains("Later public update."));
+        assert!(!encoded.contains("SECRET_LATER_CALL"));
+        assert!(!encoded.contains("SECRET_FAILED_PAYLOAD"));
+        assert_eq!(projected.len(), 4);
         assert!(matches!(
             &projected[1],
             AgentMessage::Assistant { content }
                 if matches!(
                     content.as_slice(),
-                    [ContentBlock::ToolUse(call)] if call.input["metric"] == "paid_orders"
+                    [ContentBlock::Text { .. }, ContentBlock::ToolUse(call)]
+                        if call.input["metric"] == "paid_orders"
                 )
         ));
         assert!(matches!(
@@ -211,6 +203,14 @@ mod tests {
                 if matches!(
                     content.as_slice(),
                     [ContentBlock::ToolResult(result)] if result.content["value"] == 42
+                )
+        ));
+        assert!(matches!(
+            &projected[3],
+            AgentMessage::Assistant { content }
+                if matches!(
+                    content.as_slice(),
+                    [ContentBlock::Text { text }] if text == "Later public update. "
                 )
         ));
     }

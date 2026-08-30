@@ -89,8 +89,10 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
             }
             Some(TurnOutcome::FinalAnswer(final_content))
         }
-        Some(ModelOutcome::ToolCalls { calls }) => {
+        Some(ModelOutcome::ToolCalls { text, calls }) => {
             let mut call_content = reasoning;
+            call_content.extend(content);
+            append_text(state, ctx, &mut call_content, text).await?;
             call_content.extend(calls.iter().cloned().map(ContentBlock::ToolUse));
             Some(TurnOutcome::ToolCalls {
                 content: call_content,
