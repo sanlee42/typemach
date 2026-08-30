@@ -17,22 +17,23 @@ pub fn prompt_window(
     messages: &[AgentMessage],
     policy: &ContextPolicy,
 ) -> Result<PromptWindow, AgentError> {
-    let before = estimate_messages(messages)?;
+    let projected = prompt_messages(messages);
+    let before = estimate_projected(&projected)?;
     if before.estimated_tokens < policy.compact_at_tokens
         || messages.len() <= policy.recent_messages
     {
         return Ok(PromptWindow {
-            messages: messages.to_vec(),
+            messages: projected,
             digest: None,
             compaction: None,
         });
     }
 
     let mut keep_count = policy.recent_messages.max(1).min(messages.len());
-    let mut window = build_compacted_window(messages, keep_count)?;
+    let mut window = build_compacted_window(messages, &projected, keep_count)?;
     while window.after.estimated_tokens > policy.max_input_tokens && keep_count > 1 {
         keep_count -= 1;
-        window = build_compacted_window(messages, keep_count)?;
+        window = build_compacted_window(messages, &projected, keep_count)?;
     }
 
     Ok(PromptWindow {
@@ -73,12 +74,59 @@ pub fn maybe_archive_tool_result(
 }
 
 pub fn estimate_messages(messages: &[AgentMessage]) -> Result<PromptEstimate, AgentError> {
+    estimate_projected(&prompt_messages(messages))
+}
+
+fn estimate_projected(messages: &[AgentMessage]) -> Result<PromptEstimate, AgentError> {
     let bytes = serde_json::to_vec(messages)
         .map_err(|err| AgentError::Model(format!("failed to estimate prompt size: {err}")))?;
     Ok(PromptEstimate {
         message_count: messages.len(),
         estimated_tokens: estimate_tokens(bytes.len()),
     })
+}
+
+fn prompt_messages(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User { content } => AgentMessage::User {
+                content: prompt_blocks(content),
+            },
+            AgentMessage::Assistant { content } => AgentMessage::Assistant {
+                content: prompt_blocks(content),
+            },
+        })
+        .collect()
+}
+
+fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
+    content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => ContentBlock::Text { text: text.clone() },
+            ContentBlock::ConversationDigest(digest) => {
+                ContentBlock::ConversationDigest(digest.clone())
+            }
+            ContentBlock::Thinking { text, signature } => ContentBlock::Thinking {
+                text: text.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse(tool_use) => ContentBlock::ToolUse(crate::ToolUse {
+                id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+                input: tool_use.input.clone(),
+                raw: None,
+            }),
+            ContentBlock::ToolResult(result) => ContentBlock::ToolResult(ToolResult {
+                tool_use_id: result.tool_use_id.clone(),
+                name: result.name.clone(),
+                content: result.content.clone(),
+                is_error: result.is_error,
+                raw: None,
+            }),
+        })
+        .collect()
 }
 
 struct CompactedWindow {
@@ -90,6 +138,7 @@ struct CompactedWindow {
 
 fn build_compacted_window(
     messages: &[AgentMessage],
+    projected: &[AgentMessage],
     keep_count: usize,
 ) -> Result<CompactedWindow, AgentError> {
     let mut omitted_count = messages.len().saturating_sub(keep_count);
@@ -100,7 +149,7 @@ fn build_compacted_window(
         omitted_count -= 1;
     }
     let omitted = &messages[..omitted_count];
-    let kept = &messages[omitted_count..];
+    let kept = &projected[omitted_count..];
     let digest = ConversationDigest::compacted_window(omitted_count);
     let mut compacted_messages = Vec::with_capacity(kept.len() + 1);
     compacted_messages.push(AgentMessage::User {
@@ -109,7 +158,7 @@ fn build_compacted_window(
     compacted_messages.extend_from_slice(kept);
     let omitted_bytes = serde_json::to_vec(omitted)
         .map_err(|err| AgentError::Model(format!("failed to archive transcript: {err}")))?;
-    let after = estimate_messages(&compacted_messages)?;
+    let after = estimate_projected(&compacted_messages)?;
     Ok(CompactedWindow {
         messages: compacted_messages,
         digest,
@@ -301,5 +350,78 @@ mod tests {
         assert!(unsafe_window_start(&mixed));
         assert!(!unsafe_window_start(&AgentMessage::user_text("plain")));
         assert!(!unsafe_window_start(&AgentMessage::assistant_text("a")));
+    }
+
+    #[test]
+    fn estimate_ignores_raw_but_archive_retains_it() {
+        let raw = json!({ "audit": "x".repeat(16_000) });
+        let with_raw = vec![
+            AgentMessage::user_text("q1"),
+            AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse(ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({ "metric": "orders" }),
+                    raw: Some(raw.clone()),
+                })],
+            },
+            AgentMessage::tool_result(ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                name: "metric_point".to_string(),
+                content: json!({ "value": 42 }),
+                is_error: false,
+                raw: Some(raw),
+            }),
+            AgentMessage::user_text("q2"),
+        ];
+        let without_raw = vec![
+            AgentMessage::user_text("q1"),
+            AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse(ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({ "metric": "orders" }),
+                    raw: None,
+                })],
+            },
+            tool_result_message("tool-1"),
+            AgentMessage::user_text("q2"),
+        ];
+
+        assert_eq!(
+            estimate_messages(&with_raw).expect("estimate with raw"),
+            estimate_messages(&without_raw).expect("estimate without raw")
+        );
+        assert_eq!(
+            estimate_messages(&without_raw)
+                .expect("estimate without raw")
+                .estimated_tokens,
+            estimate_tokens(serde_json::to_vec(&without_raw).expect("serialize").len())
+        );
+        let raw_free_window = prompt_window(&with_raw, &policy(8, u64::MAX)).expect("window");
+        assert!(raw_free_window.compaction.is_none());
+        assert_eq!(raw_free_window.messages, without_raw);
+        assert!(matches!(
+            &with_raw[1],
+            AgentMessage::Assistant { content }
+                if matches!(
+                    content.as_slice(),
+                    [ContentBlock::ToolUse(tool_use)] if tool_use.raw.is_some()
+                )
+        ));
+        let window = prompt_window(&with_raw, &policy(1, u64::MAX)).expect("window");
+        let compaction = window.compaction.expect("compaction");
+        let archived_without_raw = serde_json::to_vec(&without_raw[..3]).expect("archive bytes");
+
+        assert_eq!(compaction.archive.message_count, 3);
+        assert!(compaction.archive.byte_count > archived_without_raw.len());
+        assert!(matches!(
+            &with_raw[2],
+            AgentMessage::User { content }
+                if matches!(
+                    content.as_slice(),
+                    [ContentBlock::ToolResult(result)] if result.raw.is_some()
+                )
+        ));
     }
 }
