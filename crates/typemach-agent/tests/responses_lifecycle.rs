@@ -45,15 +45,29 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     .await;
 
     assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::Commentary),
-        ["Checking orders. ", "The answer ", "is 42."]
+        message_deltas(&events),
+        [
+            "Checking orders. ",
+            "Summarizing. ",
+            "The answer ",
+            "is 42."
+        ]
+    );
+    assert_eq!(
+        message_done_phases(&events),
+        [
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::FinalAnswer,
+            AssistantMessagePhase::FinalAnswer
+        ]
     );
     let completed = completed(&events);
     assert_eq!(completed.answer, "The answer is 42.");
     assert!(!completed.answer.contains("privately"));
     assert_eq!(
         assistant_texts(&completed.messages),
-        vec!["Checking orders. ", "The answer is 42."]
+        vec!["Checking orders. ", "Summarizing. The answer is 42."]
     );
     let bodies = captured_bodies(&captured);
     assert_eq!(bodies.len(), 2);
@@ -87,6 +101,17 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
             .iter()
             .any(|item| item["type"] == "message" && item["role"] == "assistant")
     );
+    let assistant = bodies[1]["input"]
+        .as_array()
+        .expect("input array")
+        .iter()
+        .find(|item| item["id"] == "msg-commentary")
+        .expect("provider assistant item retained in next request");
+    assert_eq!(assistant["phase"], "commentary");
+    assert_eq!(
+        assistant["content"],
+        json!([{ "type": "output_text", "text": "Checking orders. " }])
+    );
     let checkpoint = runner
         .checkpointer()
         .load("thread-1")
@@ -112,8 +137,11 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
         "status": "completed",
         "output": [
             {
+                "id": "msg-commentary",
                 "type": "message",
+                "status": "completed",
                 "role": "assistant",
+                "phase": "commentary",
                 "content": [{ "type": "output_text", "text": "Checking orders. " }]
             },
             {
@@ -128,8 +156,11 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
         "id": "resp-final",
         "status": "completed",
         "output": [{
+            "id": "msg-final",
             "type": "message",
+            "status": "completed",
             "role": "assistant",
+            "phase": "final_answer",
             "content": [{ "type": "output_text", "text": "The answer is 42." }]
         }]
     });
@@ -161,7 +192,7 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
     .await;
 
     assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::Commentary),
+        message_deltas(&events),
         ["Checking orders. ", "The answer is 42."]
     );
     assert_eq!(completed(&events).answer, "The answer is 42.");
@@ -175,11 +206,12 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
 }
 
 fn tool_reasoning_call_sse() -> String {
-    sse([
-        json!({ "type": "response.output_text.delta", "delta": "Checking orders. " }),
+    let mut events = message_events("msg-commentary", 1, "commentary", &["Checking orders. "]);
+    events[0]["item"]["phase"] = json!("final_answer");
+    events.extend([
         json!({
             "type": "response.output_item.added",
-            "output_index": 0,
+            "output_index": 2,
             "item": {
                 "type": "function_call",
                 "call_id": "call-1",
@@ -189,17 +221,17 @@ fn tool_reasoning_call_sse() -> String {
         }),
         json!({
             "type": "response.function_call_arguments.delta",
-            "output_index": 0,
+            "output_index": 2,
             "delta": "{\"metric_id\""
         }),
         json!({
             "type": "response.function_call_arguments.delta",
-            "output_index": 0,
+            "output_index": 2,
             "delta": ":\"paid_order_count\"}"
         }),
         json!({
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": 2,
             "item": {
                 "type": "function_call",
                 "call_id": "call-1",
@@ -221,8 +253,11 @@ fn tool_reasoning_call_sse() -> String {
                         }]
                     },
                     {
+                        "id": "msg-commentary",
                         "type": "message",
+                        "status": "completed",
                         "role": "assistant",
+                        "phase": "commentary",
                         "content": [{
                             "type": "output_text",
                             "text": "Checking orders. "
@@ -237,50 +272,157 @@ fn tool_reasoning_call_sse() -> String {
                 ]
             }
         }),
-    ])
+    ]);
+    sse(events)
 }
 
 fn final_answer_sse() -> String {
-    sse([
-        json!({ "type": "response.output_text.delta", "delta": "The answer " }),
-        json!({ "type": "response.output_text.delta", "delta": "is 42." }),
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": "resp-final",
-                "status": "completed",
-                "output": [{
+    let mut events = message_events("msg-summary", 0, "commentary", &["Summarizing. "]);
+    events.extend(message_events(
+        "msg-final-1",
+        1,
+        "final_answer",
+        &["The answer "],
+    ));
+    events.extend(message_events(
+        "msg-final-2",
+        2,
+        "final_answer",
+        &["is 42."],
+    ));
+    events.push(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp-final",
+            "status": "completed",
+            "output": [
+                {
+                    "id": "msg-summary",
                     "type": "message",
+                    "status": "completed",
                     "role": "assistant",
+                    "phase": "commentary",
                     "content": [{
                         "type": "output_text",
-                        "text": "The answer is 42."
+                        "text": "Summarizing. "
                     }]
-                }]
+                },
+                {
+                    "id": "msg-final-1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "The answer "
+                    }]
+                },
+                {
+                    "id": "msg-final-2",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "is 42."
+                    }]
+                }
+            ]
+        }
+    }));
+    sse(events)
+}
+
+fn message_prefix(id: &str, output_index: usize, phase: &str, deltas: &[&str]) -> Vec<Value> {
+    let mut events = vec![
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "phase": phase,
+                "content": []
             }
         }),
-    ])
+        json!({
+            "type": "response.content_part.added",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "" }
+        }),
+    ];
+    events.extend(deltas.iter().map(|delta| {
+        json!({
+            "type": "response.output_text.delta",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "delta": delta
+        })
+    }));
+    events
+}
+
+fn message_events(id: &str, output_index: usize, phase: &str, deltas: &[&str]) -> Vec<Value> {
+    let text = deltas.concat();
+    let mut events = message_prefix(id, output_index, phase, deltas);
+    events.extend([
+        json!({
+            "type": "response.output_text.done",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text
+        }),
+        json!({
+            "type": "response.content_part.done",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": text }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "phase": phase,
+                "content": [{ "type": "output_text", "text": text }]
+            }
+        }),
+    ]);
+    events
 }
 
 #[tokio::test]
 async fn max_tokens_candidate_is_streamed_but_not_committed() {
-    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([
-        json!({ "type": "response.output_text.delta", "delta": "Partial answer" }),
-        json!({
-            "type": "response.incomplete",
-            "response": {
-                "id": "resp-partial",
+    let mut events = message_prefix("msg-partial", 0, "final_answer", &["Partial answer"]);
+    events.push(json!({
+        "type": "response.incomplete",
+        "response": {
+            "id": "resp-partial",
+            "status": "incomplete",
+            "incomplete_details": { "reason": "max_output_tokens" },
+            "output": [{
+                "id": "msg-partial",
+                "type": "message",
                 "status": "incomplete",
-                "incomplete_details": { "reason": "max_output_tokens" },
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "Partial answer" }]
-                }]
-            }
-        }),
-    ]))])
-    .await;
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{ "type": "output_text", "text": "Partial answer" }]
+            }]
+        }
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
     let runner = build_agent_runner(
         MemorySaver::default(),
         model(base_url),
@@ -302,10 +444,7 @@ async fn max_tokens_candidate_is_streamed_but_not_committed() {
     ))
     .await;
 
-    assert_eq!(
-        message_deltas(&events, AssistantMessagePhase::Commentary),
-        ["Partial answer"]
-    );
+    assert_eq!(message_deltas(&events), ["Partial answer"]);
     assert!(
         events
             .iter()
@@ -459,15 +598,29 @@ fn completed(
 
 fn message_deltas(
     events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
-    expected_phase: AssistantMessagePhase,
 ) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantMessageDelta { phase, delta, .. },
+                signal: AgentSignal::AssistantMessageDelta { delta, .. },
                 ..
-            } if *phase == expected_phase => Some(delta.clone()),
+            } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn message_done_phases(
+    events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
+) -> Vec<AssistantMessagePhase> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunStreamEvent::Signal {
+                signal: AgentSignal::AssistantMessageDone { phase, .. },
+                ..
+            } => Some(*phase),
             _ => None,
         })
         .collect()
@@ -481,7 +634,8 @@ fn assistant_texts(messages: &[AgentMessage]) -> Vec<String> {
                 content
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(text.as_str()),
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        ContentBlock::AssistantMessage(message) => Some(message.text()),
                         _ => None,
                     })
                     .collect::<String>(),

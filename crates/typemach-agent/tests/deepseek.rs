@@ -5,8 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use typemach_agent::{
-    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, ConfiguredModel, ModelOutcome,
-    ModelRequest, ModelStream, StopReason, ToolAnnotations,
+    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, AssistantMessagePhase, ConfiguredModel,
+    ModelRequest, ModelStream, ModelStreamEvent, StopReason, ToolAnnotations,
 };
 
 #[tokio::test]
@@ -36,24 +36,17 @@ async fn origin_base_posts_to_responses_and_stale_chat_base_is_invalid() {
 
 #[tokio::test]
 async fn streaming_final_text_has_one_live_sink() {
-    let (base_url, captured) = spawn_server(vec![MockTurn::ok(sse([
-        json!({ "type": "response.output_text.delta", "delta": "A" }),
-        json!({ "type": "response.output_text.delta", "delta": "B" }),
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": "resp-1",
-                "status": "completed",
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "AB" }]
-                }],
-                "usage": { "input_tokens": 11, "output_tokens": 5 }
-            }
-        }),
-    ]))])
-    .await;
+    let mut events = message_events("msg-final", 0, "final_answer", &["A", "B"]);
+    events.push(json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp-1",
+            "status": "completed",
+            "output": [message_item("msg-final", "final_answer", "AB")],
+            "usage": { "input_tokens": 11, "output_tokens": 5 }
+        }
+    }));
+    let (base_url, captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
     let model = ConfiguredModel::new(config(base_url, true)).expect("model");
     let (stream, mut rx) = ModelStream::channel();
     let response = model
@@ -64,14 +57,17 @@ async fn streaming_final_text_has_one_live_sink() {
         .await
         .expect("response");
 
-    assert_eq!(rx.recv().await.expect("first").0, "A");
-    assert_eq!(rx.recv().await.expect("second").0, "B");
+    assert_eq!(next_delta(&mut rx).await, "A");
+    assert_eq!(next_delta(&mut rx).await, "B");
+    assert!(matches!(
+        rx.recv().await.expect("done"),
+        ModelStreamEvent::AssistantMessageDone { .. }
+    ));
     assert!(rx.try_recv().is_err());
+    assert_eq!(response.assistant_messages[0].text(), "AB");
     assert_eq!(
-        response.outcome,
-        Some(ModelOutcome::FinalAnswer {
-            text: String::new()
-        })
+        response.assistant_messages[0].phase,
+        AssistantMessagePhase::FinalAnswer
     );
     assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
     assert_eq!(response.usage.expect("usage").input_tokens, 11);
@@ -82,30 +78,32 @@ async fn streaming_final_text_has_one_live_sink() {
 
 #[tokio::test]
 async fn streamed_text_remains_live_when_the_response_also_calls_a_tool() {
-    let body = sse([
-        json!({ "type": "response.output_text.delta", "delta": "Checking orders. " }),
-        json!({
-            "type": "response.output_item.added",
-            "output_index": 1,
-            "item": {
-                "type": "function_call",
-                "call_id": "call-1",
-                "name": "metric_point",
-                "arguments": "{\"metric_id\":\"paid_order_count\"}"
-            }
-        }),
-        json!({
-            "type": "response.completed",
-            "response": mixed_response("Checking orders. ")
-        }),
-    ]);
-    let split_at = body.find("\n\n").expect("first event boundary") + 2;
+    let mut events = message_events("msg-commentary", 0, "commentary", &["Checking orders. "]);
+    events.push(json!({
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "metric_point",
+            "arguments": "{\"metric_id\":\"paid_order_count\"}"
+        }
+    }));
+    events.push(json!({
+        "type": "response.completed",
+        "response": mixed_response("Checking orders. ")
+    }));
+    let body = sse(events);
+    let delta_end = body
+        .find("response.output_text.delta")
+        .and_then(|start| body[start..].find("\n\n").map(|end| start + end + 2))
+        .expect("delta event boundary");
     let release = Arc::new(Notify::new());
     let (base_url, _captured) = spawn_server(vec![MockTurn {
         status: 200,
         content_type: "text/event-stream",
         body,
-        delivery: Delivery::HoldAfter(split_at, Arc::clone(&release)),
+        delivery: Delivery::HoldAfter(delta_end, Arc::clone(&release)),
     }])
     .await;
     let model = ConfiguredModel::new(config(base_url, true)).expect("model");
@@ -119,30 +117,32 @@ async fn streamed_text_remains_live_when_the_response_also_calls_a_tool() {
             .await
     });
 
-    let delta = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let delta = tokio::time::timeout(Duration::from_secs(1), next_delta(&mut rx))
         .await
-        .expect("delta before terminal response")
-        .expect("text delta");
-    assert_eq!(delta.0, "Checking orders. ");
+        .expect("delta before terminal response");
+    assert_eq!(delta, "Checking orders. ");
     assert!(!response.is_finished());
     release.notify_one();
 
     let response = response.await.expect("model task").expect("response");
-    let Some(ModelOutcome::ToolCalls { text, calls }) = response.outcome else {
-        panic!("expected tool calls");
-    };
-    assert!(text.is_empty(), "streamed text must not be replayed");
-    assert_eq!(calls[0].id, "call-1");
+    assert_eq!(response.assistant_messages[0].text(), "Checking orders. ");
+    assert_eq!(
+        response.assistant_messages[0].phase,
+        AssistantMessagePhase::Commentary
+    );
+    assert_eq!(response.tool_calls[0].id, "call-1");
     assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
 }
 
 #[tokio::test]
-async fn no_delta_completed_message_returns_text_once() {
-    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse([json!({
+async fn content_part_text_without_delta_is_forwarded_once() {
+    let mut events =
+        message_events_with_initial("msg-no-delta", 0, "final_answer", "No live delta.");
+    events.push(json!({
         "type": "response.completed",
-        "response": completed_message("No live delta.")
-    })]))])
-    .await;
+        "response": completed_message_with("msg-no-delta", "No live delta.")
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
     let model = ConfiguredModel::new(config(base_url, true)).expect("model");
     let (stream, mut rx) = ModelStream::channel();
     let response = model
@@ -153,25 +153,18 @@ async fn no_delta_completed_message_returns_text_once() {
         .await
         .expect("response");
 
-    assert!(rx.try_recv().is_err());
-    assert_eq!(
-        response.outcome,
-        Some(ModelOutcome::FinalAnswer {
-            text: "No live delta.".to_string()
-        })
-    );
+    assert_eq!(next_delta(&mut rx).await, "No live delta.");
+    assert_eq!(response.assistant_messages[0].text(), "No live delta.");
 }
 
 #[tokio::test]
 async fn stream_buffers_split_multibyte_utf8_until_line_boundary() {
-    let body = sse([
-        json!({ "type": "response.output_text.delta", "delta": "Orders" }),
-        json!({ "type": "response.output_text.delta", "delta": "订单" }),
-        json!({
-            "type": "response.completed",
-            "response": completed_message("Orders订单")
-        }),
-    ]);
+    let mut events = message_events("msg-utf8", 0, "final_answer", &["Orders", "订单"]);
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-utf8", "Orders订单")
+    }));
+    let body = sse(events);
     let split_at = body.find("订单").expect("multibyte text") + 1;
     let (base_url, _captured) = spawn_server(vec![MockTurn {
         status: 200,
@@ -191,20 +184,18 @@ async fn stream_buffers_split_multibyte_utf8_until_line_boundary() {
         .await
         .expect("response");
 
-    assert_eq!(rx.recv().await.expect("first").0, "Orders");
-    assert_eq!(rx.recv().await.expect("second").0, "订单");
+    assert_eq!(next_delta(&mut rx).await, "Orders");
+    assert_eq!(next_delta(&mut rx).await, "订单");
 }
 
 #[tokio::test]
 async fn stream_handles_delivery_split_after_data_line_newline() {
-    let body = sse([
-        json!({ "type": "response.output_text.delta", "delta": "A" }),
-        json!({ "type": "response.output_text.delta", "delta": "B" }),
-        json!({
-            "type": "response.completed",
-            "response": completed_message("AB")
-        }),
-    ]);
+    let mut events = message_events("msg-split", 0, "final_answer", &["A", "B"]);
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-split", "AB")
+    }));
+    let body = sse(events);
     let split_at = body.find('\n').expect("first line newline") + 1;
     let (base_url, _captured) = spawn_server(vec![MockTurn {
         status: 200,
@@ -224,8 +215,8 @@ async fn stream_handles_delivery_split_after_data_line_newline() {
         .await
         .expect("response");
 
-    assert_eq!(rx.recv().await.expect("first").0, "A");
-    assert_eq!(rx.recv().await.expect("second").0, "B");
+    assert_eq!(next_delta(&mut rx).await, "A");
+    assert_eq!(next_delta(&mut rx).await, "B");
 }
 
 #[tokio::test]
@@ -277,11 +268,11 @@ async fn function_call_arguments_are_private_and_decoded() {
         .expect("response");
 
     assert!(rx.try_recv().is_err());
-    let Some(ModelOutcome::ToolCalls { calls, .. }) = response.outcome else {
-        panic!("expected tool calls");
-    };
-    assert_eq!(calls[0].id, "call-1");
-    assert_eq!(calls[0].input["metric_id"], "paid_order_count");
+    assert_eq!(response.tool_calls[0].id, "call-1");
+    assert_eq!(
+        response.tool_calls[0].input["metric_id"],
+        "paid_order_count"
+    );
 }
 
 #[tokio::test]
@@ -354,7 +345,9 @@ async fn malformed_responses_fail_structurally() {
 
 #[tokio::test]
 async fn retry_stops_after_public_answer_delta() {
-    let first = sse([json!({ "type": "response.output_text.delta", "delta": "A" })]);
+    let mut events = message_events("msg-truncated", 0, "final_answer", &["A"]);
+    events.truncate(3);
+    let first = sse(events);
     let (base_url, captured) = spawn_server(vec![MockTurn {
         status: 200,
         content_type: "text/event-stream",
@@ -376,8 +369,42 @@ async fn retry_stops_after_public_answer_delta() {
         .expect_err("must not retry");
 
     assert!(err.to_string().contains("after 1 attempts"));
-    assert_eq!(rx.recv().await.expect("delta").0, "A");
+    assert_eq!(next_delta(&mut rx).await, "A");
     assert_eq!(captured.lock().expect("captured").len(), 1);
+}
+
+#[tokio::test]
+async fn conflicting_completed_item_is_rejected_without_done() {
+    let mut events = message_events("msg-conflict", 0, "final_answer", &["A"]);
+    events.last_mut().expect("item done")["item"]["content"][0]["text"] = json!("B");
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-conflict", "B")
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+
+    let error = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect_err("conflicting item must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("streamed message bytes differed")
+    );
+    assert_eq!(next_delta(&mut rx).await, "A");
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(
+            event,
+            ModelStreamEvent::AssistantMessageDone { .. }
+        ));
+    }
 }
 
 fn config(base_url: String, stream: bool) -> AgentConfig {
@@ -419,19 +446,126 @@ fn ok_message(text: &str) -> String {
 }
 
 fn completed_message(text: &str) -> Value {
+    completed_message_with("msg-final", text)
+}
+
+fn completed_message_with(id: &str, text: &str) -> Value {
     json!({
         "id": "resp-ok",
         "status": "completed",
-        "output": [message_item(text)]
+        "output": [message_item(id, "final_answer", text)]
     })
 }
 
-fn message_item(text: &str) -> Value {
+fn message_item(id: &str, phase: &str, text: &str) -> Value {
     json!({
+        "id": id,
         "type": "message",
+        "status": "completed",
         "role": "assistant",
+        "phase": phase,
         "content": [{ "type": "output_text", "text": text }]
     })
+}
+
+fn message_events(id: &str, output_index: usize, phase: &str, deltas: &[&str]) -> Vec<Value> {
+    let text = deltas.concat();
+    let mut events = vec![
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "phase": phase,
+                "content": []
+            }
+        }),
+        json!({
+            "type": "response.content_part.added",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "" }
+        }),
+    ];
+    events.extend(deltas.iter().map(|delta| {
+        json!({
+            "type": "response.output_text.delta",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "delta": delta
+        })
+    }));
+    events.extend([
+        json!({
+            "type": "response.output_text.done",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text
+        }),
+        json!({
+            "type": "response.content_part.done",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": text }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": message_item(id, phase, &text)
+        }),
+    ]);
+    events
+}
+
+fn message_events_with_initial(
+    id: &str,
+    output_index: usize,
+    phase: &str,
+    text: &str,
+) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "phase": phase,
+                "content": []
+            }
+        }),
+        json!({
+            "type": "response.content_part.added",
+            "item_id": id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": text }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": message_item(id, phase, text)
+        }),
+    ]
+}
+
+async fn next_delta(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ModelStreamEvent>) -> String {
+    loop {
+        if let ModelStreamEvent::AssistantMessageDelta { delta, .. } =
+            rx.recv().await.expect("model stream event")
+        {
+            return delta;
+        }
+    }
 }
 
 fn mixed_response(text: &str) -> Value {
@@ -439,7 +573,7 @@ fn mixed_response(text: &str) -> Value {
         "id": "resp-mixed",
         "status": "completed",
         "output": [
-            message_item(text),
+            message_item("msg-commentary", "commentary", text),
             {
                 "type": "function_call",
                 "call_id": "call-1",
@@ -455,8 +589,11 @@ fn completed_refusal() -> Value {
         "id": "resp-refusal",
         "status": "completed",
         "output": [{
+            "id": "msg-refusal",
             "type": "message",
+            "status": "completed",
             "role": "assistant",
+            "phase": "final_answer",
             "content": [{ "type": "refusal", "refusal": "Cannot comply." }]
         }]
     })

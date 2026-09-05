@@ -78,9 +78,12 @@ pub(super) async fn complete(
         ctx.run_id.as_str(),
         presentation.tool_use_id
     ));
+    ctx.emit(AgentSignal::AssistantMessageStarted {
+        message_id: message_id.clone(),
+    })
+    .await?;
     ctx.emit(AgentSignal::AssistantMessageDelta {
         message_id: message_id.clone(),
-        phase: AssistantMessagePhase::FinalAnswer,
         delta: presentation.receipt.clone(),
         index: 0,
     })

@@ -6,8 +6,9 @@ use crate::deepseek::{
     tool_result_content,
 };
 use crate::{
-    AgentConfig, AgentError, AgentMessage, AgentToolSpec, ContentBlock, ModelOutcome, ModelRequest,
-    ModelResponse, SpeedProfile, StopReason, ToolUse, Usage,
+    AgentConfig, AgentError, AgentMessage, AgentToolSpec, AssistantMessageId, AssistantMessageItem,
+    AssistantMessagePhase, AssistantTextPart, ContentBlock, ModelRequest, ModelResponse,
+    ResponseContentIndex, ResponseOutputIndex, SpeedProfile, StopReason, ToolUse, Usage,
 };
 
 #[derive(Debug, Serialize)]
@@ -117,11 +118,12 @@ impl From<AgentError> for DecodeFailure {
 
 pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, AgentError> {
     fail_if_error(&raw)?;
-    let decoded = decode_output(&raw, true)?;
+    let decoded = decode_output(&raw)?;
     let usage = raw.get("usage").cloned().map(decode_usage).transpose()?;
     let stop_reason = stop_reason(&raw, &decoded);
     Ok(ModelResponse {
-        outcome: decoded.outcome,
+        assistant_messages: decoded.assistant_messages,
+        tool_calls: decoded.tool_calls,
         reasoning: decoded.reasoning,
         stop_reason,
         response_id: raw
@@ -133,12 +135,9 @@ pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, Age
     })
 }
 
-pub(crate) fn model_response_shape(
-    raw: &Value,
-    include_message_text: bool,
-) -> Result<DecodedOutput, AgentError> {
+pub(crate) fn model_response_shape(raw: &Value) -> Result<DecodedOutput, AgentError> {
     fail_if_error(raw)?;
-    decode_output(raw, include_message_text)
+    decode_output(raw)
 }
 
 pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
@@ -164,14 +163,9 @@ pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
 
 #[derive(Debug)]
 pub(crate) struct DecodedOutput {
-    pub(crate) outcome: Option<ModelOutcome>,
+    pub(crate) assistant_messages: Vec<AssistantMessageItem>,
+    pub(crate) tool_calls: Vec<ToolUse>,
     pub(crate) reasoning: Vec<String>,
-    pub(crate) message_seen: bool,
-    pub(crate) tool_seen: bool,
-}
-
-pub(crate) fn usage_from_value(value: Value) -> Result<Usage, AgentError> {
-    decode_usage(value)
 }
 
 fn reasoning(config: &AgentConfig) -> ResponseReasoning {
@@ -216,7 +210,9 @@ fn append_user_items(out: &mut Vec<Value>, content: &[ContentBlock]) -> Result<(
                     "output": tool_result_content(&result.content)?
                 }));
             }
-            ContentBlock::Thinking { .. } | ContentBlock::ToolUse(_) => {
+            ContentBlock::AssistantMessage(_)
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::ToolUse(_) => {
                 return Err(AgentError::Model(
                     "user message contains assistant-only content block".to_string(),
                 ));
@@ -235,10 +231,23 @@ fn append_assistant_items(
     for block in content {
         match block {
             ContentBlock::Text { text: value } => text.push(value.clone()),
-            ContentBlock::Thinking { text: value, .. } => out.push(json!({
-                "type": "reasoning",
-                "content": [{ "type": "reasoning_text", "text": value }]
-            })),
+            ContentBlock::AssistantMessage(message) => {
+                flush_message(out, "assistant", &mut text);
+                out.push(json!({
+                    "id": message.id.as_str(),
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": phase_value(message.phase),
+                    "content": assistant_content(message)?
+                }));
+            }
+            ContentBlock::Thinking { text: value, .. } => {
+                flush_message(out, "assistant", &mut text);
+                out.push(json!({
+                    "type": "reasoning",
+                    "content": [{ "type": "reasoning_text", "text": value }]
+                }));
+            }
             ContentBlock::ToolUse(tool_use) => {
                 flush_message(out, "assistant", &mut text);
                 out.push(json!({
@@ -259,6 +268,26 @@ fn append_assistant_items(
     Ok(())
 }
 
+fn assistant_content(message: &AssistantMessageItem) -> Result<Vec<Value>, AgentError> {
+    message
+        .content
+        .iter()
+        .enumerate()
+        .map(|(index, part)| {
+            if part.index.get() != index {
+                return Err(AgentError::Model(format!(
+                    "assistant message content index {} did not match position {index}",
+                    part.index.get()
+                )));
+            }
+            Ok(json!({
+                "type": "output_text",
+                "text": part.text,
+            }))
+        })
+        .collect()
+}
+
 fn flush_message(out: &mut Vec<Value>, role: &str, text: &mut Vec<String>) {
     if text.is_empty() {
         return;
@@ -269,6 +298,13 @@ fn flush_message(out: &mut Vec<Value>, role: &str, text: &mut Vec<String>) {
         "content": text.join("")
     }));
     text.clear();
+}
+
+fn phase_value(phase: AssistantMessagePhase) -> &'static str {
+    match phase {
+        AssistantMessagePhase::Commentary => "commentary",
+        AssistantMessagePhase::FinalAnswer => "final_answer",
+    }
 }
 
 fn tools_to_responses(tools: &[AgentToolSpec]) -> Vec<Value> {
@@ -302,26 +338,28 @@ fn fail_if_error(raw: &Value) -> Result<(), AgentError> {
     Err(AgentError::Model(message.to_string()))
 }
 
-fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutput, AgentError> {
+fn decode_output(raw: &Value) -> Result<DecodedOutput, AgentError> {
     let items = raw
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| AgentError::Model("responses output must be an array".to_string()))?;
-    let mut output = OutputItems::default();
+    let mut assistant_messages = Vec::new();
+    let mut tool_calls = Vec::new();
     let mut reasoning = Vec::new();
-    for item in items {
+    for (index, item) in items.iter().enumerate() {
+        if matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("in_progress" | "incomplete")
+        ) {
+            continue;
+        }
         match item.get("type").and_then(Value::as_str) {
             Some("reasoning") => extend_reasoning(&mut reasoning, item)?,
-            Some("message") => {
-                let text = message_text(item)?;
-                output.message_seen = true;
-                if include_message_text {
-                    output.text.push_str(&text);
-                }
-            }
-            Some("function_call") => {
-                output.calls.push(tool_use_from_item(item)?);
-            }
+            Some("message") => assistant_messages.push(assistant_message_from_item(
+                item,
+                ResponseOutputIndex::new(index),
+            )?),
+            Some("function_call") => tool_calls.push(tool_use_from_item(item)?),
             Some(other) => {
                 return Err(AgentError::Model(format!(
                     "unsupported responses output item: {other}"
@@ -334,7 +372,11 @@ fn decode_output(raw: &Value, include_message_text: bool) -> Result<DecodedOutpu
             }
         }
     }
-    Ok(output.into_decoded(reasoning))
+    Ok(DecodedOutput {
+        assistant_messages,
+        tool_calls,
+        reasoning,
+    })
 }
 
 fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), AgentError> {
@@ -365,77 +407,89 @@ fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), Agent
     Ok(())
 }
 
-fn message_text(item: &Value) -> Result<String, AgentError> {
+pub(crate) fn assistant_message_from_item(
+    item: &Value,
+    output_index: ResponseOutputIndex,
+) -> Result<AssistantMessageItem, AgentError> {
+    let id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AgentError::Model("message output missing id".to_string()))?;
+    if item.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(AgentError::Model(
+            "message output role must be assistant".to_string(),
+        ));
+    }
+    if item
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status != "completed")
+    {
+        return Err(AgentError::Model(
+            "message output was not completed".to_string(),
+        ));
+    }
+    let phase = match item.get("phase").and_then(Value::as_str) {
+        Some("commentary") => AssistantMessagePhase::Commentary,
+        Some("final_answer") => AssistantMessagePhase::FinalAnswer,
+        Some(other) => {
+            return Err(AgentError::Model(format!(
+                "unsupported message output phase: {other}"
+            )));
+        }
+        None => {
+            return Err(AgentError::Model(
+                "message output missing phase".to_string(),
+            ));
+        }
+    };
     let parts = item
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| AgentError::Model("message output missing content".to_string()))?;
-    let mut text = String::new();
-    for part in parts {
-        match part.get("type").and_then(Value::as_str) {
-            Some("output_text") => {
-                let part_text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| AgentError::Model("output_text missing text".to_string()))?;
-                text.push_str(part_text);
-            }
-            Some("refusal") => {
-                return Err(AgentError::Model("model returned a refusal".to_string()));
-            }
-            Some(other) => {
-                return Err(AgentError::Model(format!(
+    let content = parts
+        .iter()
+        .enumerate()
+        .map(
+            |(index, part)| match part.get("type").and_then(Value::as_str) {
+                Some("output_text") => {
+                    let text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| AgentError::Model("output_text missing text".to_string()))?;
+                    Ok(AssistantTextPart {
+                        index: ResponseContentIndex::new(index),
+                        text: text.to_string(),
+                    })
+                }
+                Some("refusal") => Err(AgentError::Model("model returned a refusal".to_string())),
+                Some(other) => Err(AgentError::Model(format!(
                     "unsupported message content item: {other}"
-                )));
-            }
-            None => {
-                return Err(AgentError::Model(
+                ))),
+                None => Err(AgentError::Model(
                     "message content item missing type".to_string(),
-                ));
-            }
-        }
-    }
-    Ok(text)
-}
-
-#[derive(Default)]
-struct OutputItems {
-    text: String,
-    message_seen: bool,
-    calls: Vec<ToolUse>,
-}
-
-impl OutputItems {
-    fn into_decoded(self, reasoning: Vec<String>) -> DecodedOutput {
-        let tool_seen = !self.calls.is_empty();
-        let outcome = if tool_seen {
-            Some(ModelOutcome::ToolCalls {
-                text: self.text,
-                calls: self.calls,
-            })
-        } else if self.message_seen {
-            Some(ModelOutcome::FinalAnswer { text: self.text })
-        } else {
-            None
-        };
-        DecodedOutput {
-            outcome,
-            reasoning,
-            message_seen: self.message_seen,
-            tool_seen,
-        }
-    }
+                )),
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AssistantMessageItem {
+        id: AssistantMessageId::new(id),
+        output_index,
+        phase,
+        content,
+    })
 }
 
 fn stop_reason(raw: &Value, decoded: &DecodedOutput) -> Option<StopReason> {
     match raw.get("status").and_then(Value::as_str) {
         Some("incomplete") => Some(incomplete_reason(raw)),
-        Some("completed") if decoded.tool_seen => Some(StopReason::ToolUse),
-        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
+        Some("completed") if !decoded.tool_calls.is_empty() => Some(StopReason::ToolUse),
+        Some("completed") if !decoded.assistant_messages.is_empty() => Some(StopReason::EndTurn),
         Some("failed") | Some("cancelled") => Some(StopReason::Refusal),
         Some(other) => Some(StopReason::Other(other.to_string())),
-        None if decoded.tool_seen => Some(StopReason::ToolUse),
-        None if decoded.message_seen => Some(StopReason::EndTurn),
+        None if !decoded.tool_calls.is_empty() => Some(StopReason::ToolUse),
+        None if !decoded.assistant_messages.is_empty() => Some(StopReason::EndTurn),
         None => None,
     }
 }

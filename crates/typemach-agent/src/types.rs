@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::presentation::ToolDisposition;
+use crate::{AssistantMessageId, AssistantMessageItem, AssistantMessagePhase};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +48,7 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    AssistantMessage(AssistantMessageItem),
     ConversationDigest(ConversationDigest),
     Thinking {
         text: String,
@@ -202,8 +204,10 @@ pub struct ModelRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<ModelOutcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assistant_messages: Vec<AssistantMessageItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolUse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,19 +218,6 @@ pub struct ModelResponse {
     pub raw: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ModelOutcome {
-    FinalAnswer {
-        text: String,
-    },
-    ToolCalls {
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        text: String,
-        calls: Vec<ToolUse>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,39 +507,14 @@ pub struct TerminalAction {
     pub input: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AssistantMessageId(String);
-
-impl AssistantMessageId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for AssistantMessageId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AssistantMessagePhase {
-    Commentary,
-    FinalAnswer,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSignal {
+    AssistantMessageStarted {
+        message_id: AssistantMessageId,
+    },
     AssistantMessageDelta {
         message_id: AssistantMessageId,
-        phase: AssistantMessagePhase,
         delta: String,
         index: usize,
     },
@@ -738,10 +704,9 @@ mod type_contracts {
     use super::*;
 
     #[test]
-    fn assistant_delta_serializes_its_phase() {
+    fn assistant_delta_is_pending_until_done() {
         let signal = AgentSignal::AssistantMessageDelta {
             message_id: AssistantMessageId::new("run-1:turn-1"),
-            phase: AssistantMessagePhase::Commentary,
             delta: "Checking data.".to_string(),
             index: 0,
         };
@@ -751,7 +716,6 @@ mod type_contracts {
             json!({
                 "type": "assistant_message_delta",
                 "message_id": "run-1:turn-1",
-                "phase": "commentary",
                 "delta": "Checking data.",
                 "index": 0
             })

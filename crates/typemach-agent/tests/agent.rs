@@ -11,19 +11,23 @@ use typemach_agent::{
     AgentBudget, AgentError, AgentEventReceiver, AgentMessage, AgentModel, AgentRunInput,
     AgentRunOutput, AgentSignal, AgentState, AgentStep, AgentToolSpec, AllowAllTools,
     AskUserQuestion, AssistantMessagePhase, ContentBlock, ContextPolicy, FinishReason,
-    HumanInputAnswer, ModelOutcome, ModelRequest, ModelResponse, ModelStream, StopReason,
-    TerminalAction, ToolAnnotations, ToolCallRequest, ToolRegistry, ToolResult, ToolUse,
-    build_agent_runner, build_agent_runner_with_context_policy,
+    HumanInputAnswer, ModelRequest, ModelResponse, ModelStream, StopReason, TerminalAction,
+    ToolAnnotations, ToolCallRequest, ToolRegistry, ToolResult, ToolUse, build_agent_runner,
+    build_agent_runner_with_context_policy,
 };
 
 #[path = "agent/builtin_validation.rs"]
 mod builtin_validation;
 #[path = "agent/final_answer.rs"]
 mod final_answer;
+#[path = "agent/model_fixtures.rs"]
+mod model_fixtures;
 #[path = "agent/tool_artifacts.rs"]
 mod tool_artifacts;
 #[path = "agent/tool_presentation.rs"]
 mod tool_presentation;
+
+use model_fixtures::*;
 
 #[derive(Clone, Default)]
 struct ScriptedModel {
@@ -175,24 +179,16 @@ async fn collect(
 #[tokio::test]
 async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
     let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "ask-1".to_string(),
-                    name: "ask_user".to_string(),
-                    input: json!({ "question": "Which date?", "fields": { "type": "choice" } }),
-                    raw: None,
-                }],
-            }),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "On 2026-06-08, the order count is 42.".to_string(),
-            }),
-            ..ModelResponse::default()
-        },
+        tool_response(
+            "",
+            vec![ToolUse {
+                id: "ask-1".to_string(),
+                name: "ask_user".to_string(),
+                input: json!({ "question": "Which date?", "fields": { "type": "choice" } }),
+                raw: None,
+            }],
+        ),
+        final_response("On 2026-06-08, the order count is 42."),
     ]);
     let runner = build_agent_runner(
         MemorySaver::default(),
@@ -292,28 +288,24 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
 async fn reasoning_blocks_are_persisted_without_polluting_answer() {
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            reasoning: vec!["private tool reasoning".to_string()],
+            stop_reason: Some(StopReason::ToolUse),
+            response_id: Some("msg-1".to_string()),
+            raw: Some(json!({ "id": "msg-1" })),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
                     input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
                     raw: Some(json!({ "id": "tool-1", "index": 0 })),
                 }],
-            }),
-            reasoning: vec!["private tool reasoning".to_string()],
-            stop_reason: Some(StopReason::ToolUse),
-            response_id: Some("msg-1".to_string()),
-            raw: Some(json!({ "id": "msg-1" })),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "The order count is 42.".to_string(),
-            }),
             reasoning: vec!["private final reasoning".to_string()],
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("The order count is 42.")
         },
     ]);
     let runner = build_agent_runner(
@@ -364,17 +356,16 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
 #[tokio::test]
 async fn terminal_tool_completes_without_dispatching_registry_tool() {
     let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: "The report cannot continue. ".to_string(),
-            calls: vec![ToolUse {
+        stop_reason: Some(StopReason::ToolUse),
+        ..tool_response(
+            "The report cannot continue. ",
+            vec![ToolUse {
                 id: "term-1".to_string(),
                 name: "report".to_string(),
                 input: json!({ "message": "Not enough evidence to continue." }),
                 raw: None,
             }],
-        }),
-        stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
+        )
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
@@ -429,12 +420,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
 
 #[tokio::test]
 async fn compacted_prompt_window_does_not_drop_persisted_messages() {
-    let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::FinalAnswer {
-            text: "Continue.".to_string(),
-        }),
-        ..ModelResponse::default()
-    }]);
+    let model = ScriptedModel::new([final_response("Continue.")]);
     let context_policy = ContextPolicy {
         compact_at_tokens: 1,
         max_input_tokens: 128,
@@ -491,24 +477,18 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
 async fn large_tool_result_is_archived_before_next_prompt() {
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "tool-1".to_string(),
                     name: "large_evidence".to_string(),
                     input: json!({}),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Evidence loaded.".to_string(),
-            }),
-            ..ModelResponse::default()
-        },
+        final_response("Evidence loaded."),
     ]);
     let context_policy = ContextPolicy {
         max_tool_result_bytes: 32,
@@ -589,24 +569,16 @@ fn content_block_serde_shape_is_flat_and_defaults_annotations() {
 #[tokio::test]
 async fn abandoned_ask_user_is_repaired_on_next_start() {
     let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "ask-1".to_string(),
-                    name: "ask_user".to_string(),
-                    input: json!({ "question": "Which date?" }),
-                    raw: None,
-                }],
-            }),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "There are 7 units in stock.".to_string(),
-            }),
-            ..ModelResponse::default()
-        },
+        tool_response(
+            "",
+            vec![ToolUse {
+                id: "ask-1".to_string(),
+                name: "ask_user".to_string(),
+                input: json!({ "question": "Which date?" }),
+                raw: None,
+            }],
+        ),
+        final_response("There are 7 units in stock."),
     ]);
     let runner = build_agent_runner(
         MemorySaver::default(),
@@ -687,24 +659,16 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
 #[tokio::test]
 async fn system_suffix_reaches_model_request_and_survives_resume() {
     let model = ScriptedModel::new([
-        ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
-                    id: "ask-1".to_string(),
-                    name: "ask_user".to_string(),
-                    input: json!({ "question": "Which date?" }),
-                    raw: None,
-                }],
-            }),
-            ..ModelResponse::default()
-        },
-        ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Done.".to_string(),
-            }),
-            ..ModelResponse::default()
-        },
+        tool_response(
+            "",
+            vec![ToolUse {
+                id: "ask-1".to_string(),
+                name: "ask_user".to_string(),
+                input: json!({ "question": "Which date?" }),
+                raw: None,
+            }],
+        ),
+        final_response("Done."),
     ]);
     let runner = build_agent_runner(
         MemorySaver::default(),

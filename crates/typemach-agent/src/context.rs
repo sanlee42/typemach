@@ -110,6 +110,9 @@ fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
         .iter()
         .map(|block| match block {
             ContentBlock::Text { text } => ContentBlock::Text { text: text.clone() },
+            ContentBlock::AssistantMessage(message) => {
+                ContentBlock::AssistantMessage(message.clone())
+            }
             ContentBlock::ConversationDigest(digest) => {
                 ContentBlock::ConversationDigest(digest.clone())
             }

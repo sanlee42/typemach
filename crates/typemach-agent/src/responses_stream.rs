@@ -4,8 +4,14 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::responses::{DecodeFailure, model_response_shape, tool_use_from_item, usage_from_value};
-use crate::{AgentError, ModelOutcome, ModelResponse, ModelStream, StopReason, ToolUse, Usage};
+use crate::responses::{
+    DecodeFailure, assistant_message_from_item, model_response_from_value, model_response_shape,
+    tool_use_from_item,
+};
+use crate::{
+    AgentError, AssistantMessageId, AssistantMessageItem, AssistantTextPart, ModelResponse,
+    ModelStream, ModelStreamEvent, ResponseContentIndex, ResponseOutputIndex, StopReason,
+};
 
 #[derive(Debug, Deserialize)]
 struct Event {
@@ -14,32 +20,41 @@ struct Event {
     #[serde(default)]
     delta: Option<String>,
     #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
     output_index: Option<usize>,
     #[serde(default)]
+    content_index: Option<usize>,
+    #[serde(default)]
     item: Option<Value>,
+    #[serde(default)]
+    part: Option<Value>,
     #[serde(default)]
     response: Option<Value>,
 }
 
-#[derive(Debug, Default)]
-struct ToolCallBuilder {
-    call_id: Option<String>,
-    name: Option<String>,
-    arguments: String,
-    raw: Option<Value>,
+#[derive(Debug)]
+struct MessageBuilder {
+    id: AssistantMessageId,
+    output_index: ResponseOutputIndex,
+    content: BTreeMap<ResponseContentIndex, String>,
+    next_delta_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalKind {
+    Completed,
+    Incomplete,
 }
 
 #[derive(Debug, Default)]
 struct Accumulator {
-    response_id: Option<String>,
-    status: Option<String>,
-    message_seen: bool,
-    function_calls: BTreeMap<usize, ToolCallBuilder>,
-    completed_text: String,
-    reasoning: Vec<String>,
-    streamed_text: bool,
-    usage: Option<Usage>,
-    stop_reason: Option<StopReason>,
+    active_messages: BTreeMap<ResponseOutputIndex, MessageBuilder>,
+    completed_messages: Vec<AssistantMessageItem>,
+    response: Option<ModelResponse>,
+    terminal: Option<TerminalKind>,
 }
 
 pub(crate) async fn decode_stream(
@@ -60,23 +75,7 @@ pub(crate) async fn decode_stream(
     if pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
         handle_stream_line(decode_line(pending)?, &stream, &mut acc)?;
     }
-    let stop_reason = acc.stop_reason.clone().or_else(|| inferred_stop(&acc));
-    if acc.status.is_none() {
-        return Err(DecodeFailure::protocol_message(
-            "responses stream ended without a terminal event".to_string(),
-        ));
-    }
-    let response_id = acc.response_id.clone();
-    let usage = acc.usage.clone();
-    let reasoning = acc.reasoning.clone();
-    Ok(ModelResponse {
-        outcome: outcome(acc)?,
-        reasoning,
-        stop_reason,
-        response_id,
-        usage,
-        ..ModelResponse::default()
-    })
+    acc.finish()
 }
 
 fn decode_line(mut line: Vec<u8>) -> Result<String, AgentError> {
@@ -106,41 +105,15 @@ fn handle_stream_line(
         DecodeFailure::protocol_message(format!("responses stream event was invalid: {err}"))
     })?;
     match event.kind.as_str() {
-        "response.output_text.delta" => {
-            let Some(delta) = event.delta else {
-                return Err(DecodeFailure::protocol_message(
-                    "output_text delta missing text".to_string(),
-                ));
-            };
-            acc.message_seen = true;
-            acc.streamed_text = true;
-            stream.output_text(delta)?;
-        }
-        "response.reasoning_text.delta" => {}
-        "response.function_call_arguments.delta" => {
-            let index = event.output_index.ok_or_else(|| {
-                AgentError::Model("function_call delta missing output_index".to_string())
-            })?;
-            let builder = acc.function_call(index);
-            if let Some(delta) = event.delta {
-                builder.arguments.push_str(&delta);
-            }
-        }
-        "response.output_item.added" | "response.output_item.done" => {
-            let index = event.output_index.ok_or_else(|| {
-                AgentError::Model("output item event missing output_index".to_string())
-            })?;
-            let item = event
-                .item
-                .ok_or_else(|| AgentError::Model("output item event missing item".to_string()))?;
-            merge_item(acc, index, item)?;
-        }
-        "response.completed" | "response.incomplete" => {
-            let response = event
-                .response
-                .ok_or_else(|| AgentError::Model("response event missing response".to_string()))?;
-            merge_response(acc, response)?;
-        }
+        "response.output_item.added" => add_item(event, stream, acc)?,
+        "response.content_part.added" => add_content(event, stream, acc)?,
+        "response.output_text.delta" => append_text(event, stream, acc)?,
+        "response.output_text.done" => finish_text(event, acc)?,
+        "response.content_part.done" => finish_content(event, acc)?,
+        "response.output_item.done" => finish_item(event, stream, acc)?,
+        "response.reasoning_text.delta" | "response.function_call_arguments.delta" => {}
+        "response.completed" => finish_response(event, TerminalKind::Completed, acc)?,
+        "response.incomplete" => finish_response(event, TerminalKind::Incomplete, acc)?,
         "response.failed" => {
             return Err(DecodeFailure::protocol_message(
                 "responses request failed".to_string(),
@@ -156,38 +129,50 @@ fn handle_stream_line(
     Ok(())
 }
 
-fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), AgentError> {
+fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result<(), AgentError> {
+    let output_index = event_output_index(&event)?;
+    let item = event
+        .item
+        .as_ref()
+        .ok_or_else(|| AgentError::Model("output item event missing item".to_string()))?;
     match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => {
-            let builder = acc.function_call(index);
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::Model("function_call missing call_id".to_string()))?;
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::Model("function_call missing name".to_string()))?;
-            let arguments = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::Model("function_call missing arguments".to_string()))?;
-            builder.call_id = Some(call_id.to_string());
-            builder.name = Some(name.to_string());
-            if builder.arguments.is_empty() {
-                builder.arguments.push_str(arguments);
-            }
-            builder.raw = Some(item);
-        }
         Some("message") => {
-            let raw = serde_json::json!({ "output": [item] });
-            model_response_shape(&raw, false)?;
-            acc.message_seen = true;
+            let id = message_id(item)?;
+            if acc.active_messages.contains_key(&output_index)
+                || acc
+                    .completed_messages
+                    .iter()
+                    .any(|message| message.output_index == output_index)
+            {
+                return Err(AgentError::Model(format!(
+                    "duplicate message output index {}",
+                    output_index.get()
+                )));
+            }
+            if acc.active_messages.values().any(|message| message.id == id)
+                || acc
+                    .completed_messages
+                    .iter()
+                    .any(|message| message.id == id)
+            {
+                return Err(AgentError::Model("duplicate message item id".to_string()));
+            }
+            acc.active_messages.insert(
+                output_index,
+                MessageBuilder {
+                    id: id.clone(),
+                    output_index,
+                    content: BTreeMap::new(),
+                    next_delta_index: 0,
+                },
+            );
+            stream.emit(ModelStreamEvent::AssistantMessageStarted {
+                message_id: id,
+                output_index,
+            })?;
         }
-        Some("reasoning") => {
-            let raw = serde_json::json!({ "output": [item] });
-            model_response_shape(&raw, false)?;
-        }
+        Some("function_call") => validate_function_item(item, false)?,
+        Some("reasoning") => validate_shape(item)?,
         Some(other) => {
             return Err(AgentError::Model(format!(
                 "unsupported responses output item: {other}"
@@ -198,163 +183,305 @@ fn merge_item(acc: &mut Accumulator, index: usize, item: Value) -> Result<(), Ag
     Ok(())
 }
 
-fn merge_response(acc: &mut Accumulator, response: Value) -> Result<(), AgentError> {
-    if acc.response_id.is_none() {
-        acc.response_id = response
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+fn add_content(
+    event: Event,
+    stream: &ModelStream,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    let (message, content_index) = active_content(&event, acc)?;
+    let part = event
+        .part
+        .as_ref()
+        .ok_or_else(|| AgentError::Model("content part event missing part".to_string()))?;
+    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+        return Err(AgentError::Model(
+            "message content part must be output_text".to_string(),
+        ));
     }
-    if acc.status.is_none() {
-        acc.status = response
-            .get("status")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-    }
-    if acc.usage.is_none()
-        && let Some(usage) = response.get("usage").cloned()
+    let initial = part.get("text").and_then(Value::as_str).unwrap_or_default();
+    if message
+        .content
+        .insert(content_index, String::new())
+        .is_some()
     {
-        acc.usage = Some(usage_from_value(usage)?);
+        return Err(AgentError::Model(format!(
+            "duplicate message content index {}",
+            content_index.get()
+        )));
     }
-    let decoded = model_response_shape(&response, !acc.streamed_text)?;
-    if let Some(reason) = response_stop(&response, &decoded) {
-        acc.stop_reason = Some(reason);
-    }
-    acc.message_seen |= decoded.message_seen;
-    acc.reasoning = decoded.reasoning;
-    match decoded.outcome {
-        Some(ModelOutcome::FinalAnswer { text }) => {
-            append_snapshot_text(acc, &text);
-        }
-        Some(ModelOutcome::ToolCalls { text, calls }) => {
-            append_snapshot_text(acc, &text);
-            for call in calls {
-                upsert_tool(acc, call);
-            }
-        }
-        None => {}
+    if !initial.is_empty() {
+        let index = message.next_delta_index;
+        message.next_delta_index += 1;
+        message
+            .content
+            .get_mut(&content_index)
+            .expect("inserted content part")
+            .push_str(initial);
+        stream.emit(ModelStreamEvent::AssistantMessageDelta {
+            message_id: message.id.clone(),
+            output_index: message.output_index,
+            content_index,
+            delta: initial.to_string(),
+            index,
+        })?;
     }
     Ok(())
 }
 
-fn append_snapshot_text(acc: &mut Accumulator, text: &str) {
-    if !acc.streamed_text {
-        acc.completed_text.push_str(text);
-    }
-}
-
-fn upsert_tool(acc: &mut Accumulator, tool: ToolUse) {
-    let builders = &mut acc.function_calls;
-    if let Some((_, builder)) = builders
-        .iter_mut()
-        .find(|(_, builder)| builder.call_id.as_deref() == Some(tool.id.as_str()))
-    {
-        builder.arguments = arguments_from_tool(&tool);
-        builder.call_id = Some(tool.id);
-        builder.name = Some(tool.name);
-        builder.raw = tool.raw;
-        return;
-    }
-    let index = builders.keys().next_back().copied().unwrap_or(0) + 1;
-    builders.insert(
+fn append_text(
+    event: Event,
+    stream: &ModelStream,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    let delta = event
+        .delta
+        .clone()
+        .ok_or_else(|| AgentError::Model("output_text delta missing text".to_string()))?;
+    let (message, content_index) = active_content(&event, acc)?;
+    let part = message.content.get_mut(&content_index).ok_or_else(|| {
+        AgentError::Model(format!(
+            "output_text delta preceded content part {}",
+            content_index.get()
+        ))
+    })?;
+    part.push_str(&delta);
+    let index = message.next_delta_index;
+    message.next_delta_index += 1;
+    stream.emit(ModelStreamEvent::AssistantMessageDelta {
+        message_id: message.id.clone(),
+        output_index: message.output_index,
+        content_index,
+        delta,
         index,
-        ToolCallBuilder {
-            call_id: Some(tool.id.clone()),
-            name: Some(tool.name.clone()),
-            arguments: arguments_from_tool(&tool),
-            raw: tool.raw,
-        },
-    );
+    })?;
+    Ok(())
 }
 
-fn arguments_from_tool(tool: &ToolUse) -> String {
-    tool.raw
+fn finish_text(event: Event, acc: &mut Accumulator) -> Result<(), AgentError> {
+    let completed = event
+        .text
+        .clone()
+        .ok_or_else(|| AgentError::Model("output_text done missing text".to_string()))?;
+    let (message, content_index) = active_content(&event, acc)?;
+    verify_part(message, content_index, &completed)
+}
+
+fn finish_content(event: Event, acc: &mut Accumulator) -> Result<(), AgentError> {
+    let part = event
+        .part
         .as_ref()
-        .and_then(|raw| raw.get("arguments"))
+        .ok_or_else(|| AgentError::Model("content part event missing part".to_string()))?;
+    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+        return Err(AgentError::Model(
+            "message content part must be output_text".to_string(),
+        ));
+    }
+    let completed = part
+        .get("text")
         .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| tool.input.to_string())
+        .ok_or_else(|| AgentError::Model("output_text content part missing text".to_string()))?;
+    let (message, content_index) = active_content(&event, acc)?;
+    verify_part(message, content_index, completed)
 }
 
-fn tool_use_from_builder(builder: ToolCallBuilder) -> Result<ToolUse, AgentError> {
-    if let Some(raw) = builder.raw.as_ref() {
-        return tool_use_from_item(raw);
+fn finish_item(
+    event: Event,
+    stream: &ModelStream,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    let output_index = event_output_index(&event)?;
+    let item = event
+        .item
+        .as_ref()
+        .ok_or_else(|| AgentError::Model("output item event missing item".to_string()))?;
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            if item.get("status").and_then(Value::as_str) != Some("completed") {
+                return Ok(());
+            }
+            let message = assistant_message_from_item(item, output_index)?;
+            let streamed = acc.active_messages.remove(&output_index).ok_or_else(|| {
+                AgentError::Model(format!(
+                    "message output {} completed before it started",
+                    output_index.get()
+                ))
+            })?;
+            verify_message(&streamed, &message)?;
+            stream.emit(ModelStreamEvent::AssistantMessageDone {
+                message: message.clone(),
+            })?;
+            acc.completed_messages.push(message);
+        }
+        Some("function_call") => validate_function_item(item, true)?,
+        Some("reasoning") => validate_shape(item)?,
+        Some(other) => {
+            return Err(AgentError::Model(format!(
+                "unsupported responses output item: {other}"
+            )));
+        }
+        None => return Err(AgentError::Model("output item missing type".to_string())),
     }
-    let call_id = builder
-        .call_id
-        .ok_or_else(|| AgentError::Model("function_call missing call_id".to_string()))?;
-    let name = builder
-        .name
-        .ok_or_else(|| AgentError::Model("function_call missing name".to_string()))?;
-    Ok(ToolUse {
-        id: call_id,
-        name,
-        input: serde_json::from_str(&builder.arguments).unwrap_or(Value::String(builder.arguments)),
-        raw: None,
-    })
+    Ok(())
+}
+
+fn finish_response(
+    event: Event,
+    terminal: TerminalKind,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    if acc.terminal.is_some() {
+        return Err(AgentError::Model(
+            "responses stream returned multiple terminal events".to_string(),
+        ));
+    }
+    let raw = event
+        .response
+        .ok_or_else(|| AgentError::Model("response event missing response".to_string()))?;
+    acc.response = Some(model_response_from_value(raw)?);
+    acc.terminal = Some(terminal);
+    Ok(())
+}
+
+fn active_content<'a>(
+    event: &Event,
+    acc: &'a mut Accumulator,
+) -> Result<(&'a mut MessageBuilder, ResponseContentIndex), AgentError> {
+    let output_index = event_output_index(event)?;
+    let content_index = ResponseContentIndex::new(event.content_index.ok_or_else(|| {
+        AgentError::Model("message content event missing content_index".to_string())
+    })?);
+    let item_id = event
+        .item_id
+        .as_deref()
+        .ok_or_else(|| AgentError::Model("message content event missing item_id".to_string()))?;
+    let message = acc.active_messages.get_mut(&output_index).ok_or_else(|| {
+        AgentError::Model(format!(
+            "message output {} was not active",
+            output_index.get()
+        ))
+    })?;
+    if message.id.as_str() != item_id {
+        return Err(AgentError::Model(format!(
+            "message item id {} did not match active item {}",
+            item_id, message.id
+        )));
+    }
+    Ok((message, content_index))
+}
+
+fn event_output_index(event: &Event) -> Result<ResponseOutputIndex, AgentError> {
+    event
+        .output_index
+        .map(ResponseOutputIndex::new)
+        .ok_or_else(|| AgentError::Model("output item event missing output_index".to_string()))
+}
+
+fn message_id(item: &Value) -> Result<AssistantMessageId, AgentError> {
+    if item.get("role").and_then(Value::as_str) != Some("assistant") {
+        return Err(AgentError::Model(
+            "message output role must be assistant".to_string(),
+        ));
+    }
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(AssistantMessageId::new)
+        .ok_or_else(|| AgentError::Model("message output missing id".to_string()))
+}
+
+fn verify_part(
+    message: &MessageBuilder,
+    content_index: ResponseContentIndex,
+    completed: &str,
+) -> Result<(), AgentError> {
+    let streamed = message.content.get(&content_index).ok_or_else(|| {
+        AgentError::Model(format!(
+            "message content {} completed before it started",
+            content_index.get()
+        ))
+    })?;
+    if streamed != completed {
+        return Err(AgentError::Model(format!(
+            "streamed message content {} differed from completed content",
+            content_index.get()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_message(
+    streamed: &MessageBuilder,
+    completed: &AssistantMessageItem,
+) -> Result<(), AgentError> {
+    if streamed.id != completed.id || streamed.output_index != completed.output_index {
+        return Err(AgentError::Model(
+            "completed message identity differed from active item".to_string(),
+        ));
+    }
+    let content = streamed
+        .content
+        .iter()
+        .map(|(index, text)| AssistantTextPart {
+            index: *index,
+            text: text.clone(),
+        })
+        .collect::<Vec<_>>();
+    if content != completed.content {
+        return Err(AgentError::Model(
+            "streamed message bytes differed from completed item".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shape(item: &Value) -> Result<(), AgentError> {
+    model_response_shape(&serde_json::json!({ "output": [item] })).map(|_| ())
+}
+
+fn validate_function_item(item: &Value, completed: bool) -> Result<(), AgentError> {
+    if completed {
+        tool_use_from_item(item).map(|_| ())
+    } else {
+        for field in ["call_id", "name", "arguments"] {
+            if item.get(field).and_then(Value::as_str).is_none() {
+                return Err(AgentError::Model(format!("function_call missing {field}")));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Accumulator {
-    fn function_call(&mut self, index: usize) -> &mut ToolCallBuilder {
-        self.function_calls.entry(index).or_default()
-    }
-}
-
-fn outcome(acc: Accumulator) -> Result<Option<ModelOutcome>, AgentError> {
-    if !acc.function_calls.is_empty() {
-        return acc
-            .function_calls
-            .into_values()
-            .map(tool_use_from_builder)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|calls| {
-                Some(ModelOutcome::ToolCalls {
-                    text: acc.completed_text,
-                    calls,
-                })
-            });
-    }
-    Ok(acc.message_seen.then_some(ModelOutcome::FinalAnswer {
-        text: acc.completed_text,
-    }))
-}
-
-fn response_stop(
-    response: &Value,
-    decoded: &crate::responses::DecodedOutput,
-) -> Option<StopReason> {
-    match response.get("status").and_then(Value::as_str) {
-        Some("incomplete") => Some(incomplete_reason(response)),
-        Some("completed") if decoded.tool_seen => Some(StopReason::ToolUse),
-        Some("completed") if decoded.message_seen => Some(StopReason::EndTurn),
-        Some(other) => Some(StopReason::Other(other.to_string())),
-        None if decoded.tool_seen => Some(StopReason::ToolUse),
-        None if decoded.message_seen => Some(StopReason::EndTurn),
-        None => None,
-    }
-}
-
-fn inferred_stop(acc: &Accumulator) -> Option<StopReason> {
-    if !acc.function_calls.is_empty() {
-        Some(StopReason::ToolUse)
-    } else if acc.message_seen {
-        Some(StopReason::EndTurn)
-    } else {
-        acc.status
-            .as_ref()
-            .map(|status| StopReason::Other(status.clone()))
-    }
-}
-
-fn incomplete_reason(raw: &Value) -> StopReason {
-    match raw
-        .get("incomplete_details")
-        .and_then(|value| value.get("reason"))
-        .and_then(Value::as_str)
-    {
-        Some("max_output_tokens") => StopReason::MaxTokens,
-        Some("content_filter") => StopReason::Refusal,
-        Some(other) => StopReason::Other(other.to_string()),
-        None => StopReason::Other("incomplete".to_string()),
+    fn finish(mut self) -> Result<ModelResponse, DecodeFailure> {
+        let terminal = self.terminal.ok_or_else(|| {
+            DecodeFailure::protocol_message(
+                "responses stream ended without a terminal event".to_string(),
+            )
+        })?;
+        let response = self.response.take().ok_or_else(|| {
+            DecodeFailure::protocol_message("responses terminal event had no response".to_string())
+        })?;
+        if terminal == TerminalKind::Completed {
+            if !self.active_messages.is_empty() {
+                return Err(DecodeFailure::protocol_message(
+                    "responses completed with an active message item".to_string(),
+                ));
+            }
+            self.completed_messages
+                .sort_by_key(|message| message.output_index);
+            if self.completed_messages != response.assistant_messages {
+                return Err(DecodeFailure::protocol_message(
+                    "completed message items differed from response snapshot".to_string(),
+                ));
+            }
+        } else if !matches!(
+            response.stop_reason,
+            Some(StopReason::MaxTokens | StopReason::Refusal)
+        ) {
+            return Err(DecodeFailure::protocol_message(
+                "incomplete response did not report an incomplete stop reason".to_string(),
+            ));
+        }
+        Ok(response)
     }
 }

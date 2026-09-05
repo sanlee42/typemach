@@ -13,14 +13,16 @@ mod builtins;
 mod context;
 pub use context::estimate_messages;
 mod deepseek;
+mod message_item;
 mod responses;
 mod responses_stream;
 pub use deepseek::ConfiguredModel;
+pub use message_item::*;
 mod model_turn;
 mod presentation;
 pub use presentation::ToolDisposition;
 mod stream;
-pub use stream::{ModelStream, OutputTextDelta};
+pub use stream::{ModelStream, ModelStreamEvent};
 
 mod sandbox;
 pub use sandbox::{
@@ -324,11 +326,7 @@ where
         .await?;
         let turn = model_turn::invoke(self.model.as_ref(), state, ctx, request).await?;
         match turn.outcome {
-            Some(model_turn::TurnOutcome::Message {
-                message_id,
-                content,
-                text,
-            }) => {
+            Some(model_turn::TurnOutcome::Message { content, text }) => {
                 let reason = finish_reason(turn.stop_reason.as_ref())?;
                 if reason == FinishReason::MaxTokens {
                     return Err(AgentError::Incomplete(reason).machine());
@@ -338,11 +336,6 @@ where
                         AgentError::Model("assistant message was empty".to_string()).machine()
                     );
                 }
-                ctx.emit(AgentSignal::AssistantMessageDone {
-                    message_id,
-                    phase: AssistantMessagePhase::FinalAnswer,
-                })
-                .await?;
                 if !content.is_empty() {
                     state.messages.push(AgentMessage::Assistant { content });
                 }

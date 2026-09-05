@@ -73,19 +73,12 @@ impl typemach_agent::ToolPermissionPolicy for ListedToolsOnly {
 async fn run_unlisted(tool_use: ToolUse) -> (Vec<Event>, ScriptedModel) {
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![tool_use],
-            }),
             stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            ..tool_response("", vec![tool_use])
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Permission denial handled.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("Permission denial handled.")
         },
     ]);
     let runner = build_agent_runner(
@@ -180,37 +173,32 @@ async fn denied_unlisted_terminal_continues_to_the_model() {
 async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it() {
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "ask-bad".to_string(),
                     name: "ask_user".to_string(),
                     input: json!({ "question": " " }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "ask-good".to_string(),
                     name: "ask_user".to_string(),
                     input: json!({ "question": "Which date?" }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Order count is 42.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("Order count is 42.")
         },
     ]);
     let runner = build_agent_runner(
@@ -276,22 +264,22 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
 async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "artifact-missing-type".to_string(),
                     name: "emit_artifact".to_string(),
                     input: json!({ "title": "Review", "content": "Review body" }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "artifact-invalid-type".to_string(),
                     name: "emit_artifact".to_string(),
                     input: json!({
@@ -301,14 +289,13 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
                     }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "artifact-invalid-source".to_string(),
                     name: "emit_artifact".to_string(),
                     input: json!({
@@ -319,14 +306,13 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
                     }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![ToolUse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![ToolUse {
                     id: "artifact-good".to_string(),
                     name: "emit_artifact".to_string(),
                     input: json!({
@@ -336,16 +322,11 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
                     }),
                     raw: None,
                 }],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Review created.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("Review created.")
         },
     ]);
     let runner = build_agent_runner(

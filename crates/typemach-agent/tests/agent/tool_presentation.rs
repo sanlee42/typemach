@@ -99,10 +99,10 @@ impl ToolRegistry for PresentingTools {
 
 fn tool_turn(ids: &[&str]) -> ModelResponse {
     ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: String::new(),
-            calls: ids
-                .iter()
+        stop_reason: Some(StopReason::ToolUse),
+        ..tool_response(
+            "",
+            ids.iter()
                 .map(|id| ToolUse {
                     id: (*id).to_string(),
                     name: "publish_plan".to_string(),
@@ -110,9 +110,7 @@ fn tool_turn(ids: &[&str]) -> ModelResponse {
                     raw: None,
                 })
                 .collect(),
-        }),
-        stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
+        )
     }
 }
 
@@ -340,13 +338,7 @@ fn tool_result_ids(events: &[Event]) -> Vec<String> {
 
 fn final_receipt_position(events: &[Event]) -> usize {
     signal_position(events, |signal| {
-        matches!(
-            signal,
-            AgentSignal::AssistantMessageDelta {
-                phase: AssistantMessagePhase::FinalAnswer,
-                ..
-            }
-        )
+        matches!(signal, AgentSignal::AssistantMessageDelta { .. })
     })
 }
 
@@ -380,12 +372,7 @@ fn final_receipts(events: &[Event]) -> Vec<&str> {
         .iter()
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
-                signal:
-                    AgentSignal::AssistantMessageDelta {
-                        phase: AssistantMessagePhase::FinalAnswer,
-                        delta,
-                        ..
-                    },
+                signal: AgentSignal::AssistantMessageDelta { delta, .. },
             } => Some(delta.as_str()),
             _ => None,
         })

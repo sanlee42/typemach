@@ -2,34 +2,51 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::AgentError;
+use crate::{
+    AgentError, AssistantMessageId, AssistantMessageItem, ResponseContentIndex, ResponseOutputIndex,
+};
 
 #[derive(Clone)]
 pub struct ModelStream {
-    tx: mpsc::UnboundedSender<OutputTextDelta>,
+    tx: mpsc::UnboundedSender<ModelStreamEvent>,
     emitted: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputTextDelta(pub String);
+pub enum ModelStreamEvent {
+    AssistantMessageStarted {
+        message_id: AssistantMessageId,
+        output_index: ResponseOutputIndex,
+    },
+    AssistantMessageDelta {
+        message_id: AssistantMessageId,
+        output_index: ResponseOutputIndex,
+        content_index: ResponseContentIndex,
+        delta: String,
+        index: usize,
+    },
+    AssistantMessageDone {
+        message: AssistantMessageItem,
+    },
+}
 
 impl ModelStream {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<OutputTextDelta>) -> Self {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<ModelStreamEvent>) -> Self {
         Self {
             tx,
             emitted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    pub fn channel() -> (Self, mpsc::UnboundedReceiver<OutputTextDelta>) {
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<ModelStreamEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (Self::new(tx), rx)
     }
 
-    pub fn output_text(&self, delta: impl Into<String>) -> Result<(), AgentError> {
+    pub fn emit(&self, event: ModelStreamEvent) -> Result<(), AgentError> {
         self.tx
-            .send(OutputTextDelta(delta.into()))
-            .map_err(|_| AgentError::Model("model delta stream closed".to_string()))?;
+            .send(event)
+            .map_err(|_| AgentError::Model("model event stream closed".to_string()))?;
         self.emitted
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())

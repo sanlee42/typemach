@@ -64,9 +64,10 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
     let calls = Arc::clone(&tools.calls);
     let model = ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: vec![
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                vec![
                     ToolUse {
                         id: "tool-1".to_string(),
                         name: "metric_point".to_string(),
@@ -80,16 +81,11 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
                         raw: None,
                     },
                 ],
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Done.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("Done.")
         },
     ]);
     let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
@@ -185,12 +181,8 @@ async fn invalid_external_artifact_batch_fails_before_any_artifact_is_published(
     result.artifacts = vec![valid, invalid];
     let tools = InvalidArtifactTools(result);
     let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: String::new(),
-            calls: vec![tool_use],
-        }),
         stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
+        ..tool_response("", vec![tool_use])
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
     let events = collect(runner.stream(

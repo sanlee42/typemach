@@ -21,12 +21,15 @@ impl AgentModel for StreamingFinal {
     ) -> Result<ModelResponse, AgentError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.requests.lock().expect("requests lock").push(request);
-        stream.output_text("The answer ")?;
-        stream.output_text("is 42.")?;
+        let message = message_item(
+            "provider-message-1",
+            0,
+            AssistantMessagePhase::FinalAnswer,
+            "The answer is 42.",
+        );
+        emit_message(&stream, &message, &["The answer ", "is 42."])?;
         Ok(ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "The answer is 42.".to_string(),
-            }),
+            assistant_messages: vec![message],
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         })
@@ -63,12 +66,9 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
             RunStreamEvent::Signal {
                 signal:
                     AgentSignal::AssistantMessageDelta {
-                        message_id,
-                        phase,
-                        delta,
-                        ..
+                        message_id, delta, ..
                     },
-            } => Some((message_id.as_str(), *phase, delta.as_str())),
+            } => Some((message_id.as_str(), delta.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -82,18 +82,10 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
 
     assert_eq!(model.calls.load(Ordering::Relaxed), 1);
     assert_eq!(
-        deltas
-            .iter()
-            .map(|(_, _, delta)| *delta)
-            .collect::<String>(),
+        deltas.iter().map(|(_, delta)| *delta).collect::<String>(),
         output.answer
     );
     assert_eq!(output.answer, "The answer is 42.");
-    assert!(
-        deltas
-            .iter()
-            .all(|(_, phase, _)| *phase == AssistantMessagePhase::Commentary)
-    );
     assert_eq!(
         done,
         Some((deltas[0].0, AssistantMessagePhase::FinalAnswer))
@@ -144,17 +136,16 @@ impl ToolRegistry for CountingTools {
 
 fn metric_call() -> ModelResponse {
     ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: "Checking. ".to_string(),
-            calls: vec![ToolUse {
+        stop_reason: Some(StopReason::ToolUse),
+        ..tool_response(
+            "Checking. ",
+            vec![ToolUse {
                 id: "tool-1".to_string(),
                 name: "metric_point".to_string(),
                 input: json!({ "metric": "orders" }),
                 raw: None,
             }],
-        }),
-        stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
+        )
     }
 }
 
@@ -163,11 +154,8 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
     let model = ScriptedModel::new([
         metric_call(),
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "There were 42 orders.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("There were 42 orders.")
         },
     ]);
     let tools = CountingTools::default();
@@ -225,32 +213,23 @@ impl AgentModel for AbortModel {
         _request: ModelRequest,
         stream: ModelStream,
     ) -> Result<ModelResponse, AgentError> {
-        stream.output_text("uncommitted candidate")?;
+        emit_pending(&stream, "pending-message", "uncommitted candidate")?;
         match self.0 {
             AbortCase::MaxTokens => Ok(ModelResponse {
-                outcome: Some(ModelOutcome::FinalAnswer {
-                    text: "uncommitted candidate".to_string(),
-                }),
                 stop_reason: Some(StopReason::MaxTokens),
                 ..ModelResponse::default()
             }),
             AbortCase::MaxTokensToolCalls => Ok(ModelResponse {
-                outcome: Some(ModelOutcome::ToolCalls {
-                    text: "uncommitted candidate".to_string(),
-                    calls: vec![ToolUse {
-                        id: "truncated-tool".to_string(),
-                        name: "metric_point".to_string(),
-                        input: json!({}),
-                        raw: None,
-                    }],
-                }),
+                tool_calls: vec![ToolUse {
+                    id: "truncated-tool".to_string(),
+                    name: "metric_point".to_string(),
+                    input: json!({}),
+                    raw: None,
+                }],
                 stop_reason: Some(StopReason::MaxTokens),
                 ..ModelResponse::default()
             }),
             AbortCase::Refusal => Ok(ModelResponse {
-                outcome: Some(ModelOutcome::FinalAnswer {
-                    text: "uncommitted candidate".to_string(),
-                }),
                 stop_reason: Some(StopReason::Refusal),
                 ..ModelResponse::default()
             }),
@@ -353,11 +332,8 @@ async fn aborted_candidates_never_complete_or_persist() {
 #[tokio::test]
 async fn empty_terminal_text_fails_without_finalizing() {
     let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::FinalAnswer {
-            text: " \n".to_string(),
-        }),
         stop_reason: Some(StopReason::EndTurn),
-        ..ModelResponse::default()
+        ..final_response(" \n")
     }]);
     let runner = build_agent_runner(MemorySaver::default(), model, FakeTools, AllowAllTools);
     let events = collect(runner.stream(
@@ -377,16 +353,11 @@ async fn empty_terminal_text_fails_without_finalizing() {
             .iter()
             .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
     );
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        RunStreamEvent::Completed { .. }
-            | RunStreamEvent::Signal {
-                signal: AgentSignal::AssistantMessageDone {
-                    phase: AssistantMessagePhase::FinalAnswer,
-                    ..
-                },
-            }
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Completed { .. }))
+    );
     let checkpoint = runner
         .checkpointer()
         .load("thread-1")
@@ -414,15 +385,12 @@ impl AgentModel for RecoveringModel {
         match self.calls.fetch_add(1, Ordering::Relaxed) {
             0 => Ok(metric_call()),
             1 => {
-                stream.output_text("discard this candidate")?;
+                emit_pending(&stream, "failed-message", "discard this candidate")?;
                 Err(AgentError::Model("provider failed".to_string()))
             }
             _ => Ok(ModelResponse {
-                outcome: Some(ModelOutcome::FinalAnswer {
-                    text: "Recovered from saved evidence.".to_string(),
-                }),
                 stop_reason: Some(StopReason::EndTurn),
-                ..ModelResponse::default()
+                ..final_response("Recovered from saved evidence.")
             }),
         }
     }
@@ -536,9 +504,10 @@ fn raise_max(max: &AtomicUsize, value: usize) {
 fn two_tool_model() -> ScriptedModel {
     ScriptedModel::new([
         ModelResponse {
-            outcome: Some(ModelOutcome::ToolCalls {
-                text: String::new(),
-                calls: ["tool-1", "tool-2"]
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                ["tool-1", "tool-2"]
                     .into_iter()
                     .map(|id| ToolUse {
                         id: id.to_string(),
@@ -547,16 +516,11 @@ fn two_tool_model() -> ScriptedModel {
                         raw: None,
                     })
                     .collect(),
-            }),
-            stop_reason: Some(StopReason::ToolUse),
-            ..ModelResponse::default()
+            )
         },
         ModelResponse {
-            outcome: Some(ModelOutcome::FinalAnswer {
-                text: "Done.".to_string(),
-            }),
             stop_reason: Some(StopReason::EndTurn),
-            ..ModelResponse::default()
+            ..final_response("Done.")
         },
     ])
 }
@@ -607,9 +571,10 @@ async fn read_only_batches_overlap_but_unsafe_batches_do_not() {
 #[tokio::test]
 async fn oversized_tool_batch_aborts_without_partial_dispatch() {
     let model = ScriptedModel::new([ModelResponse {
-        outcome: Some(ModelOutcome::ToolCalls {
-            text: String::new(),
-            calls: ["metric-1", "metric-2"]
+        stop_reason: Some(StopReason::ToolUse),
+        ..tool_response(
+            "",
+            ["metric-1", "metric-2"]
                 .into_iter()
                 .map(|id| ToolUse {
                     id: id.to_string(),
@@ -618,9 +583,7 @@ async fn oversized_tool_batch_aborts_without_partial_dispatch() {
                     raw: None,
                 })
                 .collect(),
-        }),
-        stop_reason: Some(StopReason::ToolUse),
-        ..ModelResponse::default()
+        )
     }]);
     let tools = CountingTools::default();
     let calls = tools.calls.clone();
