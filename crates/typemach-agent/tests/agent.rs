@@ -18,6 +18,8 @@ use typemach_agent::{
 
 #[path = "agent/builtin_validation.rs"]
 mod builtin_validation;
+#[path = "agent/deferred_tools.rs"]
+mod deferred_tools;
 #[path = "agent/final_answer.rs"]
 mod final_answer;
 #[path = "agent/model_fixtures.rs"]

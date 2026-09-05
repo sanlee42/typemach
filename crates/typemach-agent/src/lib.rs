@@ -13,6 +13,8 @@ mod builtins;
 mod context;
 pub use context::estimate_messages;
 mod deepseek;
+mod deferred_tools;
+pub use deferred_tools::DeferredToolName;
 mod message_item;
 mod responses;
 mod responses_stream;
@@ -64,6 +66,7 @@ impl AgentState {
             system_suffix: input.system_suffix.clone(),
             model_turns: 0,
             tool_calls: 0,
+            loaded_deferred_tools: Default::default(),
             pending_tools: VecDeque::new(),
             pending_human: None,
             human_input: input.human_input.clone(),
@@ -109,7 +112,18 @@ pub trait AgentModel: Send + Sync {
 
 #[async_trait]
 pub trait ToolRegistry: Send + Sync {
+    /// Tools available immediately for the current context.
     async fn list_tools(&self, context: &Value) -> Result<Vec<AgentToolSpec>, AgentError>;
+    /// Authorized tools discoverable through the agent's built-in `tool_search`.
+    /// Names must be unique across both catalogs and cannot be `tool_search`.
+    /// Discovered names persist until the next fresh turn and are revalidated
+    /// against this catalog before model calls and tool dispatch.
+    async fn list_deferred_tools(
+        &self,
+        _context: &Value,
+    ) -> Result<Vec<AgentToolSpec>, AgentError> {
+        Ok(Vec::new())
+    }
     async fn call_tool(&self, request: ToolCallRequest) -> Result<ToolResult, AgentError>;
 }
 
@@ -305,11 +319,14 @@ where
         if let Some(reason) = exhausted_reason(state) {
             return Err(AgentError::Incomplete(reason).machine());
         }
-        let tools = self
-            .tools
-            .list_tools(&state.context)
-            .await
-            .map_err(AgentError::machine)?;
+        let tools = deferred_tools::ToolCatalog::read(
+            self.tools.as_ref(),
+            &state.context,
+            &mut state.loaded_deferred_tools,
+        )
+        .await
+        .map_err(AgentError::machine)?
+        .visible;
         let messages = state.messages.clone();
         let suffix = state.system_suffix.clone();
         state.model_turns += 1;
@@ -388,6 +405,16 @@ where
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
         let mut presentation = None;
+        let catalog = deferred_tools::ToolCatalog::read(
+            self.tools.as_ref(),
+            &state.context,
+            &mut state.loaded_deferred_tools,
+        )
+        .await
+        .map_err(AgentError::machine)?;
+        for pending in &mut state.pending_tools {
+            catalog.refresh_pending(pending);
+        }
         let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
         if state.pending_tools.len() > remaining {
             state.pending_tools.clear();
@@ -399,8 +426,7 @@ where
                 .drain(..)
                 .map(|pending| {
                     let permission =
-                        self.policy
-                            .check(&pending.tool_use, pending.spec.as_ref(), &state.context);
+                        deferred_tools::permission(self.policy.as_ref(), &pending, &state.context);
                     (pending, permission)
                 })
                 .collect::<Vec<_>>();
@@ -415,7 +441,7 @@ where
             } else {
                 for (pending, permission) in checked {
                     match self
-                        .dispatch_checked_tool(state, ctx, pending, permission)
+                        .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                         .await?
                     {
                         ToolDispatch::Continue => {}
@@ -428,10 +454,9 @@ where
         } else {
             while let Some(pending) = state.pending_tools.pop_front() {
                 let permission =
-                    self.policy
-                        .check(&pending.tool_use, pending.spec.as_ref(), &state.context);
+                    deferred_tools::permission(self.policy.as_ref(), &pending, &state.context);
                 match self
-                    .dispatch_checked_tool(state, ctx, pending, permission)
+                    .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                     .await?
                 {
                     ToolDispatch::Continue => {}
@@ -458,6 +483,7 @@ where
         ctx: &AgentRunContext,
         pending: PendingToolCall,
         permission: PermissionDecision,
+        catalog: &deferred_tools::ToolCatalog,
     ) -> Result<ToolDispatch, MachineError> {
         let tool_use = &pending.tool_use;
         if let PermissionDecision::Deny(reason) = permission {
@@ -512,6 +538,8 @@ where
         .await?;
         let result = if let Some(result) = built_in_error {
             result
+        } else if tool_use.name == deferred_tools::SEARCH_NAME {
+            catalog.search(tool_use, &mut state.loaded_deferred_tools)
         } else if tool_use.name == "emit_artifact" {
             match artifact_from_tool(tool_use) {
                 Ok(artifact) => self.emit_artifact(state, ctx, tool_use, artifact).await?,

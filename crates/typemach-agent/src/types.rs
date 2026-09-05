@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -627,6 +627,9 @@ pub struct AgentState {
     pub system_suffix: Option<String>,
     pub model_turns: u32,
     pub tool_calls: u32,
+    /// Loaded deferred names for this run; revalidated against the current context.
+    #[serde(default)]
+    pub loaded_deferred_tools: BTreeSet<crate::DeferredToolName>,
     #[serde(default)]
     pub pending_tools: VecDeque<PendingToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -683,6 +686,10 @@ impl<'de> Deserialize<'de> for PendingToolCall {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    #[error("registry tool uses reserved name: {0}")]
+    ReservedToolName(String),
+    #[error("registry catalogs contain duplicate tool name: {0}")]
+    DuplicateToolName(String),
     #[error("invalid agent configuration: {0}")]
     Config(String),
     #[error("model failed: {0}")]
@@ -748,6 +755,7 @@ mod type_contracts {
 
         assert_eq!(state.pending_tools.len(), 1);
         assert!(state.pending_tools[0].spec.is_none());
+        assert!(state.loaded_deferred_tools.is_empty());
         assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);
     }

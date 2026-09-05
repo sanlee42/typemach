@@ -36,7 +36,10 @@ pub(super) fn terminal_action(tool_use: &ToolUse) -> TerminalAction {
 }
 
 pub(super) fn agent_builtin(tool_use: &ToolUse) -> bool {
-    matches!(tool_use.name.as_str(), "ask_user" | "emit_artifact")
+    matches!(
+        tool_use.name.as_str(),
+        "ask_user" | "emit_artifact" | "tool_search"
+    )
 }
 
 pub(super) fn artifact_from_tool(tool_use: &ToolUse) -> Result<Artifact, AgentError> {
