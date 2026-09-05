@@ -241,3 +241,118 @@ async fn checkpoint_restart_preserves_loaded_tools_and_next_turn_resets() {
 async fn changed_resume_context_prunes_loaded_and_pending_tools() {
     resume_checkpoint(true).await;
 }
+
+#[tokio::test]
+async fn running_checkpoint_restart_preserves_discovery_and_exact_state() {
+    let first_model = ScriptedModel::new([search("search-1", "refund")]);
+    let first = build_agent_runner(
+        MemorySaver::default(),
+        first_model,
+        Catalog::default(),
+        AllowAllTools,
+    );
+    let events = collect(first.stream(request(input()), StreamConfig::default())).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    );
+    let checkpoint = first
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(checkpoint.next_step, Some(json!("model_step")));
+    let saved: AgentState = serde_json::from_value(checkpoint.state.clone()).unwrap();
+    assert_eq!(saved.loaded_deferred_tools.len(), 1);
+    let saver = MemorySaver::default();
+    saver.save("thread-1", &checkpoint).await.unwrap();
+    let model = ScriptedModel::new([final_response("Recovered")]);
+    let restarted = build_agent_runner(saver, model.clone(), Catalog::default(), AllowAllTools);
+    let mut retry = request(input());
+    retry.input.messages = vec![AgentMessage::user_text("This must not rebuild saved state")];
+    completed(&collect(restarted.stream(retry, StreamConfig::default())).await);
+    let requests = model.requests();
+    assert_eq!(
+        names(&requests[0]),
+        ["ask_user", "weekly_refunds", "tool_search"]
+    );
+    assert_eq!(requests[0].messages, saved.messages);
+    assert_eq!(requests[0].turn, saved.model_turns + 1);
+}
+
+async fn resume_legacy(revoked: bool, unknown: bool) {
+    let (mut checkpoint, _) = interrupted_run().await;
+    checkpoint.state["pending_human"] = checkpoint.state["pending_human"]["tool_use"].clone();
+    checkpoint.state["pending_tools"][0] = checkpoint.state["pending_tools"][0]["tool_use"].clone();
+    if unknown {
+        checkpoint.state["pending_tools"][0]["name"] = json!("unknown_tool");
+    }
+    checkpoint
+        .state
+        .as_object_mut()
+        .unwrap()
+        .remove("loaded_deferred_tools");
+    let saved: AgentState = serde_json::from_value(checkpoint.state).unwrap();
+    // Preserve the legacy provenance through an intermediate checkpoint write.
+    checkpoint.state = serde_json::to_value(saved).unwrap();
+    assert_eq!(checkpoint.state["pending_human"]["name"], "ask_user");
+    let saver = MemorySaver::default();
+    saver.save("thread-1", &checkpoint).await.unwrap();
+    let model = ScriptedModel::new([final_response("Resumed")]);
+    let registry = Catalog::default();
+    let runner = build_agent_runner(saver, model.clone(), registry.clone(), AllowAllTools);
+    let mut resume = request(input());
+    resume.command = RunCommand::Resume;
+    resume.input.human_input = Some(HumanInputAnswer {
+        tool_use_id: "ask-1".into(),
+        answer: "Yes".into(),
+    });
+    if revoked {
+        resume.input.context = json!("revoked");
+    }
+    let events = collect(runner.stream(resume, StreamConfig::default())).await;
+    let output = completed(&events);
+    assert!(output.messages.iter().any(|message| matches!(message,
+        AgentMessage::User { content } if content.iter().any(|block| matches!(block,
+            ContentBlock::ToolResult(result) if result.tool_use_id == "ask-1" && result.content == json!({ "answer": "Yes" })
+        ))
+    )));
+    let loaded = !revoked && !unknown;
+    assert_eq!(registry.calls.lock().unwrap().len(), usize::from(loaded));
+    let state: AgentState = serde_json::from_value(
+        runner
+            .checkpointer()
+            .load("thread-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+    )
+    .unwrap();
+    assert_eq!(state.loaded_deferred_tools.len(), usize::from(loaded));
+    assert_eq!(
+        names(&model.requests()[0]).contains(&"weekly_refunds"),
+        loaded
+    );
+    assert!(events.iter().any(|event| matches!(event,
+        RunStreamEvent::Signal { signal: AgentSignal::ToolResult { tool_use_id, is_error, .. } }
+            if tool_use_id == "pending-1" && *is_error != loaded
+    )));
+}
+
+#[tokio::test]
+async fn legacy_direct_ask_and_authorized_deferred_calls_resume() {
+    resume_legacy(false, false).await;
+}
+
+#[tokio::test]
+async fn legacy_revoked_deferred_call_is_denied() {
+    resume_legacy(true, false).await;
+}
+
+#[tokio::test]
+async fn legacy_unknown_call_is_denied() {
+    resume_legacy(false, true).await;
+}

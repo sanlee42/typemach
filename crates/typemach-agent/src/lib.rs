@@ -21,6 +21,8 @@ mod responses_stream;
 pub use deepseek::ConfiguredModel;
 pub use message_item::*;
 mod model_turn;
+mod pending_tool;
+pub use pending_tool::PendingToolCall;
 mod presentation;
 pub use presentation::ToolDisposition;
 mod stream;
@@ -405,7 +407,7 @@ where
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
         let mut presentation = None;
-        let catalog = deferred_tools::ToolCatalog::read(
+        let mut catalog = deferred_tools::ToolCatalog::read(
             self.tools.as_ref(),
             &state.context,
             &mut state.loaded_deferred_tools,
@@ -413,7 +415,7 @@ where
         .await
         .map_err(AgentError::machine)?;
         for pending in &mut state.pending_tools {
-            catalog.refresh_pending(pending);
+            catalog.refresh_pending(pending, &mut state.loaded_deferred_tools);
         }
         let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
         if state.pending_tools.len() > remaining {
@@ -500,7 +502,7 @@ where
             let _ = record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
             return Ok(ToolDispatch::Continue);
         }
-        let spec = pending.spec.as_ref();
+        let spec = pending.spec();
         let built_in_error = if tool_use.name == "ask_user" {
             if let Some(result) = self.consume_human_answer(state, tool_use, ctx).await? {
                 state.messages.push(AgentMessage::tool_result(result));
@@ -658,7 +660,7 @@ where
     fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
         !state.pending_tools.is_empty()
             && state.pending_tools.iter().all(|pending| {
-                let Some(spec) = pending.spec.as_ref() else {
+                let Some(spec) = pending.spec() else {
                     return false;
                 };
                 spec.annotations.read_only

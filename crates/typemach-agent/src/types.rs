@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::PendingToolCall;
 use crate::presentation::ToolDisposition;
 use crate::{AssistantMessageId, AssistantMessageItem, AssistantMessagePhase};
 
@@ -645,45 +646,6 @@ pub struct AgentState {
     pub tool_result_archives: Vec<ToolResultArchive>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PendingToolCall {
-    pub tool_use: ToolUse,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spec: Option<AgentToolSpec>,
-}
-
-impl PendingToolCall {
-    pub fn new(tool_use: ToolUse, spec: Option<AgentToolSpec>) -> Self {
-        Self { tool_use, spec }
-    }
-}
-
-impl<'de> Deserialize<'de> for PendingToolCall {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Shape {
-            Current {
-                tool_use: ToolUse,
-                #[serde(default)]
-                spec: Option<AgentToolSpec>,
-            },
-            Legacy(ToolUse),
-        }
-
-        match Shape::deserialize(deserializer)? {
-            Shape::Current { tool_use, spec } => Ok(Self { tool_use, spec }),
-            Shape::Legacy(tool_use) => Ok(Self {
-                tool_use,
-                spec: None,
-            }),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error("registry tool uses reserved name: {0}")]
@@ -754,7 +716,7 @@ mod type_contracts {
             serde_json::from_value(json!("model_step")).expect("deserialize legacy planning step");
 
         assert_eq!(state.pending_tools.len(), 1);
-        assert!(state.pending_tools[0].spec.is_none());
+        assert!(state.pending_tools[0].spec().is_none());
         assert!(state.loaded_deferred_tools.is_empty());
         assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);

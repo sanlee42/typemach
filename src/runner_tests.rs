@@ -301,6 +301,35 @@ fn checkpoint_scope_uses_explicit_thread_id() {
 }
 
 #[test]
+fn same_run_running_checkpoint_preserves_state_and_next_step() {
+    block_on(async {
+        let saver = Arc::new(MemorySaver::new());
+        saver
+            .save(
+                "thread-1",
+                &CheckpointRecord::running(
+                    serde_json::json!({ "value": 100, "answer": "saved answer" }),
+                    Some(serde_json::to_value(Step::Finish).unwrap()),
+                    "run-1",
+                ),
+            )
+            .await
+            .unwrap();
+        let runner = Runner::new(TestMachine, saver);
+        let output = runner.invoke(request(TestMode::Complete)).await.unwrap();
+        match output {
+            RunOutput::Completed {
+                output, snapshot, ..
+            } => {
+                assert_eq!(output, "value=100");
+                assert_eq!(snapshot["answer"], "saved answer");
+            }
+            RunOutput::Interrupted { .. } => panic!("expected completion"),
+        }
+    });
+}
+
+#[test]
 fn new_run_starts_at_start_step_when_thread_has_previous_running_checkpoint() {
     block_on(async {
         let saver = Arc::new(MemorySaver::new());

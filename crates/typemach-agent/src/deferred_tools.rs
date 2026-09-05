@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::pending_tool::PendingAuthorization;
 use crate::{
     AgentError, AgentToolSpec, PendingToolCall, PermissionDecision, ToolAnnotations,
     ToolPermissionPolicy, ToolRegistry, ToolResult, ToolUse,
@@ -69,15 +70,33 @@ impl ToolCatalog {
         })
     }
 
-    /// Refresh authorization without granting calls that were not visible when issued.
-    pub fn refresh_pending(&self, pending: &mut PendingToolCall) {
-        if pending.spec.is_some() {
-            pending.spec = self
-                .visible
-                .iter()
-                .find(|spec| spec.name == pending.tool_use.name)
-                .cloned();
+    /// Revalidate listed calls and resolve legacy calls against current catalogs.
+    /// Calls already classified as unlisted cannot gain authorization here.
+    pub fn refresh_pending(
+        &mut self,
+        pending: &mut PendingToolCall,
+        loaded: &mut BTreeSet<DeferredToolName>,
+    ) {
+        match pending.authorization {
+            PendingAuthorization::Unlisted => return,
+            PendingAuthorization::Legacy => {
+                if let Some(spec) = self
+                    .deferred
+                    .iter()
+                    .find(|spec| spec.name == pending.tool_use.name)
+                    && loaded.insert(DeferredToolName(spec.name.clone()))
+                {
+                    self.visible.push(spec.clone());
+                }
+            }
+            PendingAuthorization::Listed(_) => {}
         }
+        pending.authorization = self
+            .visible
+            .iter()
+            .find(|spec| spec.name == pending.tool_use.name)
+            .cloned()
+            .map_or(PendingAuthorization::Unlisted, PendingAuthorization::Listed);
     }
 
     pub fn search(&self, call: &ToolUse, loaded: &mut BTreeSet<DeferredToolName>) -> ToolResult {
@@ -97,10 +116,10 @@ pub(crate) fn permission(
     pending: &PendingToolCall,
     context: &Value,
 ) -> PermissionDecision {
-    if pending.spec.is_none() {
+    if pending.spec().is_none() {
         return PermissionDecision::Deny("tool is not currently loaded or authorized".into());
     }
-    policy.check(&pending.tool_use, pending.spec.as_ref(), context)
+    policy.check(&pending.tool_use, pending.spec(), context)
 }
 
 #[derive(Deserialize)]

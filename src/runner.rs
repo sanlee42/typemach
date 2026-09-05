@@ -654,23 +654,21 @@ where
             return Err(MachineError::NoPendingInterrupt);
         }
 
+        let same_run_checkpoint = record.run_id.as_deref() == Some(request.run_id.as_str());
+        // Rebuilding an in-flight run from input would replay initialization
+        // and discard machine-owned progress already captured by the checkpoint.
+        if same_run_checkpoint && let Some(raw_step) = record.next_step {
+            let step = serde_json::from_value::<M::Step>(raw_step).map_err(|err| {
+                MachineError::InvalidStep {
+                    reason: err.to_string(),
+                }
+            })?;
+            return Ok((previous, step));
+        }
         let state =
             self.machine
                 .new_state(&request.input, Some(&previous), request.snapshot.as_ref())?;
-        let same_run_checkpoint = record.run_id.as_deref() == Some(request.run_id.as_str());
-        let step = if same_run_checkpoint {
-            match record.next_step {
-                Some(raw_step) => serde_json::from_value::<M::Step>(raw_step).map_err(|err| {
-                    MachineError::InvalidStep {
-                        reason: err.to_string(),
-                    }
-                })?,
-                None => self.machine.start_step(),
-            }
-        } else {
-            self.machine.start_step()
-        };
-        Ok((state, step))
+        Ok((state, self.machine.start_step()))
     }
 
     async fn save_running(
