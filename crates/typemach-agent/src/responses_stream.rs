@@ -45,6 +45,11 @@ struct MessageBuilder {
     next_delta_index: usize,
 }
 
+#[derive(Debug)]
+struct ReasoningItem {
+    id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalKind {
     Completed,
@@ -54,6 +59,7 @@ enum TerminalKind {
 #[derive(Debug, Default)]
 struct Accumulator {
     active_messages: BTreeMap<ResponseOutputIndex, MessageBuilder>,
+    active_reasoning: BTreeMap<ResponseOutputIndex, ReasoningItem>,
     completed_messages: Vec<AssistantMessageItem>,
     response: Option<ModelResponse>,
     terminal: Option<TerminalKind>,
@@ -113,7 +119,10 @@ fn handle_stream_line(
         "response.output_text.done" => finish_text(event, acc)?,
         "response.content_part.done" => finish_content(event, acc)?,
         "response.output_item.done" => finish_item(event, stream, acc)?,
-        "response.reasoning_text.delta" | "response.function_call_arguments.delta" => {}
+        "response.reasoning_text.delta" | "response.reasoning_text.done" => {
+            active_reasoning(&event, acc)?;
+        }
+        "response.function_call_arguments.delta" => {}
         "response.completed" => finish_response(event, TerminalKind::Completed, acc)?,
         "response.incomplete" => finish_response(event, TerminalKind::Incomplete, acc)?,
         "response.failed" => {
@@ -142,6 +151,7 @@ fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result
             let id = message_id(item)?;
             let phase = assistant_message_phase(item)?;
             if acc.active_messages.contains_key(&output_index)
+                || acc.active_reasoning.contains_key(&output_index)
                 || acc
                     .completed_messages
                     .iter()
@@ -177,7 +187,7 @@ fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result
             })?;
         }
         Some("function_call") => validate_function_item(item, false)?,
-        Some("reasoning") => validate_shape(item)?,
+        Some("reasoning") => add_reasoning(item, output_index, acc)?,
         Some(other) => {
             return Err(AgentError::Model(format!(
                 "unsupported responses output item: {other}"
@@ -193,16 +203,32 @@ fn add_content(
     stream: &ModelStream,
     acc: &mut Accumulator,
 ) -> Result<(), AgentError> {
-    let (message, content_index) = active_content(&event, acc)?;
     let part = event
         .part
         .as_ref()
         .ok_or_else(|| AgentError::Model("content part event missing part".to_string()))?;
-    if part.get("type").and_then(Value::as_str) != Some("output_text") {
-        return Err(AgentError::Model(
-            "message content part must be output_text".to_string(),
-        ));
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text") => add_message_content(event, stream, acc),
+        Some("reasoning_text") => active_reasoning(&event, acc),
+        Some(other) => Err(AgentError::Model(format!(
+            "unsupported output content part: {other}"
+        ))),
+        None => Err(AgentError::Model(
+            "output content part missing type".to_string(),
+        )),
     }
+}
+
+fn add_message_content(
+    event: Event,
+    stream: &ModelStream,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    let (message, content_index) = active_content(&event, acc)?;
+    let part = event
+        .part
+        .as_ref()
+        .expect("content part was checked before message dispatch");
     let initial = part.get("text").and_then(Value::as_str).unwrap_or_default();
     if message
         .content
@@ -276,11 +302,23 @@ fn finish_content(event: Event, acc: &mut Accumulator) -> Result<(), AgentError>
         .part
         .as_ref()
         .ok_or_else(|| AgentError::Model("content part event missing part".to_string()))?;
-    if part.get("type").and_then(Value::as_str) != Some("output_text") {
-        return Err(AgentError::Model(
-            "message content part must be output_text".to_string(),
-        ));
+    match part.get("type").and_then(Value::as_str) {
+        Some("output_text") => finish_message_content(event, acc),
+        Some("reasoning_text") => active_reasoning(&event, acc),
+        Some(other) => Err(AgentError::Model(format!(
+            "unsupported output content part: {other}"
+        ))),
+        None => Err(AgentError::Model(
+            "output content part missing type".to_string(),
+        )),
     }
+}
+
+fn finish_message_content(event: Event, acc: &mut Accumulator) -> Result<(), AgentError> {
+    let part = event
+        .part
+        .as_ref()
+        .expect("content part was checked before message dispatch");
     let completed = part
         .get("text")
         .and_then(Value::as_str)
@@ -318,7 +356,7 @@ fn finish_item(
             acc.completed_messages.push(message);
         }
         Some("function_call") => validate_function_item(item, true)?,
-        Some("reasoning") => validate_shape(item)?,
+        Some("reasoning") => finish_reasoning(item, output_index, acc)?,
         Some(other) => {
             return Err(AgentError::Model(format!(
                 "unsupported responses output item: {other}"
@@ -374,6 +412,73 @@ fn active_content<'a>(
     Ok((message, content_index))
 }
 
+fn add_reasoning(
+    item: &Value,
+    output_index: ResponseOutputIndex,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    validate_shape(item)?;
+    let id = reasoning_id(item)?;
+    if acc.active_messages.contains_key(&output_index)
+        || acc.active_reasoning.contains_key(&output_index)
+    {
+        return Err(AgentError::Model(format!(
+            "duplicate output index {}",
+            output_index.get()
+        )));
+    }
+    acc.active_reasoning
+        .insert(output_index, ReasoningItem { id });
+    Ok(())
+}
+
+fn finish_reasoning(
+    item: &Value,
+    output_index: ResponseOutputIndex,
+    acc: &mut Accumulator,
+) -> Result<(), AgentError> {
+    validate_shape(item)?;
+    let id = reasoning_id(item)?;
+    let active = acc.active_reasoning.remove(&output_index).ok_or_else(|| {
+        AgentError::Model(format!(
+            "reasoning output {} completed before it started",
+            output_index.get()
+        ))
+    })?;
+    if active.id != id {
+        return Err(AgentError::Model(
+            "reasoning output identity differed from active item".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn active_reasoning(event: &Event, acc: &Accumulator) -> Result<(), AgentError> {
+    let output_index = event_output_index(event)?;
+    let item_id = event
+        .item_id
+        .as_deref()
+        .ok_or_else(|| AgentError::Model("reasoning content event missing item_id".to_string()))?;
+    if event.content_index.is_none() {
+        return Err(AgentError::Model(
+            "reasoning content event missing content_index".to_string(),
+        ));
+    }
+    let reasoning = acc.active_reasoning.get(&output_index).ok_or_else(|| {
+        AgentError::Model(format!(
+            "reasoning output {} was not active",
+            output_index.get()
+        ))
+    })?;
+    if reasoning.id != item_id {
+        return Err(AgentError::Model(format!(
+            "reasoning item id {} did not match active item {}",
+            item_id, reasoning.id
+        )));
+    }
+    Ok(())
+}
+
 fn event_output_index(event: &Event) -> Result<ResponseOutputIndex, AgentError> {
     event
         .output_index
@@ -392,6 +497,14 @@ fn message_id(item: &Value) -> Result<AssistantMessageId, AgentError> {
         .filter(|id| !id.is_empty())
         .map(AssistantMessageId::new)
         .ok_or_else(|| AgentError::Model("message output missing id".to_string()))
+}
+
+fn reasoning_id(item: &Value) -> Result<String, AgentError> {
+    item.get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| AgentError::Model("reasoning output missing id".to_string()))
 }
 
 fn verify_part(
@@ -470,9 +583,9 @@ impl Accumulator {
             DecodeFailure::protocol_message("responses terminal event had no response".to_string())
         })?;
         if terminal == TerminalKind::Completed {
-            if !self.active_messages.is_empty() {
+            if !self.active_messages.is_empty() || !self.active_reasoning.is_empty() {
                 return Err(DecodeFailure::protocol_message(
-                    "responses completed with an active message item".to_string(),
+                    "responses completed with an active output item".to_string(),
                 ));
             }
             self.completed_messages
