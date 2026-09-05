@@ -513,9 +513,11 @@ pub struct TerminalAction {
 pub enum AgentSignal {
     AssistantMessageStarted {
         message_id: AssistantMessageId,
+        phase: AssistantMessagePhase,
     },
     AssistantMessageDelta {
         message_id: AssistantMessageId,
+        phase: AssistantMessagePhase,
         delta: String,
         index: usize,
     },
@@ -673,18 +675,33 @@ mod type_contracts {
     use super::*;
 
     #[test]
-    fn assistant_delta_is_pending_until_done() {
+    fn assistant_lifecycle_signals_include_phase() {
+        let started = AgentSignal::AssistantMessageStarted {
+            message_id: AssistantMessageId::new("run-1:turn-1"),
+            phase: AssistantMessagePhase::Commentary,
+        };
         let signal = AgentSignal::AssistantMessageDelta {
             message_id: AssistantMessageId::new("run-1:turn-1"),
+            phase: AssistantMessagePhase::Commentary,
             delta: "Checking data.".to_string(),
             index: 0,
         };
+
+        assert_eq!(
+            serde_json::to_value(started).expect("serialize signal"),
+            json!({
+                "type": "assistant_message_started",
+                "message_id": "run-1:turn-1",
+                "phase": "commentary"
+            })
+        );
 
         assert_eq!(
             serde_json::to_value(signal).expect("serialize signal"),
             json!({
                 "type": "assistant_message_delta",
                 "message_id": "run-1:turn-1",
+                "phase": "commentary",
                 "delta": "Checking data.",
                 "index": 0
             })

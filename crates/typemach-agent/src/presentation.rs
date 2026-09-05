@@ -80,10 +80,12 @@ pub(super) async fn complete(
     ));
     ctx.emit(AgentSignal::AssistantMessageStarted {
         message_id: message_id.clone(),
+        phase: AssistantMessagePhase::FinalAnswer,
     })
     .await?;
     ctx.emit(AgentSignal::AssistantMessageDelta {
         message_id: message_id.clone(),
+        phase: AssistantMessagePhase::FinalAnswer,
         delta: presentation.receipt.clone(),
         index: 0,
     })

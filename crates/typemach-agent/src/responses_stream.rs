@@ -5,12 +5,13 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::responses::{
-    DecodeFailure, assistant_message_from_item, model_response_from_value, model_response_shape,
-    tool_use_from_item,
+    DecodeFailure, assistant_message_from_item, assistant_message_phase, model_response_from_value,
+    model_response_shape, tool_use_from_item,
 };
 use crate::{
-    AgentError, AssistantMessageId, AssistantMessageItem, AssistantTextPart, ModelResponse,
-    ModelStream, ModelStreamEvent, ResponseContentIndex, ResponseOutputIndex, StopReason,
+    AgentError, AssistantMessageId, AssistantMessageItem, AssistantMessagePhase, AssistantTextPart,
+    ModelResponse, ModelStream, ModelStreamEvent, ResponseContentIndex, ResponseOutputIndex,
+    StopReason,
 };
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +40,7 @@ struct Event {
 struct MessageBuilder {
     id: AssistantMessageId,
     output_index: ResponseOutputIndex,
+    phase: AssistantMessagePhase,
     content: BTreeMap<ResponseContentIndex, String>,
     next_delta_index: usize,
 }
@@ -138,6 +140,7 @@ fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result
     match item.get("type").and_then(Value::as_str) {
         Some("message") => {
             let id = message_id(item)?;
+            let phase = assistant_message_phase(item)?;
             if acc.active_messages.contains_key(&output_index)
                 || acc
                     .completed_messages
@@ -162,6 +165,7 @@ fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result
                 MessageBuilder {
                     id: id.clone(),
                     output_index,
+                    phase,
                     content: BTreeMap::new(),
                     next_delta_index: 0,
                 },
@@ -169,6 +173,7 @@ fn add_item(event: Event, stream: &ModelStream, acc: &mut Accumulator) -> Result
             stream.emit(ModelStreamEvent::AssistantMessageStarted {
                 message_id: id,
                 output_index,
+                phase,
             })?;
         }
         Some("function_call") => validate_function_item(item, false)?,
@@ -413,7 +418,10 @@ fn verify_message(
     streamed: &MessageBuilder,
     completed: &AssistantMessageItem,
 ) -> Result<(), AgentError> {
-    if streamed.id != completed.id || streamed.output_index != completed.output_index {
+    if streamed.id != completed.id
+        || streamed.output_index != completed.output_index
+        || streamed.phase != completed.phase
+    {
         return Err(AgentError::Model(
             "completed message identity differed from active item".to_string(),
         ));

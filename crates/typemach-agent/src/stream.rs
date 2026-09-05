@@ -3,7 +3,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::{
-    AgentError, AssistantMessageId, AssistantMessageItem, ResponseContentIndex, ResponseOutputIndex,
+    AgentError, AssistantMessageId, AssistantMessageItem, AssistantMessagePhase,
+    ResponseContentIndex, ResponseOutputIndex,
 };
 
 #[derive(Clone)]
@@ -17,6 +18,7 @@ pub enum ModelStreamEvent {
     AssistantMessageStarted {
         message_id: AssistantMessageId,
         output_index: ResponseOutputIndex,
+        phase: AssistantMessagePhase,
     },
     AssistantMessageDelta {
         message_id: AssistantMessageId,

@@ -430,20 +430,7 @@ pub(crate) fn assistant_message_from_item(
             "message output was not completed".to_string(),
         ));
     }
-    let phase = match item.get("phase").and_then(Value::as_str) {
-        Some("commentary") => AssistantMessagePhase::Commentary,
-        Some("final_answer") => AssistantMessagePhase::FinalAnswer,
-        Some(other) => {
-            return Err(AgentError::Model(format!(
-                "unsupported message output phase: {other}"
-            )));
-        }
-        None => {
-            return Err(AgentError::Model(
-                "message output missing phase".to_string(),
-            ));
-        }
-    };
+    let phase = assistant_message_phase(item)?;
     let parts = item
         .get("content")
         .and_then(Value::as_array)
@@ -479,6 +466,19 @@ pub(crate) fn assistant_message_from_item(
         phase,
         content,
     })
+}
+
+pub(crate) fn assistant_message_phase(item: &Value) -> Result<AssistantMessagePhase, AgentError> {
+    match item.get("phase").and_then(Value::as_str) {
+        Some("commentary") => Ok(AssistantMessagePhase::Commentary),
+        Some("final_answer") => Ok(AssistantMessagePhase::FinalAnswer),
+        Some(other) => Err(AgentError::Model(format!(
+            "unsupported message output phase: {other}"
+        ))),
+        None => Err(AgentError::Model(
+            "message output missing phase".to_string(),
+        )),
+    }
 }
 
 fn stop_reason(raw: &Value, decoded: &DecodedOutput) -> Option<StopReason> {

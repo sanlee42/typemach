@@ -62,6 +62,19 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
             AssistantMessagePhase::FinalAnswer
         ]
     );
+    assert_eq!(
+        message_stream_phases(&events),
+        [
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::Commentary,
+            AssistantMessagePhase::FinalAnswer,
+            AssistantMessagePhase::FinalAnswer,
+            AssistantMessagePhase::FinalAnswer,
+            AssistantMessagePhase::FinalAnswer,
+        ]
+    );
     let completed = completed(&events);
     assert_eq!(completed.answer, "The answer is 42.");
     assert!(!completed.answer.contains("privately"));
@@ -207,7 +220,6 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
 
 fn tool_reasoning_call_sse() -> String {
     let mut events = message_events("msg-commentary", 1, "commentary", &["Checking orders. "]);
-    events[0]["item"]["phase"] = json!("final_answer");
     events.extend([
         json!({
             "type": "response.output_item.added",
@@ -619,6 +631,25 @@ fn message_done_phases(
         .filter_map(|event| match event {
             RunStreamEvent::Signal {
                 signal: AgentSignal::AssistantMessageDone { phase, .. },
+                ..
+            } => Some(*phase),
+            _ => None,
+        })
+        .collect()
+}
+
+fn message_stream_phases(
+    events: &[RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuestion>],
+) -> Vec<AssistantMessagePhase> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunStreamEvent::Signal {
+                signal: AgentSignal::AssistantMessageStarted { phase, .. },
+                ..
+            }
+            | RunStreamEvent::Signal {
+                signal: AgentSignal::AssistantMessageDelta { phase, .. },
                 ..
             } => Some(*phase),
             _ => None,

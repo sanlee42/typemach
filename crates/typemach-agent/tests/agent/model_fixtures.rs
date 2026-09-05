@@ -33,6 +33,7 @@ pub(super) fn emit_message(
     stream.emit(ModelStreamEvent::AssistantMessageStarted {
         message_id: message.id.clone(),
         output_index: message.output_index,
+        phase: message.phase,
     })?;
     for (index, delta) in deltas.iter().enumerate() {
         stream.emit(ModelStreamEvent::AssistantMessageDelta {
@@ -53,6 +54,7 @@ pub(super) fn emit_pending(stream: &ModelStream, id: &str, text: &str) -> Result
     stream.emit(ModelStreamEvent::AssistantMessageStarted {
         message_id: message.id.clone(),
         output_index: message.output_index,
+        phase: message.phase,
     })?;
     stream.emit(ModelStreamEvent::AssistantMessageDelta {
         message_id: message.id,

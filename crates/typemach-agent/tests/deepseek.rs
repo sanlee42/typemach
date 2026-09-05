@@ -57,6 +57,13 @@ async fn streaming_final_text_has_one_live_sink() {
         .await
         .expect("response");
 
+    assert!(matches!(
+        rx.recv().await.expect("started"),
+        ModelStreamEvent::AssistantMessageStarted {
+            phase: AssistantMessagePhase::FinalAnswer,
+            ..
+        }
+    ));
     assert_eq!(next_delta(&mut rx).await, "A");
     assert_eq!(next_delta(&mut rx).await, "B");
     assert!(matches!(
@@ -398,6 +405,47 @@ async fn conflicting_completed_item_is_rejected_without_done() {
             .to_string()
             .contains("streamed message bytes differed")
     );
+    assert_eq!(next_delta(&mut rx).await, "A");
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(
+            event,
+            ModelStreamEvent::AssistantMessageDone { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn completed_phase_must_match_the_added_message() {
+    let mut events = message_events("msg-conflict", 0, "commentary", &["A"]);
+    events[0]["item"]["phase"] = json!("final_answer");
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-conflict", "A")
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+
+    let error = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect_err("phase mismatch must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("completed message identity differed from active item")
+    );
+    assert!(matches!(
+        rx.recv().await.expect("started"),
+        ModelStreamEvent::AssistantMessageStarted {
+            phase: AssistantMessagePhase::FinalAnswer,
+            ..
+        }
+    ));
     assert_eq!(next_delta(&mut rx).await, "A");
     while let Ok(event) = rx.try_recv() {
         assert!(!matches!(

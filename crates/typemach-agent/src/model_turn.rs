@@ -42,6 +42,7 @@ struct ObservedLifecycle {
 struct ActiveMessage {
     id: AssistantMessageId,
     output_index: ResponseOutputIndex,
+    phase: AssistantMessagePhase,
     content: BTreeMap<ResponseContentIndex, String>,
     next_index: usize,
 }
@@ -239,7 +240,8 @@ impl TurnStream {
             ModelStreamEvent::AssistantMessageStarted {
                 message_id,
                 output_index,
-            } => lifecycle.start(ctx, message_id, output_index).await,
+                phase,
+            } => lifecycle.start(ctx, message_id, output_index, phase).await,
             ModelStreamEvent::AssistantMessageDelta {
                 message_id,
                 output_index,
@@ -280,6 +282,7 @@ impl ObservedLifecycle {
         ctx: &AgentRunContext,
         id: AssistantMessageId,
         output_index: ResponseOutputIndex,
+        phase: AssistantMessagePhase,
     ) -> Result<(), MachineError> {
         if self.active.contains_key(&output_index) {
             return Err(AgentError::Model(
@@ -297,12 +300,16 @@ impl ObservedLifecycle {
             ActiveMessage {
                 id: id.clone(),
                 output_index,
+                phase,
                 content: BTreeMap::new(),
                 next_index: 0,
             },
         );
-        ctx.emit(AgentSignal::AssistantMessageStarted { message_id: id })
-            .await
+        ctx.emit(AgentSignal::AssistantMessageStarted {
+            message_id: id,
+            phase,
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -341,6 +348,7 @@ impl ObservedLifecycle {
             .push_str(&delta);
         ctx.emit(AgentSignal::AssistantMessageDelta {
             message_id: id,
+            phase: active.phase,
             delta,
             index,
         })
@@ -364,6 +372,7 @@ impl ObservedLifecycle {
             .collect::<Vec<_>>();
         if active.id != message.id
             || active.output_index != message.output_index
+            || active.phase != message.phase
             || streamed != message.content
         {
             return Err(AgentError::Model(
@@ -403,7 +412,7 @@ impl ObservedLifecycle {
         messages: &[AssistantMessageItem],
     ) -> Result<(), MachineError> {
         for message in messages {
-            self.start(ctx, message.id.clone(), message.output_index)
+            self.start(ctx, message.id.clone(), message.output_index, message.phase)
                 .await?;
             for (index, part) in message.content.iter().enumerate() {
                 self.append(
