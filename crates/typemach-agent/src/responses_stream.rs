@@ -349,7 +349,7 @@ fn finish_item(
                     output_index.get()
                 ))
             })?;
-            verify_message(&streamed, &message)?;
+            let message = normalize_message(&streamed, message)?;
             stream.emit(ModelStreamEvent::AssistantMessageDone {
                 message: message.clone(),
             })?;
@@ -527,16 +527,18 @@ fn verify_part(
     Ok(())
 }
 
-fn verify_message(
+fn normalize_message(
     streamed: &MessageBuilder,
-    completed: &AssistantMessageItem,
-) -> Result<(), AgentError> {
-    if streamed.id != completed.id
-        || streamed.output_index != completed.output_index
-        || streamed.phase != completed.phase
-    {
+    mut completed: AssistantMessageItem,
+) -> Result<AssistantMessageItem, AgentError> {
+    if streamed.id != completed.id {
         return Err(AgentError::Model(
-            "completed message identity differed from active item".to_string(),
+            "completed message id differed from active item".to_string(),
+        ));
+    }
+    if streamed.output_index != completed.output_index {
+        return Err(AgentError::Model(
+            "completed message output index differed from active item".to_string(),
         ));
     }
     let content = streamed
@@ -551,6 +553,36 @@ fn verify_message(
         return Err(AgentError::Model(
             "streamed message bytes differed from completed item".to_string(),
         ));
+    }
+    completed.phase = streamed.phase;
+    Ok(completed)
+}
+
+fn verify_snapshot_messages(
+    completed: &[AssistantMessageItem],
+    snapshot: &[AssistantMessageItem],
+) -> Result<(), AgentError> {
+    if completed.len() != snapshot.len() {
+        return Err(AgentError::Model(
+            "completed message count differed from response snapshot".to_string(),
+        ));
+    }
+    for (position, (completed, snapshot)) in completed.iter().zip(snapshot).enumerate() {
+        if completed.id != snapshot.id {
+            return Err(AgentError::Model(format!(
+                "completed message {position} id differed from response snapshot"
+            )));
+        }
+        if completed.output_index != snapshot.output_index {
+            return Err(AgentError::Model(format!(
+                "completed message {position} output index differed from response snapshot"
+            )));
+        }
+        if completed.content != snapshot.content {
+            return Err(AgentError::Model(format!(
+                "completed message {position} bytes differed from response snapshot"
+            )));
+        }
     }
     Ok(())
 }
@@ -579,7 +611,7 @@ impl Accumulator {
                 "responses stream ended without a terminal event".to_string(),
             )
         })?;
-        let response = self.response.take().ok_or_else(|| {
+        let mut response = self.response.take().ok_or_else(|| {
             DecodeFailure::protocol_message("responses terminal event had no response".to_string())
         })?;
         if terminal == TerminalKind::Completed {
@@ -590,11 +622,8 @@ impl Accumulator {
             }
             self.completed_messages
                 .sort_by_key(|message| message.output_index);
-            if self.completed_messages != response.assistant_messages {
-                return Err(DecodeFailure::protocol_message(
-                    "completed message items differed from response snapshot".to_string(),
-                ));
-            }
+            verify_snapshot_messages(&self.completed_messages, &response.assistant_messages)?;
+            response.assistant_messages = self.completed_messages;
         } else if !matches!(
             response.stop_reason,
             Some(StopReason::MaxTokens | StopReason::Refusal)

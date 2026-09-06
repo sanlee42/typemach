@@ -415,9 +415,9 @@ async fn conflicting_completed_item_is_rejected_without_done() {
 }
 
 #[tokio::test]
-async fn completed_phase_must_match_the_added_message() {
+async fn completed_phase_is_normalized_to_the_added_message() {
     let mut events = message_events("msg-conflict", 0, "commentary", &["A"]);
-    events[0]["item"]["phase"] = json!("final_answer");
+    events.last_mut().expect("item done")["item"]["phase"] = json!("final_answer");
     events.push(json!({
         "type": "response.completed",
         "response": completed_message_with("msg-conflict", "A")
@@ -426,33 +426,87 @@ async fn completed_phase_must_match_the_added_message() {
     let model = ConfiguredModel::new(config(base_url, true)).expect("model");
     let (stream, mut rx) = ModelStream::channel();
 
+    let response = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect("phase mismatch is display metadata");
+    assert!(matches!(
+        rx.recv().await.expect("started"),
+        ModelStreamEvent::AssistantMessageStarted {
+            phase: AssistantMessagePhase::Commentary,
+            ..
+        }
+    ));
+    assert_eq!(next_delta(&mut rx).await, "A");
+    assert!(matches!(
+        rx.recv().await.expect("done"),
+        ModelStreamEvent::AssistantMessageDone {
+            message: typemach_agent::AssistantMessageItem {
+                phase: AssistantMessagePhase::Commentary,
+                ..
+            }
+        }
+    ));
+    assert_eq!(
+        response.assistant_messages[0].phase,
+        AssistantMessagePhase::Commentary
+    );
+}
+
+#[tokio::test]
+async fn changed_completed_message_id_is_rejected() {
+    let mut events = message_events("msg-original", 0, "final_answer", &["A"]);
+    events.last_mut().expect("item done")["item"]["id"] = json!("msg-changed");
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-changed", "A")
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+
     let error = model
         .next_step(
             request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
             stream,
         )
         .await
-        .expect_err("phase mismatch must fail");
+        .expect_err("changed id must fail");
 
     assert!(
         error
             .to_string()
-            .contains("completed message identity differed from active item")
+            .contains("completed message id differed from active item")
     );
-    assert!(matches!(
-        rx.recv().await.expect("started"),
-        ModelStreamEvent::AssistantMessageStarted {
-            phase: AssistantMessagePhase::FinalAnswer,
-            ..
-        }
-    ));
-    assert_eq!(next_delta(&mut rx).await, "A");
-    while let Ok(event) = rx.try_recv() {
-        assert!(!matches!(
-            event,
-            ModelStreamEvent::AssistantMessageDone { .. }
-        ));
-    }
+}
+
+#[tokio::test]
+async fn conflicting_terminal_message_bytes_are_rejected() {
+    let mut events = message_events("msg-terminal", 0, "final_answer", &["A"]);
+    events.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-terminal", "B")
+    }));
+    let (base_url, _captured) = spawn_server(vec![MockTurn::ok(sse(events))]).await;
+    let model = ConfiguredModel::new(config(base_url, true)).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+
+    let error = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect_err("conflicting terminal snapshot must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("completed message 0 bytes differed from response snapshot")
+    );
 }
 
 fn config(base_url: String, stream: bool) -> AgentConfig {
