@@ -194,6 +194,49 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
     )));
 }
 
+#[tokio::test]
+async fn final_answer_with_tool_call_dispatches_and_allows_a_followup() {
+    let mut mixed_response = metric_call();
+    mixed_response.assistant_messages[0].phase = AssistantMessagePhase::FinalAnswer;
+    let model = ScriptedModel::new([
+        mixed_response,
+        ModelResponse {
+            stop_reason: Some(StopReason::EndTurn),
+            ..final_response("There were 42 orders.")
+        },
+    ]);
+    let tools = CountingTools::default();
+    let calls = tools.calls.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+    let events = collect(runner.stream(
+        request(AgentRunInput {
+            messages: vec![AgentMessage::user_text("How many orders?")],
+            context: Value::Null,
+            budget: AgentBudget {
+                max_model_turns: 2,
+                max_tool_calls: 2,
+            },
+            human_input: None,
+            system_suffix: None,
+        }),
+        StreamConfig::default(),
+    ))
+    .await;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(completed(&events).answer, "There were 42 orders.");
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| matches!(
+        message,
+        AgentMessage::User { content }
+            if content.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult(result) if result.tool_use_id == "tool-1"
+            ))
+    )));
+}
+
 #[derive(Clone, Copy)]
 enum AbortCase {
     MaxTokens,

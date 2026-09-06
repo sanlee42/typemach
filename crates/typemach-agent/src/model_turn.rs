@@ -125,10 +125,9 @@ async fn finish_response(
     }
     streamed.complete(ctx, &response.assistant_messages).await?;
 
-    validate_phase_order(
-        &response.assistant_messages,
-        !response.tool_calls.is_empty(),
-    )?;
+    if response.tool_calls.is_empty() {
+        validate_phase_order(&response.assistant_messages)?;
+    }
     let mut content = reasoning_blocks(response.reasoning);
     content.extend(
         response
@@ -164,22 +163,7 @@ async fn finish_response(
     })
 }
 
-fn validate_phase_order(
-    messages: &[AssistantMessageItem],
-    has_tool_calls: bool,
-) -> Result<(), MachineError> {
-    if has_tool_calls {
-        if messages
-            .iter()
-            .any(|message| message.phase != AssistantMessagePhase::Commentary)
-        {
-            return Err(AgentError::Model(
-                "tool response contained a final-answer message".to_string(),
-            )
-            .machine());
-        }
-        return Ok(());
-    }
+fn validate_phase_order(messages: &[AssistantMessageItem]) -> Result<(), MachineError> {
     let mut final_seen = false;
     for message in messages {
         match message.phase {
