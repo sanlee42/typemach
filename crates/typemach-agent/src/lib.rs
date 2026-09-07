@@ -548,6 +548,7 @@ where
             name: result.name.clone(),
             content: result.content.clone(),
             is_error: false,
+            retained_authorization: None,
         })
         .await?;
         ctx.emit(AgentSignal::ToolCompleted {
@@ -682,6 +683,10 @@ async fn record_tool_result(
     mut result: ToolResult,
 ) -> Result<Option<presentation::Presentation>, MachineError> {
     result.validate().map_err(AgentError::machine)?;
+    let retained_authorization = result
+        .retained
+        .as_ref()
+        .map(|retained| retained.authorization().clone());
     if let Some(retained) = result.retained.take() {
         retained_result::push(&mut state.retained_results, retained)
             .map_err(AgentError::machine)?;
@@ -693,6 +698,7 @@ async fn record_tool_result(
         name: result.name.clone(),
         content: result.content.clone(),
         is_error: result.is_error,
+        retained_authorization,
     })
     .await?;
     let (prompt_result, archive) =

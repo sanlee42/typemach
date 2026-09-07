@@ -574,6 +574,10 @@ pub enum AgentSignal {
         name: String,
         content: Value,
         is_error: bool,
+        /// Opaque host authorization metadata from the retained result.
+        /// Adapters must not forward it to the model provider or public UI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retained_authorization: Option<Value>,
     },
     Artifact {
         artifact: Artifact,

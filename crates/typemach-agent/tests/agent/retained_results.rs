@@ -123,6 +123,29 @@ async fn retained_results_are_host_only_and_follow_turn_lifecycle() {
         .expect("checkpoint");
     let state: AgentState = serde_json::from_value(checkpoint.state).expect("state");
     assert_eq!(ids(&state.retained_results), ["page", "metric-1"]);
+    let retained_signal = first.iter().find_map(|event| match event {
+        RunStreamEvent::Signal {
+            signal:
+                AgentSignal::ToolResult {
+                    tool_use_id,
+                    content,
+                    retained_authorization,
+                    ..
+                },
+        } if tool_use_id == "metric-1" => Some((content, retained_authorization)),
+        _ => None,
+    });
+    let (content, authorization) = retained_signal.expect("retained result signal");
+    assert_eq!(content, &json!({ "result_ref": "metric-1" }));
+    assert_eq!(
+        authorization.as_ref(),
+        Some(&json!({ "scope": "metric_point" }))
+    );
+    assert!(
+        !serde_json::to_string(&(content, authorization))
+            .expect("signal")
+            .contains("private-metric_point")
+    );
 
     let resume = RunRequest {
         command: RunCommand::Resume,
