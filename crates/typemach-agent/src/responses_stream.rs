@@ -10,8 +10,8 @@ use crate::responses::{
 };
 use crate::{
     AgentError, AssistantMessageId, AssistantMessageItem, AssistantMessagePhase, AssistantTextPart,
-    ModelResponse, ModelStream, ModelStreamEvent, ResponseContentIndex, ResponseOutputIndex,
-    StopReason,
+    ContentBlock, ModelResponse, ModelStream, ModelStreamEvent, ResponseContentIndex,
+    ResponseOutputIndex, StopReason,
 };
 
 #[derive(Debug, Deserialize)]
@@ -558,24 +558,35 @@ fn normalize_message(
     Ok(completed)
 }
 
-fn verify_snapshot_messages(
+fn normalize_snapshot_messages(
+    content: &mut [ContentBlock],
     completed: &[AssistantMessageItem],
-    snapshot: &[AssistantMessageItem],
 ) -> Result<(), AgentError> {
-    if completed.len() != snapshot.len() {
+    let snapshot_count = content
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::AssistantMessage(_)))
+        .count();
+    if completed.len() != snapshot_count {
         return Err(AgentError::Model(
             "completed message count differed from response snapshot".to_string(),
         ));
     }
-    for (position, (completed, snapshot)) in completed.iter().zip(snapshot).enumerate() {
+    let mut position = 0;
+    for block in content {
+        let ContentBlock::AssistantMessage(snapshot) = block else {
+            continue;
+        };
+        let completed = completed
+            .iter()
+            .find(|message| message.output_index == snapshot.output_index)
+            .ok_or_else(|| {
+                AgentError::Model(format!(
+                    "completed message {position} output index differed from response snapshot"
+                ))
+            })?;
         if completed.id != snapshot.id {
             return Err(AgentError::Model(format!(
                 "completed message {position} id differed from response snapshot"
-            )));
-        }
-        if completed.output_index != snapshot.output_index {
-            return Err(AgentError::Model(format!(
-                "completed message {position} output index differed from response snapshot"
             )));
         }
         if completed.content != snapshot.content {
@@ -583,6 +594,8 @@ fn verify_snapshot_messages(
                 "completed message {position} bytes differed from response snapshot"
             )));
         }
+        *snapshot = completed.clone();
+        position += 1;
     }
     Ok(())
 }
@@ -620,10 +633,7 @@ impl Accumulator {
                     "responses completed with an active output item".to_string(),
                 ));
             }
-            self.completed_messages
-                .sort_by_key(|message| message.output_index);
-            verify_snapshot_messages(&self.completed_messages, &response.assistant_messages)?;
-            response.assistant_messages = self.completed_messages;
+            normalize_snapshot_messages(&mut response.content, &self.completed_messages)?;
         } else if !matches!(
             response.stop_reason,
             Some(StopReason::MaxTokens | StopReason::Refusal)

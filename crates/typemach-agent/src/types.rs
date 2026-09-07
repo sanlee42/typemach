@@ -239,17 +239,11 @@ pub struct ModelRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ModelResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assistant_messages: Vec<AssistantMessageItem>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_calls: Vec<ToolUse>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reasoning: Vec<String>,
+    pub content: Vec<ContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
 }

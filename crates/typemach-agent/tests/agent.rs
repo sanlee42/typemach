@@ -293,28 +293,34 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
 
 #[tokio::test]
 async fn reasoning_blocks_are_persisted_without_polluting_answer() {
-    let model = ScriptedModel::new([
-        ModelResponse {
-            reasoning: vec!["private tool reasoning".to_string()],
-            stop_reason: Some(StopReason::ToolUse),
-            response_id: Some("msg-1".to_string()),
-            raw: Some(json!({ "id": "msg-1" })),
-            ..tool_response(
-                "",
-                vec![ToolUse {
-                    id: "tool-1".to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
-                    raw: Some(json!({ "id": "tool-1", "index": 0 })),
-                }],
-            )
+    let mut tool_turn = tool_response(
+        "",
+        vec![ToolUse {
+            id: "tool-1".to_string(),
+            name: "metric_point".to_string(),
+            input: json!({ "metric_id": "paid_order_count", "ds": "2026-06-08" }),
+            raw: None,
+        }],
+    );
+    tool_turn.content.insert(
+        0,
+        ContentBlock::Thinking {
+            text: "private tool reasoning".to_string(),
+            signature: None,
         },
-        ModelResponse {
-            reasoning: vec!["private final reasoning".to_string()],
-            stop_reason: Some(StopReason::EndTurn),
-            ..final_response("The order count is 42.")
+    );
+    tool_turn.stop_reason = Some(StopReason::ToolUse);
+    tool_turn.response_id = Some("msg-1".to_string());
+    let mut final_turn = final_response("The order count is 42.");
+    final_turn.content.insert(
+        0,
+        ContentBlock::Thinking {
+            text: "private final reasoning".to_string(),
+            signature: None,
         },
-    ]);
+    );
+    final_turn.stop_reason = Some(StopReason::EndTurn);
+    let model = ScriptedModel::new([tool_turn, final_turn]);
     let runner = build_agent_runner(
         MemorySaver::default(),
         model.clone(),

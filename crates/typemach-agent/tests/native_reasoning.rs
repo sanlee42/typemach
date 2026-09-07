@@ -2,8 +2,8 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use typemach_agent::{
-    AgentConfig, AgentMessage, AgentModel, AssistantMessagePhase, ConfiguredModel, ModelRequest,
-    ModelStream, ModelStreamEvent, StopReason,
+    AgentConfig, AgentMessage, AgentModel, AssistantMessagePhase, ConfiguredModel, ContentBlock,
+    ModelRequest, ModelStream, ModelStreamEvent, StopReason,
 };
 
 #[tokio::test]
@@ -29,8 +29,15 @@ async fn reasoning_lifecycle_precedes_a_function_call_without_emitting_text() {
         .await
         .expect("response");
 
-    assert_eq!(response.tool_calls[0].id, "call-1");
-    assert_eq!(response.reasoning, ["private reasoning"]);
+    let [
+        ContentBlock::Thinking { text, .. },
+        ContentBlock::ToolUse(call),
+    ] = response.content.as_slice()
+    else {
+        panic!("expected ordered reasoning and tool call");
+    };
+    assert_eq!(text, "private reasoning");
+    assert_eq!(call.id, "call-1");
     assert!(rx.try_recv().is_err());
 }
 
@@ -78,8 +85,15 @@ async fn reasoning_lifecycle_keeps_final_answer_streaming_typed() {
         ModelStreamEvent::AssistantMessageDone { .. }
     ));
     assert!(rx.try_recv().is_err());
-    assert_eq!(response.assistant_messages[0].text(), "Visible answer.");
-    assert_eq!(response.reasoning, ["private reasoning"]);
+    let [
+        ContentBlock::Thinking { text, .. },
+        ContentBlock::AssistantMessage(message),
+    ] = response.content.as_slice()
+    else {
+        panic!("expected ordered reasoning and assistant message");
+    };
+    assert_eq!(text, "private reasoning");
+    assert_eq!(message.text(), "Visible answer.");
     assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
 }
 

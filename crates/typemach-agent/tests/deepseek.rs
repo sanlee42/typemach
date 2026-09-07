@@ -1,13 +1,16 @@
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use typemach_agent::{
-    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, AssistantMessagePhase, ConfiguredModel,
-    ModelRequest, ModelStream, ModelStreamEvent, StopReason, ToolAnnotations,
+    AgentConfig, AgentMessage, AgentModel, AgentToolSpec, AssistantMessageItem,
+    AssistantMessagePhase, ConfiguredModel, ContentBlock, ModelRequest, ModelResponse, ModelStream,
+    ModelStreamEvent, StopReason, ToolAnnotations, ToolUse,
 };
+
+#[path = "deepseek/fixtures.rs"]
+mod fixtures;
+use fixtures::{Delivery, MockTurn, spawn_server, sse};
 
 #[tokio::test]
 async fn origin_base_posts_to_responses_and_stale_chat_base_is_invalid() {
@@ -71,9 +74,9 @@ async fn streaming_final_text_has_one_live_sink() {
         ModelStreamEvent::AssistantMessageDone { .. }
     ));
     assert!(rx.try_recv().is_err());
-    assert_eq!(response.assistant_messages[0].text(), "AB");
+    assert_eq!(assistant_messages(&response)[0].text(), "AB");
     assert_eq!(
-        response.assistant_messages[0].phase,
+        assistant_messages(&response)[0].phase,
         AssistantMessagePhase::FinalAnswer
     );
     assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
@@ -132,12 +135,12 @@ async fn streamed_text_remains_live_when_the_response_also_calls_a_tool() {
     release.notify_one();
 
     let response = response.await.expect("model task").expect("response");
-    assert_eq!(response.assistant_messages[0].text(), "Checking orders. ");
+    assert_eq!(assistant_messages(&response)[0].text(), "Checking orders. ");
     assert_eq!(
-        response.assistant_messages[0].phase,
+        assistant_messages(&response)[0].phase,
         AssistantMessagePhase::Commentary
     );
-    assert_eq!(response.tool_calls[0].id, "call-1");
+    assert_eq!(tool_calls(&response)[0].id, "call-1");
     assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
 }
 
@@ -161,7 +164,7 @@ async fn content_part_text_without_delta_is_forwarded_once() {
         .expect("response");
 
     assert_eq!(next_delta(&mut rx).await, "No live delta.");
-    assert_eq!(response.assistant_messages[0].text(), "No live delta.");
+    assert_eq!(assistant_messages(&response)[0].text(), "No live delta.");
 }
 
 #[tokio::test]
@@ -275,9 +278,9 @@ async fn function_call_arguments_are_private_and_decoded() {
         .expect("response");
 
     assert!(rx.try_recv().is_err());
-    assert_eq!(response.tool_calls[0].id, "call-1");
+    assert_eq!(tool_calls(&response)[0].id, "call-1");
     assert_eq!(
-        response.tool_calls[0].input["metric_id"],
+        tool_calls(&response)[0].input["metric_id"],
         "paid_order_count"
     );
 }
@@ -451,7 +454,7 @@ async fn completed_phase_is_normalized_to_the_added_message() {
         }
     ));
     assert_eq!(
-        response.assistant_messages[0].phase,
+        assistant_messages(&response)[0].phase,
         AssistantMessagePhase::Commentary
     );
 }
@@ -701,151 +704,24 @@ fn completed_refusal() -> Value {
     })
 }
 
-enum Delivery {
-    Complete,
-    Truncate,
-    SplitBodyAt(usize),
-    HoldAfter(usize, Arc<Notify>),
-}
-
-struct MockTurn {
-    status: u16,
-    content_type: &'static str,
-    body: String,
-    delivery: Delivery,
-}
-
-impl MockTurn {
-    fn ok(body: String) -> Self {
-        Self {
-            status: 200,
-            content_type: "application/json",
-            body,
-            delivery: Delivery::Complete,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct CapturedRequest {
-    target: String,
-    body: Value,
-}
-
-async fn spawn_server(turns: Vec<MockTurn>) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let captured_for_task = Arc::clone(&captured);
-    tokio::spawn(async move {
-        for turn in turns {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let request = read_request(&mut socket).await;
-            captured_for_task
-                .lock()
-                .expect("captured lock")
-                .push(request);
-            write_response(&mut socket, &turn).await;
-        }
-    });
-    (format!("http://{addr}"), captured)
-}
-
-async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
-    let mut buffer = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    let header_end = loop {
-        let n = socket.read(&mut chunk).await.expect("read request");
-        assert_ne!(n, 0, "connection closed before headers");
-        buffer.extend_from_slice(&chunk[..n]);
-        if let Some(index) = find_header_end(&buffer) {
-            break index;
-        }
-    };
-    let headers = String::from_utf8_lossy(&buffer[..header_end]);
-    let target = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .expect("request target")
-        .to_string();
-    let content_length = content_length(&headers);
-    while buffer.len() < header_end + 4 + content_length {
-        let n = socket.read(&mut chunk).await.expect("read body");
-        assert_ne!(n, 0, "connection closed before body");
-        buffer.extend_from_slice(&chunk[..n]);
-    }
-    let body = &buffer[header_end + 4..header_end + 4 + content_length];
-    CapturedRequest {
-        target,
-        body: serde_json::from_slice(body).expect("json body"),
-    }
-}
-
-async fn write_response(socket: &mut tokio::net::TcpStream, turn: &MockTurn) {
-    let advertised_len = match turn.delivery {
-        Delivery::Complete | Delivery::SplitBodyAt(_) | Delivery::HoldAfter(_, _) => {
-            turn.body.len()
-        }
-        Delivery::Truncate => turn.body.len() + 16,
-    };
-    let head = format!(
-        "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        turn.status, turn.content_type, advertised_len
-    );
-    socket
-        .write_all(head.as_bytes())
-        .await
-        .expect("write response head");
-    match turn.delivery {
-        Delivery::Complete | Delivery::Truncate => {
-            socket
-                .write_all(turn.body.as_bytes())
-                .await
-                .expect("write response body");
-        }
-        Delivery::SplitBodyAt(index) => {
-            let (first, second) = turn.body.as_bytes().split_at(index);
-            socket.write_all(first).await.expect("write first body");
-            socket.flush().await.expect("flush first body");
-            tokio::task::yield_now().await;
-            socket.write_all(second).await.expect("write second body");
-        }
-        Delivery::HoldAfter(index, ref release) => {
-            let (first, second) = turn.body.as_bytes().split_at(index);
-            socket.write_all(first).await.expect("write first body");
-            socket.flush().await.expect("flush first body");
-            release.notified().await;
-            socket.write_all(second).await.expect("write second body");
-        }
-    }
-    if !matches!(turn.delivery, Delivery::Truncate) {
-        socket.shutdown().await.expect("shutdown response");
-    }
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn content_length(headers: &str) -> usize {
-    headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().expect("content length"))
+fn assistant_messages(response: &ModelResponse) -> Vec<&AssistantMessageItem> {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::AssistantMessage(message) => Some(message),
+            _ => None,
         })
-        .expect("content-length")
+        .collect()
 }
 
-fn sse(events: impl IntoIterator<Item = Value>) -> String {
-    let mut body = String::new();
-    for event in events {
-        body.push_str("data: ");
-        body.push_str(&event.to_string());
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
-    body
+fn tool_calls(response: &ModelResponse) -> Vec<&ToolUse> {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse(tool_use) => Some(tool_use),
+            _ => None,
+        })
+        .collect()
 }

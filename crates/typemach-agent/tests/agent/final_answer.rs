@@ -29,7 +29,7 @@ impl AgentModel for StreamingFinal {
         );
         emit_message(&stream, &message, &["The answer ", "is 42."])?;
         Ok(ModelResponse {
-            assistant_messages: vec![message],
+            content: vec![ContentBlock::AssistantMessage(message)],
             stop_reason: Some(StopReason::EndTurn),
             ..ModelResponse::default()
         })
@@ -199,7 +199,10 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
 #[tokio::test]
 async fn final_answer_with_tool_call_dispatches_and_allows_a_followup() {
     let mut mixed_response = metric_call();
-    mixed_response.assistant_messages[0].phase = AssistantMessagePhase::FinalAnswer;
+    let ContentBlock::AssistantMessage(message) = &mut mixed_response.content[0] else {
+        panic!("expected assistant message");
+    };
+    message.phase = AssistantMessagePhase::FinalAnswer;
     let model = ScriptedModel::new([
         mixed_response,
         ModelResponse {
@@ -266,12 +269,12 @@ impl AgentModel for AbortModel {
                 ..ModelResponse::default()
             }),
             AbortCase::MaxTokensToolCalls => Ok(ModelResponse {
-                tool_calls: vec![ToolUse {
+                content: vec![ContentBlock::ToolUse(ToolUse {
                     id: "truncated-tool".to_string(),
                     name: "metric_point".to_string(),
                     input: json!({}),
                     raw: None,
-                }],
+                })],
                 stop_reason: Some(StopReason::MaxTokens),
                 ..ModelResponse::default()
             }),

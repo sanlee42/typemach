@@ -112,49 +112,49 @@ pub(super) async fn invoke<M: AgentModel + ?Sized>(
 async fn finish_response(
     ctx: &AgentRunContext,
     mut streamed: TurnStream,
-    mut response: ModelResponse,
+    response: ModelResponse,
 ) -> Result<Turn, MachineError> {
-    response
-        .assistant_messages
-        .sort_by_key(|message| message.output_index);
     if aborted(response.stop_reason.as_ref()) {
         return Ok(Turn {
             outcome: None,
             stop_reason: response.stop_reason,
         });
     }
-    streamed.complete(ctx, &response.assistant_messages).await?;
+    let assistant_messages = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::AssistantMessage(message) => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    streamed.complete(ctx, &assistant_messages).await?;
+    let tool_calls = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse(tool_use) => Some(tool_use.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
-    if response.tool_calls.is_empty() {
-        validate_phase_order(&response.assistant_messages)?;
+    if tool_calls.is_empty() {
+        validate_phase_order(&assistant_messages)?;
     }
-    let mut content = reasoning_blocks(response.reasoning);
-    content.extend(
-        response
-            .assistant_messages
-            .iter()
-            .cloned()
-            .map(ContentBlock::AssistantMessage),
-    );
-    let outcome = if response.tool_calls.is_empty() {
-        let text = response
-            .assistant_messages
+    let outcome = if tool_calls.is_empty() {
+        let text = assistant_messages
             .iter()
             .filter(|message| message.phase == AssistantMessagePhase::FinalAnswer)
             .map(AssistantMessageItem::text)
             .collect::<String>();
-        (!response.assistant_messages.is_empty()).then_some(TurnOutcome::Message { content, text })
+        (!assistant_messages.is_empty()).then_some(TurnOutcome::Message {
+            content: response.content,
+            text,
+        })
     } else {
-        content.extend(
-            response
-                .tool_calls
-                .iter()
-                .cloned()
-                .map(ContentBlock::ToolUse),
-        );
         Some(TurnOutcome::ToolCalls {
-            content,
-            calls: response.tool_calls,
+            content: response.content,
+            calls: tool_calls,
         })
     };
     Ok(Turn {
@@ -184,17 +184,6 @@ fn validate_phase_order(messages: &[AssistantMessageItem]) -> Result<(), Machine
         .machine());
     }
     Ok(())
-}
-
-fn reasoning_blocks(reasoning: Vec<String>) -> Vec<ContentBlock> {
-    reasoning
-        .into_iter()
-        .filter(|text| !text.is_empty())
-        .map(|text| ContentBlock::Thinking {
-            text,
-            signature: None,
-        })
-        .collect()
 }
 
 fn aborted(reason: Option<&StopReason>) -> bool {

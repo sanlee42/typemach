@@ -1,7 +1,7 @@
 use typemach_agent::{
     AgentError, AssistantMessageId, AssistantMessageItem, AssistantMessagePhase, AssistantTextPart,
-    ModelResponse, ModelStream, ModelStreamEvent, ResponseContentIndex, ResponseOutputIndex,
-    ToolUse,
+    ContentBlock, ModelResponse, ModelStream, ModelStreamEvent, ResponseContentIndex,
+    ResponseOutputIndex, ToolUse,
 };
 
 fn response_message(phase: AssistantMessagePhase, text: impl Into<String>) -> AssistantMessageItem {
@@ -67,19 +67,28 @@ pub(super) fn emit_pending(stream: &ModelStream, id: &str, text: &str) -> Result
 
 pub(super) fn final_response(text: impl Into<String>) -> ModelResponse {
     ModelResponse {
-        assistant_messages: vec![response_message(AssistantMessagePhase::FinalAnswer, text)],
+        content: vec![ContentBlock::AssistantMessage(response_message(
+            AssistantMessagePhase::FinalAnswer,
+            text,
+        ))],
         ..ModelResponse::default()
     }
 }
 
 pub(super) fn tool_response(text: impl Into<String>, calls: Vec<ToolUse>) -> ModelResponse {
     let text = text.into();
+    let mut content = (!text.is_empty())
+        .then(|| {
+            ContentBlock::AssistantMessage(response_message(
+                AssistantMessagePhase::Commentary,
+                text,
+            ))
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    content.extend(calls.into_iter().map(ContentBlock::ToolUse));
     ModelResponse {
-        assistant_messages: (!text.is_empty())
-            .then(|| response_message(AssistantMessagePhase::Commentary, text))
-            .into_iter()
-            .collect(),
-        tool_calls: calls,
+        content,
         ..ModelResponse::default()
     }
 }

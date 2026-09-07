@@ -118,24 +118,21 @@ impl From<AgentError> for DecodeFailure {
 
 pub(crate) fn model_response_from_value(raw: Value) -> Result<ModelResponse, AgentError> {
     fail_if_error(&raw)?;
-    let decoded = decode_output(&raw)?;
+    let content = decode_output(&raw)?;
     let usage = raw.get("usage").cloned().map(decode_usage).transpose()?;
-    let stop_reason = stop_reason(&raw, &decoded);
+    let stop_reason = stop_reason(&raw, &content);
     Ok(ModelResponse {
-        assistant_messages: decoded.assistant_messages,
-        tool_calls: decoded.tool_calls,
-        reasoning: decoded.reasoning,
+        content,
         stop_reason,
         response_id: raw
             .get("id")
             .and_then(Value::as_str)
             .map(ToString::to_string),
-        raw: Some(raw),
         usage,
     })
 }
 
-pub(crate) fn model_response_shape(raw: &Value) -> Result<DecodedOutput, AgentError> {
+pub(crate) fn model_response_shape(raw: &Value) -> Result<Vec<ContentBlock>, AgentError> {
     fail_if_error(raw)?;
     decode_output(raw)
 }
@@ -159,13 +156,6 @@ pub(crate) fn tool_use_from_item(item: &Value) -> Result<ToolUse, AgentError> {
         input: decode_arguments(arguments),
         raw: Some(item.clone()),
     })
-}
-
-#[derive(Debug)]
-pub(crate) struct DecodedOutput {
-    pub(crate) assistant_messages: Vec<AssistantMessageItem>,
-    pub(crate) tool_calls: Vec<ToolUse>,
-    pub(crate) reasoning: Vec<String>,
 }
 
 fn reasoning(config: &AgentConfig) -> ResponseReasoning {
@@ -250,12 +240,7 @@ fn append_assistant_items(
             }
             ContentBlock::ToolUse(tool_use) => {
                 flush_message(out, "assistant", &mut text);
-                out.push(json!({
-                    "type": "function_call",
-                    "call_id": tool_use.id,
-                    "name": tool_use.name,
-                    "arguments": encode_arguments(&tool_use.input)?
-                }));
+                out.push(function_call_item(tool_use)?);
             }
             ContentBlock::ConversationDigest(_) | ContentBlock::ToolResult(_) => {
                 return Err(AgentError::Model(
@@ -266,6 +251,29 @@ fn append_assistant_items(
     }
     flush_message(out, "assistant", &mut text);
     Ok(())
+}
+
+fn function_call_item(tool_use: &ToolUse) -> Result<Value, AgentError> {
+    let Some(raw) = &tool_use.raw else {
+        return Ok(json!({
+            "type": "function_call",
+            "call_id": tool_use.id,
+            "name": tool_use.name,
+            "arguments": encode_arguments(&tool_use.input)?
+        }));
+    };
+    if raw.get("type").and_then(Value::as_str) != Some("function_call") {
+        return Err(AgentError::Model(
+            "tool call raw item type must be function_call".to_string(),
+        ));
+    }
+    let replay = tool_use_from_item(raw)?;
+    if replay.id != tool_use.id || replay.name != tool_use.name {
+        return Err(AgentError::Model(
+            "tool call raw item identity differed from dispatch view".to_string(),
+        ));
+    }
+    Ok(raw.clone())
 }
 
 fn assistant_content(message: &AssistantMessageItem) -> Result<Vec<Value>, AgentError> {
@@ -338,14 +346,12 @@ fn fail_if_error(raw: &Value) -> Result<(), AgentError> {
     Err(AgentError::Model(message.to_string()))
 }
 
-fn decode_output(raw: &Value) -> Result<DecodedOutput, AgentError> {
+fn decode_output(raw: &Value) -> Result<Vec<ContentBlock>, AgentError> {
     let items = raw
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| AgentError::Model("responses output must be an array".to_string()))?;
-    let mut assistant_messages = Vec::new();
-    let mut tool_calls = Vec::new();
-    let mut reasoning = Vec::new();
+    let mut content = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if matches!(
             item.get("status").and_then(Value::as_str),
@@ -354,12 +360,11 @@ fn decode_output(raw: &Value) -> Result<DecodedOutput, AgentError> {
             continue;
         }
         match item.get("type").and_then(Value::as_str) {
-            Some("reasoning") => extend_reasoning(&mut reasoning, item)?,
-            Some("message") => assistant_messages.push(assistant_message_from_item(
-                item,
-                ResponseOutputIndex::new(index),
-            )?),
-            Some("function_call") => tool_calls.push(tool_use_from_item(item)?),
+            Some("reasoning") => content.extend(reasoning_block(item)?),
+            Some("message") => content.push(ContentBlock::AssistantMessage(
+                assistant_message_from_item(item, ResponseOutputIndex::new(index))?,
+            )),
+            Some("function_call") => content.push(ContentBlock::ToolUse(tool_use_from_item(item)?)),
             Some(other) => {
                 return Err(AgentError::Model(format!(
                     "unsupported responses output item: {other}"
@@ -372,16 +377,12 @@ fn decode_output(raw: &Value) -> Result<DecodedOutput, AgentError> {
             }
         }
     }
-    Ok(DecodedOutput {
-        assistant_messages,
-        tool_calls,
-        reasoning,
-    })
+    Ok(content)
 }
 
-fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), AgentError> {
+fn reasoning_block(item: &Value) -> Result<Option<ContentBlock>, AgentError> {
     let Some(parts) = item.get("content").and_then(Value::as_array) else {
-        return Ok(());
+        return Ok(None);
     };
     let text = parts.iter().try_fold(String::new(), |mut text, part| {
         match part.get("type").and_then(Value::as_str) {
@@ -401,10 +402,10 @@ fn extend_reasoning(content: &mut Vec<String>, item: &Value) -> Result<(), Agent
             )),
         }
     })?;
-    if !text.is_empty() {
-        content.push(text);
-    }
-    Ok(())
+    Ok((!text.is_empty()).then_some(ContentBlock::Thinking {
+        text,
+        signature: None,
+    }))
 }
 
 pub(crate) fn assistant_message_from_item(
@@ -481,15 +482,21 @@ pub(crate) fn assistant_message_phase(item: &Value) -> Result<AssistantMessagePh
     }
 }
 
-fn stop_reason(raw: &Value, decoded: &DecodedOutput) -> Option<StopReason> {
+fn stop_reason(raw: &Value, content: &[ContentBlock]) -> Option<StopReason> {
+    let has_tool_call = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse(_)));
+    let has_message = content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::AssistantMessage(_)));
     match raw.get("status").and_then(Value::as_str) {
         Some("incomplete") => Some(incomplete_reason(raw)),
-        Some("completed") if !decoded.tool_calls.is_empty() => Some(StopReason::ToolUse),
-        Some("completed") if !decoded.assistant_messages.is_empty() => Some(StopReason::EndTurn),
+        Some("completed") if has_tool_call => Some(StopReason::ToolUse),
+        Some("completed") if has_message => Some(StopReason::EndTurn),
         Some("failed") | Some("cancelled") => Some(StopReason::Refusal),
         Some(other) => Some(StopReason::Other(other.to_string())),
-        None if !decoded.tool_calls.is_empty() => Some(StopReason::ToolUse),
-        None if !decoded.assistant_messages.is_empty() => Some(StopReason::EndTurn),
+        None if has_tool_call => Some(StopReason::ToolUse),
+        None if has_message => Some(StopReason::EndTurn),
         None => None,
     }
 }

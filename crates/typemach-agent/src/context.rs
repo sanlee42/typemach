@@ -84,7 +84,18 @@ pub fn estimate_messages(messages: &[AgentMessage]) -> Result<PromptEstimate, Ag
 }
 
 fn estimate_projected(messages: &[AgentMessage]) -> Result<PromptEstimate, AgentError> {
-    let bytes = serde_json::to_vec(messages)
+    let mut estimated = messages.to_vec();
+    for message in &mut estimated {
+        let content = match message {
+            AgentMessage::User { content } | AgentMessage::Assistant { content } => content,
+        };
+        for block in content {
+            if let ContentBlock::ToolUse(tool_use) = block {
+                tool_use.raw = None;
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&estimated)
         .map_err(|err| AgentError::Model(format!("failed to estimate prompt size: {err}")))?;
     Ok(PromptEstimate {
         message_count: messages.len(),
@@ -121,12 +132,7 @@ fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
                 text: text.clone(),
                 signature: signature.clone(),
             },
-            ContentBlock::ToolUse(tool_use) => ContentBlock::ToolUse(crate::ToolUse {
-                id: tool_use.id.clone(),
-                name: tool_use.name.clone(),
-                input: tool_use.input.clone(),
-                raw: None,
-            }),
+            ContentBlock::ToolUse(tool_use) => ContentBlock::ToolUse(tool_use.clone()),
             ContentBlock::ToolResult(result) => ContentBlock::ToolResult(ToolResult {
                 tool_use_id: result.tool_use_id.clone(),
                 name: result.name.clone(),
@@ -371,15 +377,21 @@ mod tests {
     }
 
     #[test]
-    fn estimate_ignores_non_model_metadata_but_archive_retains_it() {
-        let raw = json!({ "audit": "x".repeat(16_000) });
+    fn estimate_ignores_replayed_raw_while_prompt_retains_it() {
+        let input = json!({ "metric": "orders", "padding": "x".repeat(16_000) });
+        let raw = json!({
+            "type": "function_call",
+            "call_id": "tool-1",
+            "name": "metric_point",
+            "arguments": input.to_string()
+        });
         let with_raw = vec![
             AgentMessage::user_text("q1"),
             AgentMessage::Assistant {
                 content: vec![ContentBlock::ToolUse(ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
-                    input: json!({ "metric": "orders" }),
+                    input: input.clone(),
                     raw: Some(raw.clone()),
                 })],
             },
@@ -398,7 +410,7 @@ mod tests {
                     window: None,
                     updated_at: None,
                 }],
-                raw: Some(raw),
+                raw: Some(json!({ "audit": "x".repeat(16_000) })),
                 retained: None,
             }),
             AgentMessage::user_text("q2"),
@@ -409,7 +421,7 @@ mod tests {
                 content: vec![ContentBlock::ToolUse(ToolUse {
                     id: "tool-1".to_string(),
                     name: "metric_point".to_string(),
-                    input: json!({ "metric": "orders" }),
+                    input,
                     raw: None,
                 })],
             },
@@ -429,7 +441,9 @@ mod tests {
         );
         let raw_free_window = prompt_window(&with_raw, &policy(8, u64::MAX)).expect("window");
         assert!(raw_free_window.compaction.is_none());
-        assert_eq!(raw_free_window.messages, without_raw);
+        assert_eq!(raw_free_window.messages[0], without_raw[0]);
+        assert_eq!(raw_free_window.messages[1], with_raw[1]);
+        assert_eq!(raw_free_window.messages[2..], without_raw[2..]);
         assert!(matches!(
             &with_raw[1],
             AgentMessage::Assistant { content }
