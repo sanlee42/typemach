@@ -92,6 +92,7 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
     let input = AgentRunInput {
         messages: vec![AgentMessage::user_text("Read the metric")],
         context: Value::Null,
+        retained_results: Vec::new(),
         budget: AgentBudget::default(),
         human_input: None,
         system_suffix: None,
@@ -126,6 +127,7 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
             ..request(AgentRunInput {
                 messages: Vec::new(),
                 context: Value::Null,
+                retained_results: Vec::new(),
                 budget: AgentBudget::default(),
                 human_input: None,
                 system_suffix: None,
@@ -189,6 +191,7 @@ async fn invalid_external_artifact_batch_fails_before_any_artifact_is_published(
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Read the metric")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,

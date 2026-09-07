@@ -5,7 +5,9 @@ use serde_json::{Value, json};
 
 use crate::PendingToolCall;
 use crate::presentation::ToolDisposition;
-use crate::{AssistantMessageId, AssistantMessageItem, AssistantMessagePhase};
+use crate::{
+    AssistantMessageId, AssistantMessageItem, AssistantMessagePhase, ResultId, RetainedResult,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +86,9 @@ pub struct ToolResult {
     pub artifacts: Vec<Artifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
+    /// Host-only value retained for later tool calls in this turn.
+    #[serde(skip)]
+    pub retained: Option<RetainedResult>,
 }
 
 impl ToolResult {
@@ -96,6 +101,7 @@ impl ToolResult {
             disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
+            retained: None,
         }
     }
 
@@ -108,7 +114,22 @@ impl ToolResult {
             disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
+            retained: None,
         }
+    }
+
+    pub fn retain(mut self, value: Value, authorization: Value) -> Result<Self, AgentError> {
+        if self.is_error {
+            return Err(AgentError::InvalidToolResult(
+                "an error result cannot be retained".to_string(),
+            ));
+        }
+        self.retained = Some(RetainedResult::new(
+            ResultId::new(self.tool_use_id.clone())?,
+            value,
+            authorization,
+        ));
+        Ok(self)
     }
 
     pub fn present(mut self, receipt: impl Into<String>) -> Result<Self, AgentError> {
@@ -126,6 +147,18 @@ impl ToolResult {
     }
 
     pub(crate) fn validate(&self) -> Result<(), AgentError> {
+        if self.is_error && self.retained.is_some() {
+            return Err(AgentError::InvalidToolResult(
+                "an error result cannot be retained".to_string(),
+            ));
+        }
+        if let Some(retained) = &self.retained
+            && retained.id().as_str() != self.tool_use_id
+        {
+            return Err(AgentError::InvalidToolResult(
+                "retained result id must match tool_use_id".to_string(),
+            ));
+        }
         if let ToolDisposition::Present { receipt } = &self.disposition {
             if self.is_error {
                 return Err(AgentError::InvalidToolResult(
@@ -448,6 +481,8 @@ pub struct ToolCallRequest {
     pub tool_use: ToolUse,
     #[serde(default)]
     pub context: Value,
+    #[serde(default)]
+    pub retained_results: Vec<RetainedResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -582,6 +617,8 @@ pub struct AgentRunInput {
     #[serde(default)]
     pub context: Value,
     #[serde(default)]
+    pub retained_results: Vec<RetainedResult>,
+    #[serde(default)]
     pub budget: AgentBudget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_input: Option<HumanInputAnswer>,
@@ -623,6 +660,8 @@ pub enum FinishReason {
 pub struct AgentState {
     pub messages: Vec<AgentMessage>,
     pub context: Value,
+    #[serde(default)]
+    pub retained_results: Vec<RetainedResult>,
     pub budget: AgentBudget,
     #[serde(default)]
     pub context_policy: ContextPolicy,

@@ -118,6 +118,7 @@ fn presentation_input(max_tool_calls: u32) -> AgentRunInput {
     AgentRunInput {
         messages: vec![AgentMessage::user_text("Build the plan")],
         context: Value::Null,
+        retained_results: Vec::new(),
         budget: AgentBudget {
             max_model_turns: 1,
             max_tool_calls,

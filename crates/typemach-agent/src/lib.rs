@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,6 +8,7 @@ use typemach::{
     Transition,
 };
 
+mod agent_state;
 mod builtins;
 mod context;
 pub use context::estimate_messages;
@@ -25,6 +25,8 @@ mod pending_tool;
 pub use pending_tool::PendingToolCall;
 mod presentation;
 pub use presentation::ToolDisposition;
+mod retained_result;
+pub use retained_result::{ResultId, RetainedResult};
 mod stream;
 pub use stream::{ModelStream, ModelStreamEvent};
 
@@ -48,54 +50,6 @@ pub use types::*;
 use builtins::{
     agent_builtin, artifact_from_tool, ask_user_question, is_terminal_tool, terminal_action,
 };
-
-impl AgentState {
-    fn fresh(
-        input: &AgentRunInput,
-        previous: Option<&Self>,
-        context_policy: &ContextPolicy,
-    ) -> Self {
-        let mut messages = previous
-            .map(|state| state.messages.clone())
-            .unwrap_or_default();
-        repair_dangling_tool_uses(&mut messages);
-        messages.extend(input.messages.clone());
-        Self {
-            messages,
-            context: input.context.clone(),
-            budget: input.budget.clone(),
-            context_policy: context_policy.clone(),
-            system_suffix: input.system_suffix.clone(),
-            model_turns: 0,
-            tool_calls: 0,
-            loaded_deferred_tools: Default::default(),
-            pending_tools: VecDeque::new(),
-            pending_human: None,
-            human_input: input.human_input.clone(),
-            answer: String::new(),
-            usage: Usage::default(),
-            artifacts: Vec::new(),
-            terminal: None,
-            digest: previous.and_then(|state| state.digest.clone()),
-            tool_result_archives: previous
-                .map(|state| state.tool_result_archives.clone())
-                .unwrap_or_default(),
-        }
-    }
-
-    fn output_with_answer(&self, finish_reason: FinishReason, answer: String) -> AgentRunOutput {
-        AgentRunOutput {
-            messages: self.messages.clone(),
-            answer,
-            finish_reason,
-            terminal: self.terminal.clone(),
-            usage: self.usage.clone(),
-            artifacts: self.artifacts.clone(),
-            digest: self.digest.clone(),
-            tool_result_archives: self.tool_result_archives.clone(),
-        }
-    }
-}
 
 impl AgentError {
     fn machine(self) -> MachineError {
@@ -274,7 +228,7 @@ where
         previous: Option<&Self::State>,
         _snapshot: Option<&Value>,
     ) -> Result<Self::State, MachineError> {
-        Ok(AgentState::fresh(input, previous, &self.context_policy))
+        AgentState::fresh(input, previous, &self.context_policy).map_err(AgentError::machine)
     }
 
     fn apply_resume_input(
@@ -552,6 +506,7 @@ where
                 .call_tool(ToolCallRequest {
                     tool_use: tool_use.clone(),
                     context: state.context.clone(),
+                    retained_results: state.retained_results.clone(),
                 })
                 .await
                 .unwrap_or_else(|err| ToolResult::error(tool_use, err.to_string()))
@@ -632,15 +587,18 @@ where
             .await?;
         }
         let context = state.context.clone();
+        let retained_results = state.retained_results.clone();
         let calls = batch.iter().map(|pending| {
             let tools = Arc::clone(&self.tools);
             let context = context.clone();
+            let retained_results = retained_results.clone();
             let tool_use = pending.tool_use.clone();
             async move {
                 tools
                     .call_tool(ToolCallRequest {
                         tool_use: tool_use.clone(),
                         context,
+                        retained_results,
                     })
                     .await
                     .unwrap_or_else(|err| ToolResult::error(&tool_use, err.to_string()))
@@ -670,40 +628,6 @@ where
                     && !agent_builtin(&pending.tool_use)
                     && !is_terminal_tool(&pending.tool_use, Some(spec))
             })
-    }
-}
-
-/// A run started over an inherited transcript may find tool calls whose
-/// results never arrived (abandoned ask_user, disconnect mid-dispatch).
-/// Provider protocols reject such transcripts outright, so close every
-/// dangling call with a synthetic error result.
-fn repair_dangling_tool_uses(messages: &mut Vec<AgentMessage>) {
-    let mut resulted = std::collections::HashSet::new();
-    for message in messages.iter() {
-        let (AgentMessage::User { content } | AgentMessage::Assistant { content }) = message;
-        for block in content {
-            if let ContentBlock::ToolResult(result) = block {
-                resulted.insert(result.tool_use_id.clone());
-            }
-        }
-    }
-    let mut dangling = Vec::new();
-    for message in messages.iter() {
-        if let AgentMessage::Assistant { content } = message {
-            for block in content {
-                if let ContentBlock::ToolUse(tool_use) = block
-                    && !resulted.contains(&tool_use.id)
-                {
-                    dangling.push(tool_use.clone());
-                }
-            }
-        }
-    }
-    for tool_use in dangling {
-        messages.push(AgentMessage::tool_result(ToolResult::error(
-            &tool_use,
-            "interrupted before completion",
-        )));
     }
 }
 
@@ -758,6 +682,10 @@ async fn record_tool_result(
     mut result: ToolResult,
 ) -> Result<Option<presentation::Presentation>, MachineError> {
     result.validate().map_err(AgentError::machine)?;
+    if let Some(retained) = result.retained.take() {
+        retained_result::push(&mut state.retained_results, retained)
+            .map_err(AgentError::machine)?;
+    }
     let presentation = presentation::take(&mut result);
     let artifacts = std::mem::take(&mut result.artifacts);
     ctx.emit(AgentSignal::ToolResult {

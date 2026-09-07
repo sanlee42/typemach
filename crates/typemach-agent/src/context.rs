@@ -74,6 +74,7 @@ pub fn maybe_archive_tool_result(
         disposition: ToolDisposition::Continue,
         artifacts: Vec::new(),
         raw: None,
+        retained: None,
     };
     Ok((archived, Some(archive)))
 }
@@ -134,6 +135,7 @@ fn prompt_blocks(content: &[ContentBlock]) -> Vec<ContentBlock> {
                 disposition: ToolDisposition::Continue,
                 artifacts: Vec::new(),
                 raw: None,
+                retained: None,
             }),
         })
         .collect()
@@ -241,6 +243,7 @@ mod tests {
             disposition: ToolDisposition::Continue,
             artifacts: Vec::new(),
             raw: None,
+            retained: None,
         })
     }
 
@@ -355,6 +358,7 @@ mod tests {
                     disposition: ToolDisposition::Continue,
                     artifacts: Vec::new(),
                     raw: None,
+                    retained: None,
                 }),
                 ContentBlock::Text {
                     text: "extra".to_string(),
@@ -395,6 +399,7 @@ mod tests {
                     updated_at: None,
                 }],
                 raw: Some(raw),
+                retained: None,
             }),
             AgentMessage::user_text("q2"),
         ];

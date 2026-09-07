@@ -49,6 +49,7 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 1,
                 max_tool_calls: 4,
@@ -165,6 +166,7 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("How many orders?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 2,
@@ -212,6 +214,7 @@ async fn final_answer_with_tool_call_dispatches_and_allows_a_followup() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("How many orders?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 2,
@@ -304,6 +307,7 @@ async fn aborted_candidates_never_complete_or_persist() {
             request(AgentRunInput {
                 messages: vec![AgentMessage::user_text("Answer")],
                 context: Value::Null,
+                retained_results: Vec::new(),
                 budget: AgentBudget::default(),
                 human_input: None,
                 system_suffix: None,
@@ -354,6 +358,7 @@ async fn aborted_candidates_never_complete_or_persist() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Answer")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 0,
                 max_tool_calls: 4,
@@ -383,6 +388,7 @@ async fn empty_terminal_text_fails_without_finalizing() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Answer")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
@@ -448,6 +454,7 @@ async fn retry_resumes_after_tool_dispatch_without_replaying_the_tool() {
     let run = request(AgentRunInput {
         messages: vec![AgentMessage::user_text("How many orders?")],
         context: Value::Null,
+        retained_results: Vec::new(),
         budget: AgentBudget {
             max_model_turns: 4,
             max_tool_calls: 4,
@@ -580,6 +587,7 @@ async fn run_batch(tools: BatchTools) -> (Vec<Event>, usize) {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Read both metrics")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -635,6 +643,7 @@ async fn oversized_tool_batch_aborts_without_partial_dispatch() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Read both metrics")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 1,

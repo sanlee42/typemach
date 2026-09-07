@@ -59,6 +59,7 @@ fn input() -> AgentRunInput {
     AgentRunInput {
         messages: vec![AgentMessage::user_text("Find evidence")],
         context: Value::Null,
+        retained_results: Vec::new(),
         budget: AgentBudget::default(),
         human_input: None,
         system_suffix: None,

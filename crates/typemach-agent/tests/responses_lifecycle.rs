@@ -33,6 +33,7 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -193,6 +194,7 @@ async fn non_stream_mixed_text_is_emitted_once_and_the_call_dispatches() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -445,6 +447,7 @@ async fn max_tokens_candidate_is_streamed_but_not_committed() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Write a long answer")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 1,
                 max_tool_calls: 4,
@@ -498,6 +501,7 @@ async fn max_tokens_without_message_fails_without_an_answer() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Write a long answer")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,

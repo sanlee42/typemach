@@ -91,6 +91,7 @@ async fn run_unlisted(tool_use: ToolUse) -> (Vec<Event>, ScriptedModel) {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Run the tool")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -211,6 +212,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Show order count")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 3,
                 max_tool_calls: 4,
@@ -234,6 +236,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
         input: AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 3,
                 max_tool_calls: 4,
@@ -247,6 +250,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
         ..request(AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
@@ -339,6 +343,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Create a review")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,

@@ -24,6 +24,8 @@ mod deferred_tools;
 mod final_answer;
 #[path = "agent/model_fixtures.rs"]
 mod model_fixtures;
+#[path = "agent/retained_results.rs"]
+mod retained_results;
 #[path = "agent/tool_artifacts.rs"]
 mod tool_artifacts;
 #[path = "agent/tool_presentation.rs"]
@@ -202,6 +204,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 2,
@@ -225,6 +228,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
         input: AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 2,
@@ -238,6 +242,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
         ..request(AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 2,
@@ -320,6 +325,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was yesterday's order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -374,6 +380,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Create a report")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
@@ -446,6 +453,7 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
                 AgentMessage::user_text("turn 5"),
             ],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 1,
                 max_tool_calls: 4,
@@ -507,6 +515,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Load the large evidence")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -592,6 +601,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
@@ -612,6 +622,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Check inventory first")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
@@ -682,6 +693,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("What was the order count?")],
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -703,6 +715,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         input: AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
                 max_tool_calls: 4,
@@ -716,6 +729,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         ..request(AgentRunInput {
             messages: Vec::new(),
             context: Value::Null,
+            retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
             system_suffix: None,
