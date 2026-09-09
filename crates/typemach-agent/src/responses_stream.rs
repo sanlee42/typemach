@@ -73,7 +73,7 @@ pub(crate) async fn decode_stream(
     let mut pending = Vec::new();
     let mut acc = Accumulator::default();
     while let Some(chunk) = bytes.next().await {
-        let chunk = chunk.map_err(|err| DecodeFailure::body(err, "model stream failed"))?;
+        let chunk = chunk.map_err(|err| DecodeFailure::transport(err, "model stream failed"))?;
         pending.extend_from_slice(&chunk);
         while let Some(index) = pending.iter().position(|byte| *byte == b'\n') {
             let line = pending.drain(..=index).collect::<Vec<_>>();

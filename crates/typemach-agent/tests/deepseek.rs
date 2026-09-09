@@ -354,6 +354,76 @@ async fn malformed_responses_fail_structurally() {
 }
 
 #[tokio::test]
+async fn interrupted_stream_before_an_event_is_retried() {
+    let mut recovered = message_events("msg-recovered", 0, "final_answer", &["Recovered."]);
+    recovered.push(json!({
+        "type": "response.completed",
+        "response": completed_message_with("msg-recovered", "Recovered.")
+    }));
+    let (base_url, captured) = spawn_server(vec![
+        MockTurn {
+            status: 200,
+            content_type: "text/event-stream",
+            body: "data: ".to_string(),
+            delivery: Delivery::Truncate,
+        },
+        MockTurn {
+            status: 200,
+            content_type: "text/event-stream",
+            body: sse(recovered),
+            delivery: Delivery::Complete,
+        },
+    ])
+    .await;
+    let mut config = config(base_url, true);
+    config.max_retries = 1;
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, mut rx) = ModelStream::channel();
+
+    let response = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect("body interruption before an event should retry");
+
+    assert_eq!(assistant_messages(&response)[0].text(), "Recovered.");
+    assert_eq!(next_delta(&mut rx).await, "Recovered.");
+    assert_eq!(captured.lock().expect("captured").len(), 2);
+}
+
+#[tokio::test]
+async fn malformed_stream_event_is_not_retried() {
+    let (base_url, captured) = spawn_server(vec![
+        MockTurn {
+            status: 200,
+            content_type: "text/event-stream",
+            body: "data: not-json\n\n".to_string(),
+            delivery: Delivery::Complete,
+        },
+        MockTurn::ok(ok_message("Must not be requested.")),
+    ])
+    .await;
+    let mut config = config(base_url, true);
+    config.max_retries = 1;
+    let model = ConfiguredModel::new(config).expect("model");
+    let (stream, _rx) = ModelStream::channel();
+
+    let error = model
+        .next_step(
+            request(Vec::new(), Some(typemach_agent::ToolChoice::None)),
+            stream,
+        )
+        .await
+        .expect_err("malformed stream event must not retry");
+
+    assert!(error.to_string().contains("after 1 attempts"));
+    assert!(error.to_string().contains("stream event was invalid"));
+    assert_eq!(captured.lock().expect("captured").len(), 1);
+}
+
+#[tokio::test]
 async fn retry_stops_after_public_answer_delta() {
     let mut events = message_events("msg-truncated", 0, "final_answer", &["A"]);
     events.truncate(3);

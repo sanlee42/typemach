@@ -68,10 +68,13 @@ pub(crate) fn responses_request(
 pub(crate) async fn decode_response(
     response: reqwest::Response,
 ) -> Result<ModelResponse, DecodeFailure> {
-    let raw: Value = response
-        .json()
+    let body = response
+        .bytes()
         .await
-        .map_err(|err| DecodeFailure::body(err, "model response was not JSON"))?;
+        .map_err(|err| DecodeFailure::transport(err, "model response body failed"))?;
+    let raw: Value = serde_json::from_slice(&body).map_err(|err| {
+        DecodeFailure::protocol_message(format!("model response was not JSON: {err}"))
+    })?;
     model_response_from_value(raw).map_err(DecodeFailure::protocol)
 }
 
@@ -82,13 +85,8 @@ pub(crate) enum DecodeFailure {
 }
 
 impl DecodeFailure {
-    pub(crate) fn body(err: reqwest::Error, context: &str) -> Self {
-        let message = format!("{context}: {err}");
-        if err.is_decode() {
-            Self::Protocol(message)
-        } else {
-            Self::Transport(message)
-        }
+    pub(crate) fn transport(err: reqwest::Error, context: &str) -> Self {
+        Self::Transport(format!("{context}: {}", err.without_url()))
     }
 
     pub(crate) fn protocol(err: AgentError) -> Self {
