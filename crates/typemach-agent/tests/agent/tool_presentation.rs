@@ -13,6 +13,7 @@ type Event = RunStreamEvent<AgentStep, AgentSignal, AgentRunOutput, AskUserQuest
 enum PresentationMode {
     Single,
     Concurrent,
+    ConcurrentSiblingError,
     SequentialFirst,
     SequentialBoth,
 }
@@ -23,6 +24,7 @@ struct PresentingTools {
     calls: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+    receipt: String,
 }
 
 impl PresentingTools {
@@ -32,6 +34,14 @@ impl PresentingTools {
             calls: Arc::new(AtomicUsize::new(0)),
             active: Arc::new(AtomicUsize::new(0)),
             max_active: Arc::new(AtomicUsize::new(0)),
+            receipt: RECEIPT.to_string(),
+        }
+    }
+
+    fn with_receipt(mode: PresentationMode, receipt: impl Into<String>) -> Self {
+        Self {
+            receipt: receipt.into(),
+            ..Self::new(mode)
         }
     }
 }
@@ -59,15 +69,24 @@ impl ToolRegistry for PresentingTools {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         raise_max(&self.max_active, active);
-        if matches!(self.mode, PresentationMode::Concurrent) {
-            let delay = if request.tool_use.id == "tool-1" {
-                40
-            } else {
-                10
+        if matches!(
+            self.mode,
+            PresentationMode::Concurrent | PresentationMode::ConcurrentSiblingError
+        ) {
+            let delay = match (self.mode, request.tool_use.id.as_str()) {
+                (PresentationMode::Concurrent, "tool-1")
+                | (PresentationMode::ConcurrentSiblingError, "tool-2") => 40,
+                _ => 10,
             };
             sleep(Duration::from_millis(delay)).await;
         }
         self.active.fetch_sub(1, Ordering::SeqCst);
+
+        if matches!(self.mode, PresentationMode::ConcurrentSiblingError)
+            && request.tool_use.id == "tool-2"
+        {
+            return Ok(ToolResult::error(&request.tool_use, "sibling failed"));
+        }
 
         let result = ToolResult::ok(
             &request.tool_use,
@@ -86,11 +105,12 @@ impl ToolRegistry for PresentingTools {
         let presents = match self.mode {
             PresentationMode::Single => true,
             PresentationMode::Concurrent => request.tool_use.id == "tool-2",
+            PresentationMode::ConcurrentSiblingError => request.tool_use.id == "tool-1",
             PresentationMode::SequentialFirst => request.tool_use.id == "tool-1",
             PresentationMode::SequentialBoth => true,
         };
         if presents {
-            result.present(RECEIPT)
+            result.present(self.receipt.clone())
         } else {
             Ok(result)
         }
@@ -233,6 +253,56 @@ async fn concurrent_batch_records_every_result_before_presenting_once() {
     assert_eq!(state.answer, RECEIPT);
     assert_eq!(tool_results(&state).count(), 2);
     assert!(tool_results(&state).all(|result| result.disposition == ToolDisposition::Continue));
+}
+
+#[tokio::test]
+async fn concurrent_sibling_error_discards_presentation_and_returns_to_model() {
+    let recovery = "Recovered after the failed tool result.";
+    let model = ScriptedModel::new([tool_turn(&["tool-1", "tool-2"]), final_response(recovery)]);
+    let tools = PresentingTools::new(PresentationMode::ConcurrentSiblingError);
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+    let mut input = presentation_input(3);
+    input.budget.max_model_turns = 2;
+    let events = collect(runner.stream(request(input), StreamConfig::default())).await;
+
+    let output = completed(&events);
+    assert_eq!(model.requests().len(), 2);
+    assert_eq!(output.answer, recovery);
+    assert_eq!(tool_result_ids(&events), ["tool-1", "tool-2"]);
+    assert!(!final_receipts(&events).contains(&RECEIPT));
+
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    let results = tool_results(&state).collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].is_error);
+    assert!(results[1].is_error);
+}
+
+#[tokio::test]
+async fn presented_multibyte_receipt_streams_as_bounded_utf8_chunks() {
+    let receipt = "库".repeat(100);
+    let model = ScriptedModel::new([tool_turn(&["tool-1"])]);
+    let tools = PresentingTools::with_receipt(PresentationMode::Single, receipt.clone());
+    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
+    let events =
+        collect(runner.stream(request(presentation_input(1)), StreamConfig::default())).await;
+
+    let deltas = final_receipts(&events);
+    assert!(deltas.len() > 1);
+    assert!(deltas.iter().all(|delta| delta.len() <= 256));
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta.chars().all(|character| character == '库'))
+    );
+    assert_eq!(deltas.concat(), receipt);
+    assert_eq!(completed(&events).answer, receipt);
 }
 
 #[tokio::test]

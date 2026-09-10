@@ -7,6 +7,8 @@ use crate::{
     commit_answer,
 };
 
+const DELTA_MAX_BYTES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDisposition {
@@ -83,13 +85,23 @@ pub(super) async fn complete(
         phase: AssistantMessagePhase::FinalAnswer,
     })
     .await?;
-    ctx.emit(AgentSignal::AssistantMessageDelta {
-        message_id: message_id.clone(),
-        phase: AssistantMessagePhase::FinalAnswer,
-        delta: presentation.receipt.clone(),
-        index: 0,
-    })
-    .await?;
+    let mut start = 0;
+    let mut index = 0;
+    while start < presentation.receipt.len() {
+        let mut end = (start + DELTA_MAX_BYTES).min(presentation.receipt.len());
+        while !presentation.receipt.is_char_boundary(end) {
+            end -= 1;
+        }
+        ctx.emit(AgentSignal::AssistantMessageDelta {
+            message_id: message_id.clone(),
+            phase: AssistantMessagePhase::FinalAnswer,
+            delta: presentation.receipt[start..end].to_string(),
+            index,
+        })
+        .await?;
+        start = end;
+        index += 1;
+    }
     ctx.emit(AgentSignal::AssistantMessageDone {
         message_id,
         phase: AssistantMessagePhase::FinalAnswer,

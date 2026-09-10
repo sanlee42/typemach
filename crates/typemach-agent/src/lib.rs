@@ -120,9 +120,35 @@ pub struct AgentMachine<M, T, P> {
 }
 
 enum ToolDispatch {
-    Continue,
-    Present(presentation::Presentation),
+    Recorded {
+        presentation: Option<presentation::Presentation>,
+        is_error: bool,
+    },
     Transition(Box<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>),
+}
+
+#[derive(Default)]
+struct ToolBatch {
+    presentation: Option<presentation::Presentation>,
+    has_error: bool,
+}
+
+impl ToolBatch {
+    fn record(
+        &mut self,
+        presentation: Option<presentation::Presentation>,
+        is_error: bool,
+    ) -> Result<(), AgentError> {
+        self.has_error |= is_error;
+        if let Some(presentation) = presentation {
+            presentation::merge(&mut self.presentation, presentation)?;
+        }
+        Ok(())
+    }
+
+    fn accepted(self) -> Option<presentation::Presentation> {
+        (!self.has_error).then_some(self.presentation).flatten()
+    }
 }
 
 impl<M, T, P> AgentMachine<M, T, P> {
@@ -360,7 +386,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        let mut presentation = None;
+        let mut batch = ToolBatch::default();
         let mut catalog = deferred_tools::ToolCatalog::read(
             self.tools.as_ref(),
             &state.context,
@@ -390,9 +416,9 @@ where
                 .iter()
                 .all(|(_, permission)| *permission == PermissionDecision::Allow)
             {
-                let batch = checked.into_iter().map(|(pending, _)| pending).collect();
-                presentation = self
-                    .dispatch_concurrent_read_only(state, ctx, batch)
+                let calls = checked.into_iter().map(|(pending, _)| pending).collect();
+                batch = self
+                    .dispatch_concurrent_read_only(state, ctx, calls)
                     .await?;
             } else {
                 for (pending, permission) in checked {
@@ -400,8 +426,11 @@ where
                         .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                         .await?
                     {
-                        ToolDispatch::Continue => {}
-                        ToolDispatch::Present(next) => presentation::merge(&mut presentation, next)
+                        ToolDispatch::Recorded {
+                            presentation,
+                            is_error,
+                        } => batch
+                            .record(presentation, is_error)
                             .map_err(AgentError::machine)?,
                         ToolDispatch::Transition(transition) => return Ok(*transition),
                     }
@@ -415,15 +444,17 @@ where
                     .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                     .await?
                 {
-                    ToolDispatch::Continue => {}
-                    ToolDispatch::Present(next) => {
-                        presentation::merge(&mut presentation, next).map_err(AgentError::machine)?
-                    }
+                    ToolDispatch::Recorded {
+                        presentation,
+                        is_error,
+                    } => batch
+                        .record(presentation, is_error)
+                        .map_err(AgentError::machine)?,
                     ToolDispatch::Transition(transition) => return Ok(*transition),
                 }
             }
         }
-        if let Some(presentation) = presentation {
+        if let Some(presentation) = batch.accepted() {
             return presentation::complete(state, ctx, presentation).await;
         }
         if let Some(reason) = exhausted_reason(state) {
@@ -453,14 +484,21 @@ where
                 name: tool_use.name.clone(),
             })
             .await?;
-            let _ = record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
-            return Ok(ToolDispatch::Continue);
+            let presentation =
+                record_tool_result(state, ctx, ToolResult::error(tool_use, reason)).await?;
+            return Ok(ToolDispatch::Recorded {
+                presentation,
+                is_error: true,
+            });
         }
         let spec = pending.spec();
         let built_in_error = if tool_use.name == "ask_user" {
             if let Some(result) = self.consume_human_answer(state, tool_use, ctx).await? {
                 state.messages.push(AgentMessage::tool_result(result));
-                return Ok(ToolDispatch::Continue);
+                return Ok(ToolDispatch::Recorded {
+                    presentation: None,
+                    is_error: false,
+                });
             }
             match ask_user_question(tool_use) {
                 Ok(question) => {
@@ -511,9 +549,10 @@ where
                 .await
                 .unwrap_or_else(|err| ToolResult::error(tool_use, err.to_string()))
         };
-        Ok(match record_tool_result(state, ctx, result).await? {
-            Some(presentation) => ToolDispatch::Present(presentation),
-            None => ToolDispatch::Continue,
+        let is_error = result.is_error;
+        Ok(ToolDispatch::Recorded {
+            presentation: record_tool_result(state, ctx, result).await?,
+            is_error,
         })
     }
 
@@ -578,7 +617,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
         batch: Vec<PendingToolCall>,
-    ) -> Result<Option<presentation::Presentation>, MachineError> {
+    ) -> Result<ToolBatch, MachineError> {
         state.tool_calls += batch.len() as u32;
         for pending in &batch {
             ctx.emit(AgentSignal::ToolStarted {
@@ -605,15 +644,19 @@ where
                     .unwrap_or_else(|err| ToolResult::error(&tool_use, err.to_string()))
             }
         });
+        // `join_all` returns results in input order, so signals and presentation
+        // selection are deterministic even when calls finish out of order.
         let results = join_all(calls).await;
         presentation::validate_batch(&results).map_err(AgentError::machine)?;
-        let mut presentation = None;
+        let mut batch = ToolBatch::default();
         for result in results {
-            if let Some(next) = record_tool_result(state, ctx, result).await? {
-                presentation = Some(next);
-            }
+            let is_error = result.is_error;
+            let presentation = record_tool_result(state, ctx, result).await?;
+            batch
+                .record(presentation, is_error)
+                .map_err(AgentError::machine)?;
         }
-        Ok(presentation)
+        Ok(batch)
     }
 
     fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
