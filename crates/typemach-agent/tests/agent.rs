@@ -20,6 +20,8 @@ use typemach_agent::{
 mod builtin_validation;
 #[path = "agent/deferred_tools.rs"]
 mod deferred_tools;
+#[path = "agent/evidence_synthesis.rs"]
+mod evidence_synthesis;
 #[path = "agent/final_answer.rs"]
 mod final_answer;
 #[path = "agent/model_fixtures.rs"]
@@ -210,6 +212,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
                 max_tool_calls: 2,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -237,6 +240,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
             }),
+            synthesis_request: None,
             system_suffix: None,
         },
         ..request(AgentRunInput {
@@ -248,6 +252,7 @@ async fn ask_user_resume_reaches_the_model_without_replaying_the_tool() {
                 max_tool_calls: 2,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         })
     };
@@ -337,6 +342,7 @@ async fn reasoning_blocks_are_persisted_without_polluting_answer() {
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -389,6 +395,7 @@ async fn terminal_tool_completes_without_dispatching_registry_tool() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -465,6 +472,7 @@ async fn compacted_prompt_window_does_not_drop_persisted_messages() {
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -527,6 +535,7 @@ async fn large_tool_result_is_archived_before_next_prompt() {
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -610,6 +619,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -631,6 +641,7 @@ async fn abandoned_ask_user_is_repaired_on_next_start() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -705,6 +716,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: Some("Current shop: A".to_string()),
         }),
         StreamConfig::default(),
@@ -730,6 +742,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
                 tool_use_id: "ask-1".to_string(),
                 answer: "2026-06-08".to_string(),
             }),
+            synthesis_request: None,
             system_suffix: Some("Current shop: B".to_string()),
         },
         ..request(AgentRunInput {
@@ -738,6 +751,7 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         })
     };

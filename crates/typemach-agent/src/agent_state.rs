@@ -12,6 +12,9 @@ impl AgentState {
         context_policy: &ContextPolicy,
     ) -> Result<Self, AgentError> {
         retained_result::validate(&input.retained_results)?;
+        if let Some(request) = &input.synthesis_request {
+            validate_synthesis_request(request)?;
+        }
         let mut messages = previous
             .map(|state| state.messages.clone())
             .unwrap_or_default();
@@ -19,6 +22,8 @@ impl AgentState {
         messages.extend(input.messages.clone());
         Ok(Self {
             messages,
+            synthesis_request: input.synthesis_request.clone(),
+            synthesis_evidence: None,
             context: input.context.clone(),
             retained_results: input.retained_results.clone(),
             budget: input.budget.clone(),
@@ -58,6 +63,24 @@ impl AgentState {
             tool_result_archives: self.tool_result_archives.clone(),
         }
     }
+}
+
+pub(super) fn validate_synthesis_request(request: &AgentMessage) -> Result<(), AgentError> {
+    let AgentMessage::User { content } = request else {
+        return Err(AgentError::Config(
+            "synthesis_request must be a user message".to_string(),
+        ));
+    };
+    if content.is_empty()
+        || content
+            .iter()
+            .any(|block| !matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+    {
+        return Err(AgentError::Config(
+            "synthesis_request must contain only non-empty text blocks".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// A run started over an inherited transcript may find tool calls whose

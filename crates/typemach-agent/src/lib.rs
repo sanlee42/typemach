@@ -121,7 +121,7 @@ pub struct AgentMachine<M, T, P> {
 
 enum ToolDispatch {
     Continue,
-    Present(presentation::Presentation),
+    Disposition(presentation::Disposition),
     Transition(Box<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>),
 }
 
@@ -288,11 +288,15 @@ where
             }
             AgentPhase::Synthesis => (
                 Vec::new(),
-                synthesis_suffix(state.system_suffix.as_deref()),
+                if state.synthesis_evidence.is_some() {
+                    evidence_synthesis_suffix(state.system_suffix.as_deref())
+                } else {
+                    synthesis_suffix(state.system_suffix.as_deref())
+                },
                 Some(ToolChoice::None),
             ),
         };
-        let messages = state.messages.clone();
+        let messages = synthesis_messages(state).map_err(AgentError::machine)?;
         state.model_turns += 1;
         let turn_number = state.model_turns;
         let request = model_turn::prepare(
@@ -376,7 +380,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        let mut presentation = None;
+        let mut disposition = None;
         let mut catalog = deferred_tools::ToolCatalog::read(
             self.tools.as_ref(),
             &state.context,
@@ -413,18 +417,29 @@ where
                 .all(|(_, permission)| *permission == PermissionDecision::Allow)
             {
                 let batch = checked.into_iter().map(|(pending, _)| pending).collect();
-                presentation = self
+                disposition = self
                     .dispatch_concurrent_read_only(state, ctx, batch)
                     .await?;
             } else {
-                for (pending, permission) in checked {
+                let mut checked = checked.into_iter();
+                while let Some((pending, permission)) = checked.next() {
                     match self
                         .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                         .await?
                     {
                         ToolDispatch::Continue => {}
-                        ToolDispatch::Present(next) => presentation::merge(&mut presentation, next)
-                            .map_err(AgentError::machine)?,
+                        ToolDispatch::Disposition(next) => {
+                            let synthesis = next.is_synthesis();
+                            presentation::merge(&mut disposition, next)
+                                .map_err(AgentError::machine)?;
+                            if synthesis {
+                                close_skipped_for_synthesis(
+                                    state,
+                                    checked.map(|(pending, _)| pending),
+                                )?;
+                                break;
+                            }
+                        }
                         ToolDispatch::Transition(transition) => return Ok(*transition),
                     }
                 }
@@ -438,15 +453,28 @@ where
                     .await?
                 {
                     ToolDispatch::Continue => {}
-                    ToolDispatch::Present(next) => {
-                        presentation::merge(&mut presentation, next).map_err(AgentError::machine)?
+                    ToolDispatch::Disposition(next) => {
+                        let synthesis = next.is_synthesis();
+                        presentation::merge(&mut disposition, next).map_err(AgentError::machine)?;
+                        if synthesis {
+                            let skipped = state.pending_tools.drain(..).collect::<Vec<_>>();
+                            close_skipped_for_synthesis(state, skipped)?;
+                            break;
+                        }
                     }
                     ToolDispatch::Transition(transition) => return Ok(*transition),
                 }
             }
         }
-        if let Some(presentation) = presentation {
-            return presentation::complete(state, ctx, presentation).await;
+        if let Some(disposition) = disposition {
+            match disposition {
+                presentation::Disposition::Present(presentation) => {
+                    return presentation::complete(state, ctx, presentation).await;
+                }
+                presentation::Disposition::Synthesize(evidence) => {
+                    begin_evidence_synthesis(state, evidence).map_err(AgentError::machine)?;
+                }
+            }
         }
         if synthesis_due(state) {
             state.phase = AgentPhase::Synthesis;
@@ -533,7 +561,7 @@ where
                 .unwrap_or_else(|err| ToolResult::error(tool_use, err.to_string()))
         };
         Ok(match record_tool_result(state, ctx, result).await? {
-            Some(presentation) => ToolDispatch::Present(presentation),
+            Some(disposition) => ToolDispatch::Disposition(disposition),
             None => ToolDispatch::Continue,
         })
     }
@@ -599,7 +627,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
         batch: Vec<PendingToolCall>,
-    ) -> Result<Option<presentation::Presentation>, MachineError> {
+    ) -> Result<Option<presentation::Disposition>, MachineError> {
         state.tool_calls += batch.len() as u32;
         for pending in &batch {
             ctx.emit(AgentSignal::ToolStarted {
@@ -628,13 +656,13 @@ where
         });
         let results = join_all(calls).await;
         presentation::validate_batch(&results).map_err(AgentError::machine)?;
-        let mut presentation = None;
+        let mut disposition = None;
         for result in results {
             if let Some(next) = record_tool_result(state, ctx, result).await? {
-                presentation = Some(next);
+                disposition = Some(next);
             }
         }
-        Ok(presentation)
+        Ok(disposition)
     }
 
     fn concurrent_batch_ready(&self, state: &AgentState) -> bool {
@@ -659,12 +687,51 @@ fn commit_answer(state: &mut AgentState, text: String) -> String {
 }
 
 const SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request from the evidence already in this conversation. Do not request or call tools. State material unknowns explicitly.";
+const EVIDENCE_SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request using the [Final evidence] capsule as the sole factual source. Do not request or call tools. Do not recompute any values.";
 
 fn synthesis_suffix(suffix: Option<&str>) -> Option<String> {
+    synthesis_suffix_with(suffix, SYNTHESIS_INSTRUCTION)
+}
+
+fn evidence_synthesis_suffix(suffix: Option<&str>) -> Option<String> {
+    synthesis_suffix_with(suffix, EVIDENCE_SYNTHESIS_INSTRUCTION)
+}
+
+fn synthesis_suffix_with(suffix: Option<&str>, instruction: &str) -> Option<String> {
     Some(match suffix {
-        Some(suffix) => format!("{suffix}\n\n{SYNTHESIS_INSTRUCTION}"),
-        None => SYNTHESIS_INSTRUCTION.to_string(),
+        Some(suffix) => format!("{suffix}\n\n{instruction}"),
+        None => instruction.to_string(),
     })
+}
+
+fn synthesis_messages(state: &AgentState) -> Result<Vec<AgentMessage>, AgentError> {
+    let Some(evidence) = &state.synthesis_evidence else {
+        return Ok(state.messages.clone());
+    };
+    let mut request = state.synthesis_request.clone().ok_or_else(|| {
+        AgentError::Config("synthesis_request is required for evidence synthesis".to_string())
+    })?;
+    agent_state::validate_synthesis_request(&request)?;
+    let encoded = serde_json::to_string(evidence).map_err(|err| {
+        AgentError::InvalidToolResult(format!("failed to encode synthesis evidence: {err}"))
+    })?;
+    let AgentMessage::User { content } = &mut request else {
+        unreachable!("validated synthesis request")
+    };
+    content.push(ContentBlock::Text {
+        text: format!("\n\n[Final evidence]\n{encoded}"),
+    });
+    Ok(vec![request])
+}
+
+fn begin_evidence_synthesis(state: &mut AgentState, evidence: Value) -> Result<(), AgentError> {
+    let request = state.synthesis_request.as_ref().ok_or_else(|| {
+        AgentError::Config("synthesis_request is required for evidence synthesis".to_string())
+    })?;
+    agent_state::validate_synthesis_request(request)?;
+    state.synthesis_evidence = Some(evidence);
+    state.phase = AgentPhase::Synthesis;
+    Ok(())
 }
 
 fn next_model_phase(state: &mut AgentState) -> Result<AgentPhase, FinishReason> {
@@ -709,6 +776,27 @@ fn close_budget_exhausted_batch(
     Ok(())
 }
 
+fn close_skipped_for_synthesis(
+    state: &mut AgentState,
+    skipped: impl IntoIterator<Item = PendingToolCall>,
+) -> Result<(), MachineError> {
+    for pending in skipped {
+        let mut result = ToolResult::error(
+            &pending.tool_use,
+            "tool was not executed because an earlier call provided final synthesis evidence",
+        );
+        result.content = json!({
+            "error": {
+                "code": "synthesis_started",
+                "message": "The tool was not executed because an earlier call provided final synthesis evidence."
+            }
+        });
+        result.validate().map_err(AgentError::machine)?;
+        state.messages.push(AgentMessage::tool_result(result));
+    }
+    Ok(())
+}
+
 fn finish_reason(reason: Option<&StopReason>) -> Result<FinishReason, MachineError> {
     match reason {
         Some(StopReason::EndTurn | StopReason::StopSequence) | None => Ok(FinishReason::Stop),
@@ -743,7 +831,7 @@ async fn record_tool_result(
     state: &mut AgentState,
     ctx: &AgentRunContext,
     mut result: ToolResult,
-) -> Result<Option<presentation::Presentation>, MachineError> {
+) -> Result<Option<presentation::Disposition>, MachineError> {
     result.validate().map_err(AgentError::machine)?;
     let retained_authorization = result
         .retained
@@ -753,7 +841,7 @@ async fn record_tool_result(
         retained_result::push(&mut state.retained_results, retained)
             .map_err(AgentError::machine)?;
     }
-    let presentation = presentation::take(&mut result);
+    let disposition = presentation::take(&mut result);
     let artifacts = std::mem::take(&mut result.artifacts);
     ctx.emit(AgentSignal::ToolResult {
         tool_use_id: result.tool_use_id.clone(),
@@ -784,5 +872,5 @@ async fn record_tool_result(
     state
         .messages
         .push(AgentMessage::tool_result(prompt_result));
-    Ok(presentation)
+    Ok(disposition)
 }

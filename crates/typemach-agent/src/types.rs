@@ -148,6 +148,12 @@ impl ToolResult {
         Ok(self)
     }
 
+    pub fn synthesize(mut self, evidence: Value) -> Result<Self, AgentError> {
+        self.disposition = ToolDisposition::Synthesize { evidence };
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn with_artifacts(mut self, artifacts: Vec<Artifact>) -> Result<Self, AgentError> {
         self.artifacts = artifacts;
         self.validate()?;
@@ -176,6 +182,21 @@ impl ToolResult {
             if receipt.trim().is_empty() {
                 return Err(AgentError::InvalidToolResult(
                     "present requires a non-empty receipt".to_string(),
+                ));
+            }
+        }
+        if let ToolDisposition::Synthesize { evidence } = &self.disposition {
+            if self.is_error {
+                return Err(AgentError::InvalidToolResult(
+                    "an error result cannot request synthesis".to_string(),
+                ));
+            }
+            if evidence
+                .as_object()
+                .is_none_or(|evidence| evidence.is_empty())
+            {
+                return Err(AgentError::InvalidToolResult(
+                    "synthesis evidence must be a non-empty JSON object".to_string(),
                 ));
             }
         }
@@ -620,6 +641,11 @@ impl Default for AgentBudget {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentRunInput {
     pub messages: Vec<AgentMessage>,
+    /// Exact current user request used when a tool requests evidence synthesis.
+    /// This must be one non-empty user message containing only text blocks. The
+    /// field is not appended to `messages`, which remains the complete transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_request: Option<AgentMessage>,
     #[serde(default)]
     pub context: Value,
     #[serde(default)]
@@ -665,6 +691,11 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentState {
     pub messages: Vec<AgentMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_request: Option<AgentMessage>,
+    /// Authoritative capsule selected by a successful synthesis disposition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis_evidence: Option<Value>,
     pub context: Value,
     #[serde(default)]
     pub retained_results: Vec<RetainedResult>,
@@ -783,6 +814,8 @@ mod type_contracts {
         assert!(state.pending_tools[0].spec().is_none());
         assert!(state.loaded_deferred_tools.is_empty());
         assert_eq!(state.phase, AgentPhase::Evidence);
+        assert!(state.synthesis_request.is_none());
+        assert!(state.synthesis_evidence.is_none());
         assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);
     }

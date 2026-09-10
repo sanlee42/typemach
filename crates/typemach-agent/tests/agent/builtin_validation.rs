@@ -97,6 +97,7 @@ async fn run_unlisted(tool_use: ToolUse) -> (Vec<Event>, ScriptedModel) {
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -218,6 +219,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
                 max_tool_calls: 4,
             },
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -245,6 +247,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
                 tool_use_id: "ask-good".to_string(),
                 answer: "2026-06-08".to_string(),
             }),
+            synthesis_request: None,
             system_suffix: None,
         },
         ..request(AgentRunInput {
@@ -253,6 +256,7 @@ async fn terminal_annotated_invalid_ask_is_paired_before_the_model_corrects_it()
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         })
     };
@@ -346,6 +350,7 @@ async fn invalid_artifacts_are_paired_before_the_model_corrects_them() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
+            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
