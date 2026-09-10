@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::{
-    AgentError, AgentMessage, AgentRunInput, AgentRunOutput, AgentState, ContentBlock,
+    AgentError, AgentMessage, AgentPhase, AgentRunInput, AgentRunOutput, AgentState, ContentBlock,
     ContextPolicy, FinishReason, ToolResult, Usage, retained_result,
 };
 
@@ -22,6 +22,7 @@ impl AgentState {
             context: input.context.clone(),
             retained_results: input.retained_results.clone(),
             budget: input.budget.clone(),
+            phase: AgentPhase::Evidence,
             context_policy: context_policy.clone(),
             system_suffix: input.system_suffix.clone(),
             model_turns: 0,

@@ -96,9 +96,9 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].tool_choice,
-            Some(typemach_agent::ToolChoice::Auto)
+            Some(typemach_agent::ToolChoice::None)
         );
-        assert!(!requests[0].tools.is_empty());
+        assert!(requests[0].tools.is_empty());
     }
 
     let checkpoint = runner
@@ -151,7 +151,7 @@ fn metric_call() -> ModelResponse {
 }
 
 #[tokio::test]
-async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
+async fn tool_call_followup_uses_the_reserved_synthesis_turn() {
     let model = ScriptedModel::new([
         metric_call(),
         ModelResponse {
@@ -169,7 +169,7 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
             retained_results: Vec::new(),
             budget: AgentBudget {
                 max_model_turns: 2,
-                max_tool_calls: 2,
+                max_tool_calls: 1,
             },
             human_input: None,
             system_suffix: None,
@@ -182,10 +182,21 @@ async fn tool_call_followup_remains_tool_capable_and_commits_its_text() {
     assert_eq!(completed(&events).answer, "There were 42 orders.");
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
-    assert!(requests.iter().all(|request| {
-        request.tool_choice == Some(typemach_agent::ToolChoice::Auto)
-            && request.tools.iter().any(|tool| tool.name == "metric_point")
-    }));
+    assert_eq!(
+        requests[0].tool_choice,
+        Some(typemach_agent::ToolChoice::Auto)
+    );
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "metric_point")
+    );
+    assert_eq!(
+        requests[1].tool_choice,
+        Some(typemach_agent::ToolChoice::None)
+    );
+    assert!(requests[1].tools.is_empty());
     assert!(requests[1].messages.iter().any(|message| matches!(
         message,
         AgentMessage::User { content }
@@ -623,25 +634,31 @@ async fn read_only_batches_overlap_but_unsafe_batches_do_not() {
 }
 
 #[tokio::test]
-async fn oversized_tool_batch_aborts_without_partial_dispatch() {
-    let model = ScriptedModel::new([ModelResponse {
-        stop_reason: Some(StopReason::ToolUse),
-        ..tool_response(
-            "",
-            ["metric-1", "metric-2"]
-                .into_iter()
-                .map(|id| ToolUse {
-                    id: id.to_string(),
-                    name: "metric_point".to_string(),
-                    input: json!({}),
-                    raw: None,
-                })
-                .collect(),
-        )
-    }]);
+async fn oversized_tool_batch_closes_every_call_then_synthesizes() {
+    let model = ScriptedModel::new([
+        ModelResponse {
+            stop_reason: Some(StopReason::ToolUse),
+            ..tool_response(
+                "",
+                ["metric-1", "metric-2"]
+                    .into_iter()
+                    .map(|id| ToolUse {
+                        id: id.to_string(),
+                        name: "metric_point".to_string(),
+                        input: json!({}),
+                        raw: None,
+                    })
+                    .collect(),
+            )
+        },
+        ModelResponse {
+            stop_reason: Some(StopReason::EndTurn),
+            ..final_response("Answered from existing evidence.")
+        },
+    ]);
     let tools = CountingTools::default();
     let calls = tools.calls.clone();
-    let runner = build_agent_runner(MemorySaver::default(), model, tools, AllowAllTools);
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
     let events = collect(runner.stream(
         request(AgentRunInput {
             messages: vec![AgentMessage::user_text("Read both metrics")],
@@ -659,10 +676,9 @@ async fn oversized_tool_batch_aborts_without_partial_dispatch() {
     .await;
 
     assert_eq!(calls.load(Ordering::Relaxed), 0);
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, RunStreamEvent::Failed { .. }))
+    assert_eq!(
+        completed(&events).answer,
+        "Answered from existing evidence."
     );
     assert!(!events.iter().any(|event| matches!(
         event,
@@ -670,6 +686,28 @@ async fn oversized_tool_batch_aborts_without_partial_dispatch() {
             signal: AgentSignal::ToolStarted { .. } | AgentSignal::ToolCompleted { .. },
         }
     )));
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].tool_choice,
+        Some(typemach_agent::ToolChoice::None)
+    );
+    assert!(requests[1].tools.is_empty());
+    let budget_errors = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| match message {
+            AgentMessage::User { content } | AgentMessage::Assistant { content } => content,
+        })
+        .filter(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolResult(result)
+                    if result.content["error"]["code"] == "budget_exhausted"
+            )
+        })
+        .count();
+    assert_eq!(budget_errors, 2);
 }
 
 fn tool_result_ids(events: &[Event]) -> Vec<String> {

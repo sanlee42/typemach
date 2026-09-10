@@ -18,6 +18,14 @@ pub enum AgentStep {
     DispatchTools,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    #[default]
+    Evidence,
+    Synthesis,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
@@ -595,7 +603,7 @@ pub enum AgentSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentBudget {
-    /// Maximum model calls, including the terminal answer call.
+    /// Maximum model calls, including one reserved synthesis call.
     pub max_model_turns: u32,
     pub max_tool_calls: u32,
 }
@@ -661,6 +669,8 @@ pub struct AgentState {
     #[serde(default)]
     pub retained_results: Vec<RetainedResult>,
     pub budget: AgentBudget,
+    #[serde(default)]
+    pub phase: AgentPhase,
     #[serde(default)]
     pub context_policy: ContextPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,6 +782,7 @@ mod type_contracts {
         assert_eq!(state.pending_tools.len(), 1);
         assert!(state.pending_tools[0].spec().is_none());
         assert!(state.loaded_deferred_tools.is_empty());
+        assert_eq!(state.phase, AgentPhase::Evidence);
         assert_eq!(state.pending_tools[0].tool_use.id, "tool-1");
         assert_eq!(step, AgentStep::ModelStep);
     }

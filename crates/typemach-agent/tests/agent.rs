@@ -753,7 +753,8 @@ async fn system_suffix_reaches_model_request_and_survives_resume() {
         .system_suffix
         .as_deref()
         .expect("resumed suffix");
-    assert_eq!(resumed_suffix, "Current shop: B");
+    assert!(resumed_suffix.starts_with("Current shop: B\n\n"));
+    assert!(resumed_suffix.contains("Final synthesis turn"));
 }
 
 #[test]

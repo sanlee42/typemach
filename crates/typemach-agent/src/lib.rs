@@ -272,19 +272,27 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        if let Some(reason) = exhausted_reason(state) {
-            return Err(AgentError::Incomplete(reason).machine());
-        }
-        let tools = deferred_tools::ToolCatalog::read(
-            self.tools.as_ref(),
-            &state.context,
-            &mut state.loaded_deferred_tools,
-        )
-        .await
-        .map_err(AgentError::machine)?
-        .visible;
+        let phase =
+            next_model_phase(state).map_err(|reason| AgentError::Incomplete(reason).machine())?;
+        let (tools, suffix, tool_choice) = match phase {
+            AgentPhase::Evidence => {
+                let tools = deferred_tools::ToolCatalog::read(
+                    self.tools.as_ref(),
+                    &state.context,
+                    &mut state.loaded_deferred_tools,
+                )
+                .await
+                .map_err(AgentError::machine)?
+                .visible;
+                (tools, state.system_suffix.clone(), Some(ToolChoice::Auto))
+            }
+            AgentPhase::Synthesis => (
+                Vec::new(),
+                synthesis_suffix(state.system_suffix.as_deref()),
+                Some(ToolChoice::None),
+            ),
+        };
         let messages = state.messages.clone();
-        let suffix = state.system_suffix.clone();
         state.model_turns += 1;
         let turn_number = state.model_turns;
         let request = model_turn::prepare(
@@ -293,7 +301,7 @@ where
             messages,
             tools.clone(),
             suffix,
-            Some(ToolChoice::Auto),
+            tool_choice,
             turn_number,
         )
         .await?;
@@ -321,6 +329,12 @@ where
                 content,
                 calls: tool_uses,
             }) => {
+                if phase == AgentPhase::Synthesis {
+                    return Err(AgentError::Model(
+                        "model returned tool calls during final synthesis".to_string(),
+                    )
+                    .machine());
+                }
                 if !matches!(turn.stop_reason, Some(StopReason::ToolUse) | None) {
                     return Err(AgentError::Model(
                         "model stopped before completing tool calls".to_string(),
@@ -335,8 +349,11 @@ where
                 }
                 let remaining =
                     state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
+                state.messages.push(AgentMessage::Assistant { content });
                 if tool_uses.len() > remaining {
-                    return Err(AgentError::Incomplete(FinishReason::MaxToolCalls).machine());
+                    close_budget_exhausted_batch(state, &tool_uses)?;
+                    state.phase = AgentPhase::Synthesis;
+                    return Ok(Transition::Next(AgentStep::ModelStep));
                 }
                 state
                     .pending_tools
@@ -344,7 +361,6 @@ where
                         let spec = tools.iter().find(|spec| spec.name == tool_use.name);
                         PendingToolCall::new(tool_use, spec.cloned())
                     }));
-                state.messages.push(AgentMessage::Assistant { content });
                 Ok(Transition::Next(AgentStep::DispatchTools))
             }
             None if turn.stop_reason == Some(StopReason::MaxTokens) => {
@@ -373,8 +389,14 @@ where
         }
         let remaining = state.budget.max_tool_calls.saturating_sub(state.tool_calls) as usize;
         if state.pending_tools.len() > remaining {
-            state.pending_tools.clear();
-            return Err(AgentError::Incomplete(FinishReason::MaxToolCalls).machine());
+            let tool_uses = state
+                .pending_tools
+                .drain(..)
+                .map(|pending| pending.tool_use)
+                .collect::<Vec<_>>();
+            close_budget_exhausted_batch(state, &tool_uses)?;
+            state.phase = AgentPhase::Synthesis;
+            return Ok(Transition::Next(AgentStep::ModelStep));
         }
         if self.concurrent_batch_ready(state) {
             let checked = state
@@ -426,11 +448,10 @@ where
         if let Some(presentation) = presentation {
             return presentation::complete(state, ctx, presentation).await;
         }
-        if let Some(reason) = exhausted_reason(state) {
-            Err(AgentError::Incomplete(reason).machine())
-        } else {
-            Ok(Transition::Next(AgentStep::ModelStep))
+        if synthesis_due(state) {
+            state.phase = AgentPhase::Synthesis;
         }
+        Ok(Transition::Next(AgentStep::ModelStep))
     }
 
     async fn dispatch_checked_tool(
@@ -637,14 +658,55 @@ fn commit_answer(state: &mut AgentState, text: String) -> String {
     state.answer.clone()
 }
 
-fn exhausted_reason(state: &AgentState) -> Option<FinishReason> {
+const SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request from the evidence already in this conversation. Do not request or call tools. State material unknowns explicitly.";
+
+fn synthesis_suffix(suffix: Option<&str>) -> Option<String> {
+    Some(match suffix {
+        Some(suffix) => format!("{suffix}\n\n{SYNTHESIS_INSTRUCTION}"),
+        None => SYNTHESIS_INSTRUCTION.to_string(),
+    })
+}
+
+fn next_model_phase(state: &mut AgentState) -> Result<AgentPhase, FinishReason> {
     if state.model_turns >= state.budget.max_model_turns {
-        Some(FinishReason::MaxModelTurns)
-    } else if state.tool_calls >= state.budget.max_tool_calls {
-        Some(FinishReason::MaxToolCalls)
-    } else {
-        None
+        return Err(FinishReason::MaxModelTurns);
     }
+    if synthesis_due(state) {
+        state.phase = AgentPhase::Synthesis;
+    }
+    Ok(state.phase)
+}
+
+fn synthesis_due(state: &AgentState) -> bool {
+    if state.phase == AgentPhase::Synthesis {
+        return true;
+    }
+    let model_turns_left = state
+        .budget
+        .max_model_turns
+        .saturating_sub(state.model_turns);
+    model_turns_left <= 1 || state.tool_calls >= state.budget.max_tool_calls
+}
+
+fn close_budget_exhausted_batch(
+    state: &mut AgentState,
+    tool_uses: &[ToolUse],
+) -> Result<(), MachineError> {
+    for tool_use in tool_uses {
+        let mut result = ToolResult::error(
+            tool_use,
+            "tool batch was not executed because it exceeds the remaining tool-call budget",
+        );
+        result.content = json!({
+            "error": {
+                "code": "budget_exhausted",
+                "message": "The entire tool batch was not executed because it exceeds the remaining tool-call budget."
+            }
+        });
+        result.validate().map_err(AgentError::machine)?;
+        state.messages.push(AgentMessage::tool_result(result));
+    }
+    Ok(())
 }
 
 fn finish_reason(reason: Option<&StopReason>) -> Result<FinishReason, MachineError> {

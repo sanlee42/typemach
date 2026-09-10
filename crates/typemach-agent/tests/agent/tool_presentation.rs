@@ -120,7 +120,7 @@ fn presentation_input(max_tool_calls: u32) -> AgentRunInput {
         context: Value::Null,
         retained_results: Vec::new(),
         budget: AgentBudget {
-            max_model_turns: 1,
+            max_model_turns: 2,
             max_tool_calls,
         },
         human_input: None,

@@ -86,12 +86,8 @@ async fn provider_sse_to_agent_lifecycle_streams_and_persists_answer_once() {
     let bodies = captured_bodies(&captured);
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0]["tool_choice"], "auto");
-    assert_eq!(bodies[1]["tool_choice"], "auto");
-    assert!(
-        bodies[1]["tools"]
-            .as_array()
-            .is_some_and(|tools| !tools.is_empty())
-    );
+    assert_eq!(bodies[1]["tool_choice"], "none");
+    assert!(bodies[1].get("tools").is_none());
     assert!(input_has_type(&bodies[1], "function_call"));
     assert!(input_has_type(&bodies[1], "function_call_output"));
     assert_ordered_input_types(&bodies[1], &["function_call", "function_call_output"]);
