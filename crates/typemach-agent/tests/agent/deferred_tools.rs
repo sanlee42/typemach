@@ -62,7 +62,6 @@ fn input() -> AgentRunInput {
         retained_results: Vec::new(),
         budget: AgentBudget::default(),
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     }
 }

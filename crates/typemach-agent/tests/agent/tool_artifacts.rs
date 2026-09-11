@@ -95,7 +95,6 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
         retained_results: Vec::new(),
         budget: AgentBudget::default(),
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     };
 
@@ -131,7 +130,6 @@ async fn checkpoint_resume_keeps_external_artifacts_exactly_once_and_in_order() 
                 retained_results: Vec::new(),
                 budget: AgentBudget::default(),
                 human_input: None,
-                synthesis_request: None,
                 system_suffix: None,
             })
         },
@@ -196,7 +194,6 @@ async fn invalid_external_artifact_batch_fails_before_any_artifact_is_published(
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),

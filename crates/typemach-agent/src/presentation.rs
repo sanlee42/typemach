@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use typemach::{MachineError, Transition};
 
 use crate::{
@@ -16,11 +15,6 @@ pub enum ToolDisposition {
     Present {
         receipt: String,
     },
-    /// Stop evidence collection and ask the configured model to write the
-    /// final answer from this authoritative capsule.
-    Synthesize {
-        evidence: Value,
-    },
 }
 
 impl ToolDisposition {
@@ -34,43 +28,24 @@ pub(super) struct Presentation {
     receipt: String,
 }
 
-pub(super) enum Disposition {
-    Present(Presentation),
-    Synthesize(Value),
-}
-
-impl Disposition {
-    pub(super) fn is_synthesis(&self) -> bool {
-        matches!(self, Self::Synthesize(_))
-    }
-}
-
-pub(super) fn take(result: &mut ToolResult) -> Option<Disposition> {
+pub(super) fn take(result: &mut ToolResult) -> Option<Presentation> {
     match std::mem::take(&mut result.disposition) {
         ToolDisposition::Continue => None,
-        ToolDisposition::Present { receipt } => Some(Disposition::Present(Presentation {
+        ToolDisposition::Present { receipt } => Some(Presentation {
             tool_use_id: result.tool_use_id.clone(),
             receipt,
-        })),
-        ToolDisposition::Synthesize { evidence } => Some(Disposition::Synthesize(evidence)),
+        }),
     }
 }
 
 pub(super) fn merge(
-    current: &mut Option<Disposition>,
-    next: Disposition,
+    current: &mut Option<Presentation>,
+    next: Presentation,
 ) -> Result<(), AgentError> {
-    if let Some(current) = current {
-        let reason = match (&*current, &next) {
-            (Disposition::Present(_), Disposition::Present(_)) => {
-                "a tool batch cannot present more than one final answer"
-            }
-            (Disposition::Synthesize(_), Disposition::Synthesize(_)) => {
-                "a tool batch cannot provide more than one evidence capsule"
-            }
-            _ => "a tool batch cannot both present an answer and request synthesis",
-        };
-        return Err(AgentError::InvalidToolResult(reason.to_string()));
+    if current.is_some() {
+        return Err(AgentError::InvalidToolResult(
+            "a tool batch cannot present more than one final answer".to_string(),
+        ));
     }
     *current = Some(next);
     Ok(())
@@ -87,21 +62,6 @@ pub(super) fn validate_batch(results: &[ToolResult]) -> Result<(), AgentError> {
     if presentations > 1 {
         return Err(AgentError::InvalidToolResult(
             "a concurrent tool batch cannot present more than one final answer".to_string(),
-        ));
-    }
-    let syntheses = results
-        .iter()
-        .filter(|result| matches!(result.disposition, ToolDisposition::Synthesize { .. }))
-        .count();
-    if syntheses > 1 {
-        return Err(AgentError::InvalidToolResult(
-            "a concurrent tool batch cannot provide more than one evidence capsule".to_string(),
-        ));
-    }
-    if presentations == 1 && syntheses == 1 {
-        return Err(AgentError::InvalidToolResult(
-            "a concurrent tool batch cannot both present an answer and request synthesis"
-                .to_string(),
         ));
     }
     Ok(())

@@ -55,7 +55,6 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
                 max_tool_calls: 4,
             },
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -97,9 +96,9 @@ async fn terminal_output_is_generated_once_and_promoted_in_place() {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].tool_choice,
-            Some(typemach_agent::ToolChoice::None)
+            Some(typemach_agent::ToolChoice::Auto)
         );
-        assert!(requests[0].tools.is_empty());
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "ask_user"));
     }
 
     let checkpoint = runner
@@ -152,38 +151,28 @@ fn metric_call() -> ModelResponse {
 }
 
 #[tokio::test]
-async fn tool_call_followup_uses_the_reserved_synthesis_turn() {
-    let model = ScriptedModel::new([
-        metric_call(),
-        ModelResponse {
-            stop_reason: Some(StopReason::EndTurn),
-            ..final_response("There were 42 orders.")
-        },
-    ]);
+async fn model_budget_aborts_after_checkpointed_tool_dispatch_without_replay() {
+    let model = ScriptedModel::new([metric_call()]);
     let tools = CountingTools::default();
     let calls = tools.calls.clone();
     let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
-    let events = collect(runner.stream(
-        request(AgentRunInput {
-            messages: vec![AgentMessage::user_text("How many orders?")],
-            context: Value::Null,
-            retained_results: Vec::new(),
-            budget: AgentBudget {
-                max_model_turns: 2,
-                max_tool_calls: 1,
-            },
-            human_input: None,
-            synthesis_request: None,
-            system_suffix: None,
-        }),
-        StreamConfig::default(),
-    ))
-    .await;
+    let run = request(AgentRunInput {
+        messages: vec![AgentMessage::user_text("How many orders?")],
+        context: Value::Null,
+        retained_results: Vec::new(),
+        budget: AgentBudget {
+            max_model_turns: 1,
+            max_tool_calls: 4,
+        },
+        human_input: None,
+        system_suffix: None,
+    });
+    let events = collect(runner.stream(run.clone(), StreamConfig::default())).await;
 
     assert_eq!(calls.load(Ordering::Relaxed), 1);
-    assert_eq!(completed(&events).answer, "There were 42 orders.");
+    assert!(failed_with(&events, FinishReason::MaxModelTurns));
     let requests = model.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].tool_choice,
         Some(typemach_agent::ToolChoice::Auto)
@@ -194,12 +183,17 @@ async fn tool_call_followup_uses_the_reserved_synthesis_turn() {
             .iter()
             .any(|tool| tool.name == "metric_point")
     );
-    assert_eq!(
-        requests[1].tool_choice,
-        Some(typemach_agent::ToolChoice::None)
-    );
-    assert!(requests[1].tools.is_empty());
-    assert!(requests[1].messages.iter().any(|message| matches!(
+    let checkpoint = runner
+        .checkpointer()
+        .load("thread-1")
+        .await
+        .expect("load checkpoint")
+        .expect("checkpoint");
+    assert_eq!(checkpoint.next_step, Some(json!("model_step")));
+    let state: AgentState = serde_json::from_value(checkpoint.state).expect("agent state");
+    assert!(state.answer.is_empty());
+    assert!(state.pending_tools.is_empty());
+    assert!(state.messages.iter().any(|message| matches!(
         message,
         AgentMessage::User { content }
             if content.iter().any(|block| matches!(
@@ -207,6 +201,40 @@ async fn tool_call_followup_uses_the_reserved_synthesis_turn() {
                 ContentBlock::ToolResult(result) if result.tool_use_id == "tool-1"
             ))
     )));
+
+    let retried = collect(runner.stream(run, StreamConfig::default())).await;
+    assert!(failed_with(&retried, FinishReason::MaxModelTurns));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn tool_budget_aborts_before_another_model_call_without_replay() {
+    let model = ScriptedModel::new([metric_call()]);
+    let tools = CountingTools::default();
+    let calls = tools.calls.clone();
+    let runner = build_agent_runner(MemorySaver::default(), model.clone(), tools, AllowAllTools);
+    let run = request(AgentRunInput {
+        messages: vec![AgentMessage::user_text("How many orders?")],
+        context: Value::Null,
+        retained_results: Vec::new(),
+        budget: AgentBudget {
+            max_model_turns: 3,
+            max_tool_calls: 1,
+        },
+        human_input: None,
+        system_suffix: None,
+    });
+
+    let events = collect(runner.stream(run.clone(), StreamConfig::default())).await;
+    assert!(failed_with(&events, FinishReason::MaxToolCalls));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.requests().len(), 1);
+
+    let retried = collect(runner.stream(run, StreamConfig::default())).await;
+    assert!(failed_with(&retried, FinishReason::MaxToolCalls));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(model.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -236,7 +264,6 @@ async fn final_answer_with_tool_call_dispatches_and_allows_a_followup() {
                 max_tool_calls: 2,
             },
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -327,7 +354,6 @@ async fn aborted_candidates_never_complete_or_persist() {
                 retained_results: Vec::new(),
                 budget: AgentBudget::default(),
                 human_input: None,
-                synthesis_request: None,
                 system_suffix: None,
             }),
             StreamConfig::default(),
@@ -382,7 +408,6 @@ async fn aborted_candidates_never_complete_or_persist() {
                 max_tool_calls: 4,
             },
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -410,7 +435,6 @@ async fn empty_terminal_text_fails_without_finalizing() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -480,7 +504,6 @@ async fn retry_resumes_after_tool_dispatch_without_replaying_the_tool() {
             max_tool_calls: 4,
         },
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     });
 
@@ -614,7 +637,6 @@ async fn run_batch(tools: BatchTools) -> (Vec<Event>, usize) {
                 max_tool_calls: 4,
             },
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -642,7 +664,7 @@ async fn read_only_batches_overlap_but_unsafe_batches_do_not() {
 }
 
 #[tokio::test]
-async fn oversized_tool_batch_closes_every_call_then_synthesizes() {
+async fn oversized_tool_batch_closes_every_call_then_continues() {
     let model = ScriptedModel::new([
         ModelResponse {
             stop_reason: Some(StopReason::ToolUse),
@@ -677,7 +699,6 @@ async fn oversized_tool_batch_closes_every_call_then_synthesizes() {
                 max_tool_calls: 1,
             },
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),
@@ -699,9 +720,14 @@ async fn oversized_tool_batch_closes_every_call_then_synthesizes() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         requests[1].tool_choice,
-        Some(typemach_agent::ToolChoice::None)
+        Some(typemach_agent::ToolChoice::Auto)
     );
-    assert!(requests[1].tools.is_empty());
+    assert!(
+        requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "metric_point")
+    );
     let budget_errors = requests[1]
         .messages
         .iter()
@@ -729,4 +755,16 @@ fn tool_result_ids(events: &[Event]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+fn failed_with(events: &[Event], reason: FinishReason) -> bool {
+    events.iter().any(|event| match event {
+        RunStreamEvent::Failed {
+            error: typemach::MachineError::Transition(error),
+        } => matches!(
+            error.downcast_ref::<AgentError>(),
+            Some(AgentError::Incomplete(actual)) if *actual == reason
+        ),
+        _ => false,
+    })
 }

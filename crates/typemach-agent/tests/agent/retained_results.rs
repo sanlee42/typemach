@@ -107,7 +107,6 @@ async fn retained_results_are_host_only_and_follow_turn_lifecycle() {
         retained_results: vec![retained("page", "original-page")],
         budget: AgentBudget::default(),
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     };
 
@@ -159,7 +158,6 @@ async fn retained_results_are_host_only_and_follow_turn_lifecycle() {
                 tool_use_id: "ask-1".to_string(),
                 answer: "yes".to_string(),
             }),
-            synthesis_request: None,
             system_suffix: None,
         },
         ..request(AgentRunInput {
@@ -168,7 +166,6 @@ async fn retained_results_are_host_only_and_follow_turn_lifecycle() {
             retained_results: Vec::new(),
             budget: AgentBudget::default(),
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         })
     };
@@ -181,7 +178,6 @@ async fn retained_results_are_host_only_and_follow_turn_lifecycle() {
         retained_results: vec![retained("new-page", "new-page")],
         budget: AgentBudget::default(),
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     };
     let fresh_events = collect(runner.stream(request(fresh), StreamConfig::default())).await;
@@ -266,7 +262,6 @@ async fn concurrent_siblings_receive_the_same_prior_result_snapshot() {
             retained_results: vec![retained("page", "page")],
             budget: AgentBudget::default(),
             human_input: None,
-            synthesis_request: None,
             system_suffix: None,
         }),
         StreamConfig::default(),

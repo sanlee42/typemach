@@ -124,7 +124,6 @@ fn presentation_input(max_tool_calls: u32) -> AgentRunInput {
             max_tool_calls,
         },
         human_input: None,
-        synthesis_request: None,
         system_suffix: None,
     }
 }

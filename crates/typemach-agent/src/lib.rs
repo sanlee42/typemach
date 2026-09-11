@@ -121,7 +121,7 @@ pub struct AgentMachine<M, T, P> {
 
 enum ToolDispatch {
     Continue,
-    Disposition(presentation::Disposition),
+    Disposition(presentation::Presentation),
     Transition(Box<Transition<AgentStep, AskUserQuestion, AgentRunOutput>>),
 }
 
@@ -272,40 +272,24 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
     ) -> Result<Transition<AgentStep, AskUserQuestion, AgentRunOutput>, MachineError> {
-        let phase =
-            next_model_phase(state).map_err(|reason| AgentError::Incomplete(reason).machine())?;
-        let (tools, suffix, tool_choice) = match phase {
-            AgentPhase::Evidence => {
-                let tools = deferred_tools::ToolCatalog::read(
-                    self.tools.as_ref(),
-                    &state.context,
-                    &mut state.loaded_deferred_tools,
-                )
-                .await
-                .map_err(AgentError::machine)?
-                .visible;
-                (tools, state.system_suffix.clone(), Some(ToolChoice::Auto))
-            }
-            AgentPhase::Synthesis => (
-                Vec::new(),
-                if state.synthesis_evidence.is_some() {
-                    evidence_synthesis_suffix(state.system_suffix.as_deref())
-                } else {
-                    synthesis_suffix(state.system_suffix.as_deref())
-                },
-                Some(ToolChoice::None),
-            ),
-        };
-        let messages = synthesis_messages(state).map_err(AgentError::machine)?;
+        check_budget(state).map_err(|reason| AgentError::Incomplete(reason).machine())?;
+        let tools = deferred_tools::ToolCatalog::read(
+            self.tools.as_ref(),
+            &state.context,
+            &mut state.loaded_deferred_tools,
+        )
+        .await
+        .map_err(AgentError::machine)?
+        .visible;
         state.model_turns += 1;
         let turn_number = state.model_turns;
         let request = model_turn::prepare(
             state,
             ctx,
-            messages,
+            state.messages.clone(),
             tools.clone(),
-            suffix,
-            tool_choice,
+            state.system_suffix.clone(),
+            Some(ToolChoice::Auto),
             turn_number,
         )
         .await?;
@@ -333,12 +317,6 @@ where
                 content,
                 calls: tool_uses,
             }) => {
-                if phase == AgentPhase::Synthesis {
-                    return Err(AgentError::Model(
-                        "model returned tool calls during final synthesis".to_string(),
-                    )
-                    .machine());
-                }
                 if !matches!(turn.stop_reason, Some(StopReason::ToolUse) | None) {
                     return Err(AgentError::Model(
                         "model stopped before completing tool calls".to_string(),
@@ -356,7 +334,6 @@ where
                 state.messages.push(AgentMessage::Assistant { content });
                 if tool_uses.len() > remaining {
                     close_budget_exhausted_batch(state, &tool_uses)?;
-                    state.phase = AgentPhase::Synthesis;
                     return Ok(Transition::Next(AgentStep::ModelStep));
                 }
                 state
@@ -399,7 +376,6 @@ where
                 .map(|pending| pending.tool_use)
                 .collect::<Vec<_>>();
             close_budget_exhausted_batch(state, &tool_uses)?;
-            state.phase = AgentPhase::Synthesis;
             return Ok(Transition::Next(AgentStep::ModelStep));
         }
         if self.concurrent_batch_ready(state) {
@@ -421,24 +397,15 @@ where
                     .dispatch_concurrent_read_only(state, ctx, batch)
                     .await?;
             } else {
-                let mut checked = checked.into_iter();
-                while let Some((pending, permission)) = checked.next() {
+                for (pending, permission) in checked {
                     match self
                         .dispatch_checked_tool(state, ctx, pending, permission, &catalog)
                         .await?
                     {
                         ToolDispatch::Continue => {}
                         ToolDispatch::Disposition(next) => {
-                            let synthesis = next.is_synthesis();
                             presentation::merge(&mut disposition, next)
                                 .map_err(AgentError::machine)?;
-                            if synthesis {
-                                close_skipped_for_synthesis(
-                                    state,
-                                    checked.map(|(pending, _)| pending),
-                                )?;
-                                break;
-                            }
                         }
                         ToolDispatch::Transition(transition) => return Ok(*transition),
                     }
@@ -454,30 +421,14 @@ where
                 {
                     ToolDispatch::Continue => {}
                     ToolDispatch::Disposition(next) => {
-                        let synthesis = next.is_synthesis();
                         presentation::merge(&mut disposition, next).map_err(AgentError::machine)?;
-                        if synthesis {
-                            let skipped = state.pending_tools.drain(..).collect::<Vec<_>>();
-                            close_skipped_for_synthesis(state, skipped)?;
-                            break;
-                        }
                     }
                     ToolDispatch::Transition(transition) => return Ok(*transition),
                 }
             }
         }
-        if let Some(disposition) = disposition {
-            match disposition {
-                presentation::Disposition::Present(presentation) => {
-                    return presentation::complete(state, ctx, presentation).await;
-                }
-                presentation::Disposition::Synthesize(evidence) => {
-                    begin_evidence_synthesis(state, evidence).map_err(AgentError::machine)?;
-                }
-            }
-        }
-        if synthesis_due(state) {
-            state.phase = AgentPhase::Synthesis;
+        if let Some(presentation) = disposition {
+            return presentation::complete(state, ctx, presentation).await;
         }
         Ok(Transition::Next(AgentStep::ModelStep))
     }
@@ -627,7 +578,7 @@ where
         state: &mut AgentState,
         ctx: &AgentRunContext,
         batch: Vec<PendingToolCall>,
-    ) -> Result<Option<presentation::Disposition>, MachineError> {
+    ) -> Result<Option<presentation::Presentation>, MachineError> {
         state.tool_calls += batch.len() as u32;
         for pending in &batch {
             ctx.emit(AgentSignal::ToolStarted {
@@ -686,73 +637,14 @@ fn commit_answer(state: &mut AgentState, text: String) -> String {
     state.answer.clone()
 }
 
-const SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request from the evidence already in this conversation. Do not request or call tools. State material unknowns explicitly.";
-const EVIDENCE_SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request using the [Final evidence] capsule as the sole factual source. Preserve its definitions, predicates, numeric qualifiers, labels, and values exactly. Introduce no stronger or new factual claims. Present causality only as interpretation or hypothesis unless the capsule explicitly establishes it. Do not request or call tools. Do not recompute any values.";
-
-fn synthesis_suffix(suffix: Option<&str>) -> Option<String> {
-    synthesis_suffix_with(suffix, SYNTHESIS_INSTRUCTION)
-}
-
-fn evidence_synthesis_suffix(suffix: Option<&str>) -> Option<String> {
-    synthesis_suffix_with(suffix, EVIDENCE_SYNTHESIS_INSTRUCTION)
-}
-
-fn synthesis_suffix_with(suffix: Option<&str>, instruction: &str) -> Option<String> {
-    Some(match suffix {
-        Some(suffix) => format!("{suffix}\n\n{instruction}"),
-        None => instruction.to_string(),
-    })
-}
-
-fn synthesis_messages(state: &AgentState) -> Result<Vec<AgentMessage>, AgentError> {
-    let Some(evidence) = &state.synthesis_evidence else {
-        return Ok(state.messages.clone());
-    };
-    let mut request = state.synthesis_request.clone().ok_or_else(|| {
-        AgentError::Config("synthesis_request is required for evidence synthesis".to_string())
-    })?;
-    agent_state::validate_synthesis_request(&request)?;
-    let encoded = serde_json::to_string(evidence).map_err(|err| {
-        AgentError::InvalidToolResult(format!("failed to encode synthesis evidence: {err}"))
-    })?;
-    let AgentMessage::User { content } = &mut request else {
-        unreachable!("validated synthesis request")
-    };
-    content.push(ContentBlock::Text {
-        text: format!("\n\n[Final evidence]\n{encoded}"),
-    });
-    Ok(vec![request])
-}
-
-fn begin_evidence_synthesis(state: &mut AgentState, evidence: Value) -> Result<(), AgentError> {
-    let request = state.synthesis_request.as_ref().ok_or_else(|| {
-        AgentError::Config("synthesis_request is required for evidence synthesis".to_string())
-    })?;
-    agent_state::validate_synthesis_request(request)?;
-    state.synthesis_evidence = Some(evidence);
-    state.phase = AgentPhase::Synthesis;
-    Ok(())
-}
-
-fn next_model_phase(state: &mut AgentState) -> Result<AgentPhase, FinishReason> {
+fn check_budget(state: &AgentState) -> Result<(), FinishReason> {
     if state.model_turns >= state.budget.max_model_turns {
         return Err(FinishReason::MaxModelTurns);
     }
-    if synthesis_due(state) {
-        state.phase = AgentPhase::Synthesis;
+    if state.tool_calls >= state.budget.max_tool_calls {
+        return Err(FinishReason::MaxToolCalls);
     }
-    Ok(state.phase)
-}
-
-fn synthesis_due(state: &AgentState) -> bool {
-    if state.phase == AgentPhase::Synthesis {
-        return true;
-    }
-    let model_turns_left = state
-        .budget
-        .max_model_turns
-        .saturating_sub(state.model_turns);
-    model_turns_left <= 1 || state.tool_calls >= state.budget.max_tool_calls
+    Ok(())
 }
 
 fn close_budget_exhausted_batch(
@@ -768,27 +660,6 @@ fn close_budget_exhausted_batch(
             "error": {
                 "code": "budget_exhausted",
                 "message": "The entire tool batch was not executed because it exceeds the remaining tool-call budget."
-            }
-        });
-        result.validate().map_err(AgentError::machine)?;
-        state.messages.push(AgentMessage::tool_result(result));
-    }
-    Ok(())
-}
-
-fn close_skipped_for_synthesis(
-    state: &mut AgentState,
-    skipped: impl IntoIterator<Item = PendingToolCall>,
-) -> Result<(), MachineError> {
-    for pending in skipped {
-        let mut result = ToolResult::error(
-            &pending.tool_use,
-            "tool was not executed because an earlier call provided final synthesis evidence",
-        );
-        result.content = json!({
-            "error": {
-                "code": "synthesis_started",
-                "message": "The tool was not executed because an earlier call provided final synthesis evidence."
             }
         });
         result.validate().map_err(AgentError::machine)?;
@@ -831,7 +702,7 @@ async fn record_tool_result(
     state: &mut AgentState,
     ctx: &AgentRunContext,
     mut result: ToolResult,
-) -> Result<Option<presentation::Disposition>, MachineError> {
+) -> Result<Option<presentation::Presentation>, MachineError> {
     result.validate().map_err(AgentError::machine)?;
     let retained_authorization = result
         .retained
