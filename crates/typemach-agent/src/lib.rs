@@ -687,7 +687,7 @@ fn commit_answer(state: &mut AgentState, text: String) -> String {
 }
 
 const SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request from the evidence already in this conversation. Do not request or call tools. State material unknowns explicitly.";
-const EVIDENCE_SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request using the [Final evidence] capsule as the sole factual source. Do not request or call tools. Do not recompute any values.";
+const EVIDENCE_SYNTHESIS_INSTRUCTION: &str = "Final synthesis turn: answer the user's request using the [Final evidence] capsule as the sole factual source. Preserve its definitions, predicates, numeric qualifiers, labels, and values exactly. Introduce no stronger or new factual claims. Present causality only as interpretation or hypothesis unless the capsule explicitly establishes it. Do not request or call tools. Do not recompute any values.";
 
 fn synthesis_suffix(suffix: Option<&str>) -> Option<String> {
     synthesis_suffix_with(suffix, SYNTHESIS_INSTRUCTION)
